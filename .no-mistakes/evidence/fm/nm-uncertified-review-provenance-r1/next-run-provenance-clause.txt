@@ -1,0 +1,5 @@
+Fix-round provenance:
+- Commits after 8b91f73a291a8a2b70e58fb0acf06b398ec2bc10 through ce5da73d2009a2cfb1e9fe99915ac079bb9bcdc2 on this branch were authored by a previous run's fixer and were never certified: that run's re-review did not complete. Review them as pipeline-authored code under the same adversarial standard.
+- Review that pipeline-authored code with exactly the same adversarial standard as the author's original changes. It is unreviewed new code, not a settled resolution of the findings that prompted it.
+- Prior findings and fix summaries are claims, not evidence. Verify each claimed fix against the current code, and independently judge whether behavior the fix rounds introduced is correct, not merely whether it implements what was prescribed.
+- A test added or changed in the same fix round as the code it exercises is part of that round's claim, not independent proof: judge whether its asserted outcome is the right outcome and whether it could still pass with the code wrong.
