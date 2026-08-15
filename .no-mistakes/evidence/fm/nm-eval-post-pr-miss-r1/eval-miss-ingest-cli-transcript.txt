@@ -1,0 +1,69 @@
+$ NM_HOME=/tmp/nm-eval-miss-home.z1fJ77
+$ /tmp/nm-eval-miss-demo/no-mistakes eval miss ingest --help
+
+Reads confirmed post-PR misses from --finding JSON (repeatable), not from GitHub comments or an external ledger. Captures the named run if needed, then writes false-negative gold onto the last completed non-blocking review pass.
+
+Usage:
+  no-mistakes eval miss ingest <run> --finding <json> [flags]
+
+Flags:
+      --finding stringArray   confirmed miss as JSON finding object (repeatable)
+  -h, --help                  help for ingest
+
+-----
+$ /tmp/nm-eval-miss-demo/no-mistakes eval miss ingest 01M028Z63BRG3HKRARPQFJYXMQ --finding '{"id":"silent-wrong-set","file":"pkg/compute.go","line":12,"severity":"error","description":"returns the wrong set for a valid input"}' --finding '{"id":"off-by-one","file":"pkg/compute.go","line":18,"severity":"error","description":"counts one extra item"}'
+
+ingested 2 false-negative gold finding(s) into case 01M028Z63BRG3HKRARPQFJYXMQ-01M028Z63CN4JHA8E3AZKTVK1G (2 total)
+
+-----
+$ /tmp/nm-eval-miss-demo/no-mistakes eval sets
+
+LOCAL-ONLY EVAL CASE SETS
+
+all: 1 cases, 1 with finding-level gold (true-positive 0, false-negative 2, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=none, type=error/
+
+labeled: 1 cases, 1 with finding-level gold (true-positive 0, false-negative 2, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=none, type=error/
+
+diversified: 1 cases, 1 with finding-level gold (true-positive 0, false-negative 2, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  cap: 32, pins: 1
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=none, type=error/
+
+tune: 0 cases, 0 with finding-level gold (true-positive 0, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  warning: tune is empty; do not fit matcher thresholds on diversified
+
+-----
+$ /tmp/nm-eval-miss-demo/no-mistakes eval capture 01M028Z63BRG3HKRARPQFJYXMQ
+
+captured 1 local review case(s)
+  01M028Z63BRG3HKRARPQFJYXMQ-01M028Z63CN4JHA8E3AZKTVK1G  run 01M028Z63BRG3HKRARPQFJYXMQ round 01M028Z63CN4JHA8E3AZKTVK1G
+
+-----
+$ /tmp/nm-eval-miss-demo/no-mistakes eval sets   # after recapture; labels must persist
+
+LOCAL-ONLY EVAL CASE SETS
+
+all: 1 cases, 1 with finding-level gold (true-positive 0, false-negative 2, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=none, type=error/
+
+labeled: 1 cases, 1 with finding-level gold (true-positive 0, false-negative 2, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=none, type=error/
+
+diversified: 1 cases, 1 with finding-level gold (true-positive 0, false-negative 2, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  cap: 32, pins: 1
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=none, type=error/
+
+tune: 0 cases, 0 with finding-level gold (true-positive 0, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  warning: tune is empty; do not fit matcher thresholds on diversified
+
+-----
+$ /tmp/nm-eval-miss-demo/no-mistakes eval miss ingest 01M028Z63BRG3HKRARPQFJYXMQ --finding '{"id":"silent-wrong-set","file":"pkg/compute.go","line":12,"severity":"error","description":"returns the wrong set for a valid input"}'
+
+ingested 0 false-negative gold finding(s) into case 01M028Z63BRG3HKRARPQFJYXMQ-01M028Z63CN4JHA8E3AZKTVK1G (2 total)
+
+-----
+$ /tmp/nm-eval-miss-demo/no-mistakes eval miss ingest 01M028Z63CN4JHA8E3B2EWTNJ2 --finding '{"id":"later-caught","file":"main.go","line":3,"severity":"error","description":"should have been refused"}'
+
+review did not pass green: last completed review pass was blocking
+exit=1

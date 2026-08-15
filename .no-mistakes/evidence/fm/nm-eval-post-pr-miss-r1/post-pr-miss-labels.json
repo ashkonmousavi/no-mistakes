@@ -1,0 +1,24 @@
+{
+  "version": 2,
+  "findings": [
+    {
+      "id": "silent-wrong-set",
+      "kind": "false-negative",
+      "source": "recorded-post-pr-miss",
+      "file": "pkg/compute.go",
+      "line": 12,
+      "description": "returns the wrong set for a valid input",
+      "severity": "error"
+    },
+    {
+      "id": "off-by-one",
+      "kind": "false-negative",
+      "source": "recorded-post-pr-miss",
+      "file": "pkg/compute.go",
+      "line": 18,
+      "description": "counts one extra item",
+      "severity": "error"
+    }
+  ],
+  "queued_candidate_findings": 0
+}
