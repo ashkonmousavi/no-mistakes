@@ -1,0 +1,35 @@
+[
+  {
+    "source_round_id": "01M023Q8VVDCCQE4Z147VD16E4",
+    "labels": {
+      "version": 2,
+      "queued_candidate_findings": 0
+    }
+  },
+  {
+    "source_round_id": "01M023Q8VVDCCQE4Z1494TV094",
+    "labels": {
+      "version": 2,
+      "queued_candidate_findings": 0
+    }
+  },
+  {
+    "source_round_id": "01M023Q8VWW93E63A2TMP55FDM",
+    "labels": {
+      "version": 2,
+      "findings": [
+        {
+          "id": "other-bug",
+          "kind": "false-positive",
+          "source": "recorded-shipped-unfixed",
+          "file": "main.go",
+          "line": 1,
+          "description": "style",
+          "severity": "warning",
+          "action": "ask-user"
+        }
+      ],
+      "queued_candidate_findings": 0
+    }
+  }
+]
