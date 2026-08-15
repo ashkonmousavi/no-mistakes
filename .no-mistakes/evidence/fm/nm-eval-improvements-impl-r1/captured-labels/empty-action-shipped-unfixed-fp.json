@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "findings": [
+    {
+      "id": "missing-action",
+      "kind": "false-positive",
+      "source": "recorded-shipped-unfixed",
+      "file": "main.go",
+      "line": 5,
+      "description": "empty action defaults to ask-user",
+      "severity": "error"
+    }
+  ],
+  "queued_candidate_findings": 0
+}

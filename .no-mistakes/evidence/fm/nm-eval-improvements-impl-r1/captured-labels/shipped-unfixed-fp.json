@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "findings": [
+    {
+      "id": "noise",
+      "kind": "false-positive",
+      "source": "recorded-shipped-unfixed",
+      "file": "main.go",
+      "line": 1,
+      "description": "style nit shipped unfixed",
+      "severity": "warning",
+      "action": "ask-user"
+    }
+  ],
+  "queued_candidate_findings": 0
+}

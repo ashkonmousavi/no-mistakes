@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "findings": [
+    {
+      "id": "real-bug",
+      "kind": "true-positive",
+      "source": "recorded-auto-fix-merged",
+      "file": "main.go",
+      "line": 3,
+      "description": "nil deref on the handler path",
+      "severity": "error",
+      "action": "auto-fix"
+    }
+  ],
+  "queued_candidate_findings": 0
+}

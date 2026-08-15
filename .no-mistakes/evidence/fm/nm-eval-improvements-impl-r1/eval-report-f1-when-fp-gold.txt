@@ -1,0 +1,37 @@
+$ no-mistakes eval report
+# cohort no-fp-gold: TP + pending unmatched, no FP gold -> F1 withheld
+# cohort mixed-tp-fp-gold: TP plus shipped-unfixed FP gold -> headline F1
+# cohort fp-gold: FP gold only
+
+LOCAL-ONLY EVAL REPORT
+
+codex+gpt-5.4 (cohort fp-gold)
+  replays: 1 across 1 repeat(s); labeled: 1; failures: 0
+  finding scores: true-positive 0, false-negative 0, false-positive 1, pending 0
+  recall: unavailable (no true-issue gold)
+  precision bounds: 0.0%-0.0% (adjudicated 0.0%; pending treated as FP for the lower bound)
+  F1: 0.0% (headline; false-positive gold is present)
+  token cost: 95 fresh-input + output tokens per reported replay
+  wall time: 1.2s average
+  recall-vs-cost frontier: unavailable (no true-issue gold)
+
+codex+gpt-5.4 (cohort mixed-tp-fp-gold)
+  replays: 1 across 1 repeat(s); labeled: 1; failures: 0
+  finding scores: true-positive 1, false-negative 0, false-positive 1, pending 0
+  recall: 100.0% (1/1 gold issues)
+  precision bounds: 50.0%-50.0% (adjudicated 50.0%; pending treated as FP for the lower bound)
+  F1: 66.7% (headline; false-positive gold is present)
+  token cost: 108 fresh-input + output tokens per reported replay
+  wall time: 1.3s average
+  recall-vs-cost frontier: true
+
+codex+gpt-5.4 (cohort no-fp-gold)
+  replays: 1 across 1 repeat(s); labeled: 1; failures: 0
+  finding scores: true-positive 1, false-negative 0, false-positive 0, pending 1
+  recall: 100.0% (1/1 gold issues)
+  precision bounds: 50.0%-100.0% (adjudicated 100.0%; pending treated as FP for the lower bound)
+  F1: withheld (no false-positive gold; precision in [50.0%, 100.0%])
+  queued unmatched candidate findings: 1 (not scored as false-positive)
+  token cost: 120 fresh-input + output tokens per reported replay
+  wall time: 1.5s average
+  recall-vs-cost frontier: true

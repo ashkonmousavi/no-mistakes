@@ -1,0 +1,38 @@
+$ no-mistakes eval capture <run-id>
+# shipped-unfixed ask-user finding on a merged PR
+
+captured 1 local review case(s)
+  01M01Y3709MG713Z5J5NRZVJ4E-01M01Y370AH7NWNPRK6XHAKXZV  run 01M01Y3709MG713Z5J5NRZVJ4E round 01M01Y370AH7NWNPRK6XHAKXZV
+
+# auto-fix finding that landed in a merged PR
+
+captured 1 local review case(s)
+  01M01Y370AH7NWNPRK702G6ET6-01M01Y370AH7NWNPRK74EKMHWC  run 01M01Y370AH7NWNPRK702G6ET6 round 01M01Y370AH7NWNPRK74EKMHWC
+
+# missing/empty finding action on a merged PR (defaults to ask-user)
+
+captured 1 local review case(s)
+  01M01Y370BQRHDQ1MB0T7J3ZCY-01M01Y370BQRHDQ1MB0YXKYC1E  run 01M01Y370BQRHDQ1MB0T7J3ZCY round 01M01Y370BQRHDQ1MB0YXKYC1E
+
+$ no-mistakes eval sets
+
+LOCAL-ONLY EVAL CASE SETS
+
+all: 3 cases, 3 with finding-level gold (true-positive 1, false-negative 0, false-positive 2), 0 unlabeled / pending, 0 candidate findings queued
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=false-positive
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=warning, type=false-positive
+
+labeled: 3 cases, 3 with finding-level gold (true-positive 1, false-negative 0, false-positive 2), 0 unlabeled / pending, 0 candidate findings queued
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=false-positive
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=warning, type=false-positive
+
+diversified: 3 cases, 3 with finding-level gold (true-positive 1, false-negative 0, false-positive 2), 0 unlabeled / pending, 0 candidate findings queued
+  cap: 32, pins: 3
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=false-positive
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=warning, type=false-positive
+
+tune: 0 cases, 0 with finding-level gold (true-positive 0, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  warning: tune is empty; do not fit matcher thresholds on diversified
