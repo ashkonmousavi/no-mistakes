@@ -1,0 +1,9 @@
+{
+  "TruePositive": 2,
+  "TruePositiveExact": 1,
+  "TruePositiveFuzzy": 1,
+  "FalseNegative": 0,
+  "FalsePositive": 0,
+  "FalsePositiveGold": 0,
+  "Pending": 0
+}

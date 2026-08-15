@@ -1,0 +1,12 @@
+LOCAL-ONLY EVAL CASE SETS
+
+all: 1 cases, 0 with finding-level gold (true-positive 0, false-negative 0, false-positive 0), 1 unlabeled / pending, 0 candidate findings queued
+  1  repo=repo-a, language=go, size=tiny, severity=error, type=unlabeled
+
+labeled: 0 cases, 0 with finding-level gold (true-positive 0, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+
+diversified: 0 cases, 0 with finding-level gold (true-positive 0, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  cap: 32, pins: 0
+  warning: diversified is empty: no labeled gold (unlabeled cases are not filled)
+
+tune: 0 cases, 0 with finding-level gold (true-positive 0, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued

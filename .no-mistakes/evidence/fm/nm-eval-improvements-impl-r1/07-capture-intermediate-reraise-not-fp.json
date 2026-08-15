@@ -1,0 +1,7 @@
+{
+  "first_round_labels": {
+    "version": 2,
+    "queued_candidate_findings": 0
+  },
+  "note": "first-round finding was re-raised then gone from the last round before merge; must stay unlabeled, not shipped-unfixed FP"
+}

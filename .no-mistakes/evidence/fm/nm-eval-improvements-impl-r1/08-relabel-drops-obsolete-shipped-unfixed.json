@@ -1,0 +1,22 @@
+{
+  "after": {
+    "version": 2,
+    "queued_candidate_findings": 0
+  },
+  "before": {
+    "version": 2,
+    "findings": [
+      {
+        "id": "real-bug",
+        "kind": "false-positive",
+        "source": "recorded-shipped-unfixed",
+        "file": "main.go",
+        "line": 3,
+        "description": "bug",
+        "severity": "error",
+        "action": "ask-user"
+      }
+    ],
+    "queued_candidate_findings": 0
+  }
+}

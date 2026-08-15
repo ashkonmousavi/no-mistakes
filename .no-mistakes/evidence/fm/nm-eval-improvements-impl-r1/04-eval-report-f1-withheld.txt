@@ -1,0 +1,11 @@
+LOCAL-ONLY EVAL REPORT
+
+codex+test (cohort labeled)
+  replays: 1 across 1 repeat(s); labeled: 1; failures: 0
+  finding scores: true-positive 2, false-negative 0, false-positive 0, pending 1
+  recall: 100.0% (2/2 gold issues)
+  precision bounds: 66.7%-100.0% (adjudicated 100.0%; pending treated as FP for the lower bound)
+  F1: withheld (no false-positive gold; precision in [66.7%, 100.0%])
+  queued unmatched candidate findings: 1 (not scored as false-positive)
+  token cost: unknown (token usage was not reported for every replay)
+  wall time: 0.0s average

@@ -1,0 +1,42 @@
+BEFORE lowering cap (diversified=repo-a-error-0,repo-b-error-0,repo-c-error-0)
+LOCAL-ONLY EVAL CASE SETS
+
+all: 3 cases, 3 with finding-level gold (true-positive 3, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  1  repo=repo-a, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=repo-b, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=repo-c, language=go, size=tiny, severity=error, type=error/auto-fix
+
+labeled: 3 cases, 3 with finding-level gold (true-positive 3, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  1  repo=repo-a, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=repo-b, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=repo-c, language=go, size=tiny, severity=error, type=error/auto-fix
+
+diversified: 3 cases, 3 with finding-level gold (true-positive 3, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  cap: 3, pins: 3
+  1  repo=repo-a, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=repo-b, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=repo-c, language=go, size=tiny, severity=error, type=error/auto-fix
+
+tune: 0 cases, 0 with finding-level gold (true-positive 0, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  warning: tune is empty; do not fit matcher thresholds on diversified
+
+AFTER lowering cap to 1 without --refresh-diversified (diversified=repo-a-error-0)
+LOCAL-ONLY EVAL CASE SETS
+
+all: 3 cases, 3 with finding-level gold (true-positive 3, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  1  repo=repo-a, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=repo-b, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=repo-c, language=go, size=tiny, severity=error, type=error/auto-fix
+
+labeled: 3 cases, 3 with finding-level gold (true-positive 3, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  1  repo=repo-a, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=repo-b, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=repo-c, language=go, size=tiny, severity=error, type=error/auto-fix
+
+diversified: 1 cases, 1 with finding-level gold (true-positive 1, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  cap: 1, pins: 1
+  1  repo=repo-a, language=go, size=tiny, severity=error, type=error/auto-fix
+
+tune: 2 cases, 2 with finding-level gold (true-positive 2, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  1  repo=repo-b, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=repo-c, language=go, size=tiny, severity=error, type=error/auto-fix
