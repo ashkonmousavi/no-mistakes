@@ -1,0 +1,46 @@
+BEFORE (cap 6, Hamilton pins duplicates in two strata and leaves a third unoccupied):
+LOCAL-ONLY EVAL CASE SETS
+
+all: 22 cases, 22 with finding-level gold (true-positive 22, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  10  repo=repo-a, language=go, size=tiny, severity=error, type=error/auto-fix
+  10  repo=repo-b, language=go, size=tiny, severity=error, type=error/auto-fix
+  2  repo=repo-c, language=go, size=tiny, severity=info, type=info/auto-fix
+
+labeled: 22 cases, 22 with finding-level gold (true-positive 22, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  10  repo=repo-a, language=go, size=tiny, severity=error, type=error/auto-fix
+  10  repo=repo-b, language=go, size=tiny, severity=error, type=error/auto-fix
+  2  repo=repo-c, language=go, size=tiny, severity=info, type=info/auto-fix
+
+diversified: 6 cases, 6 with finding-level gold (true-positive 6, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  cap: 6, pins: 6
+  3  repo=repo-a, language=go, size=tiny, severity=error, type=error/auto-fix
+  3  repo=repo-b, language=go, size=tiny, severity=error, type=error/auto-fix
+
+tune: 16 cases, 16 with finding-level gold (true-positive 16, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  7  repo=repo-a, language=go, size=tiny, severity=error, type=error/auto-fix
+  7  repo=repo-b, language=go, size=tiny, severity=error, type=error/auto-fix
+  2  repo=repo-c, language=go, size=tiny, severity=info, type=info/auto-fix
+
+AFTER (cap 5, collapse-freed seats must not reallocate multiple official cases into one stratum):
+LOCAL-ONLY EVAL CASE SETS
+
+all: 22 cases, 22 with finding-level gold (true-positive 22, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  10  repo=repo-a, language=go, size=tiny, severity=error, type=error/auto-fix
+  10  repo=repo-b, language=go, size=tiny, severity=error, type=error/auto-fix
+  2  repo=repo-c, language=go, size=tiny, severity=info, type=info/auto-fix
+
+labeled: 22 cases, 22 with finding-level gold (true-positive 22, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  10  repo=repo-a, language=go, size=tiny, severity=error, type=error/auto-fix
+  10  repo=repo-b, language=go, size=tiny, severity=error, type=error/auto-fix
+  2  repo=repo-c, language=go, size=tiny, severity=info, type=info/auto-fix
+
+diversified: 3 cases, 3 with finding-level gold (true-positive 3, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  cap: 5, pins: 3
+  1  repo=repo-a, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=repo-b, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=repo-c, language=go, size=tiny, severity=info, type=info/auto-fix
+
+tune: 19 cases, 19 with finding-level gold (true-positive 19, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  9  repo=repo-a, language=go, size=tiny, severity=error, type=error/auto-fix
+  9  repo=repo-b, language=go, size=tiny, severity=error, type=error/auto-fix
+  1  repo=repo-c, language=go, size=tiny, severity=info, type=info/auto-fix
