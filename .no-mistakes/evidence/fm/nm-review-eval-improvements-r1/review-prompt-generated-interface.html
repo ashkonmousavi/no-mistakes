@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Review prompt generated interface — R2/R4</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a2332;
+    --ink: #e8eef5;
+    --muted: #93a4b8;
+    --add: #1f6f43;
+    --add-bg: #143d28;
+    --keep: #3d5a80;
+    --keep-bg: #1c2d42;
+    --ok: #3ecf8e;
+    --warn: #f0c14b;
+    --line: #2a3a4d;
+  }
+  body {
+    margin: 0;
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+  }
+  header {
+    padding: 28px 32px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  h1 { margin: 0 0 8px; font-size: 22px; }
+  .sub { color: var(--muted); max-width: 72ch; }
+  main { padding: 24px 32px 48px; display: grid; gap: 28px; }
+  h2 { margin: 0 0 10px; font-size: 16px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+  pre {
+    margin: 0;
+    padding: 16px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    white-space: pre-wrap;
+    font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .add { background: var(--add-bg); color: #b8f0d0; }
+  .keep { background: var(--keep-bg); color: #c9ddf5; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .pass { color: var(--ok); font-weight: 600; }
+  .note { color: var(--muted); font-size: 13px; }
+  .pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    background: var(--add);
+    color: #fff;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Generated review-prompt interface</h1>
+  <p class="sub">
+    Captured by executing <code>ReviewStep.Execute</code> with a mock reviewer agent.
+    This is the prompt a review agent actually receives. New R2/R4 language is
+    highlighted green; the existing durable-fix pairing is highlighted blue.
+  </p>
+</header>
+<main>
+  <section>
+    <h2>Task section — before vs after</h2>
+    <div class="grid">
+      <div>
+        <p class="note">Base commit <code>dac4dc9</code></p>
+        <pre>Task:
+- Read the relevant history and diff yourself.
+- Focus findings on risks introduced by changed code, but inspect surrounding code, call sites, shared helpers, tests, and invariants when needed to understand root cause.
+- Determine from the stated intent and relevant evidence whether a bug-fix change claims a durable fix or explicitly authorized short-term containment.
+- For a claimed durable fix, reconstruct the concrete failing sequence and required invariant, inspect relevant sibling paths and shared state transitions, and ask whether the same authorized failure remains reachable.
+- When source evidence proves the failure remains reachable, report the concrete path and recommend the earliest supported shared boundary that would make the invariant hold, rather than duplicating another symptom patch.
+- Do not infer a systemic flaw from code shape, duplication, or architectural preference alone. Do not demand a shared abstraction or broad redesign without a concrete reachable path, violated invariant, or immediately competing semantic owner.
+- Do not block explicitly authorized honest containment merely because a later durable fix is possible. Do not expand user scope or turn optional broader improvements into blockers.
+- Do NOT run tests during review. The pipeline has a dedicated test step after review.
+- Analyze for bugs, risks, and code simplification opportunities.
+- "Simplification" means reducing code complexity through non-functional refactoring (e.g. deduplication, clearer control flow). It does NOT mean removing features, changing product behavior, or stripping intentional user-facing output.
+- Treat security issues, performance regressions, breaking changes, and insufficient error handling as risks.
+- Do a full review pass before returning. Do not stop after the first valid finding. Continue inspecting the rest of the changed code until you have enumerated all material issues you can substantiate.</pre>
+      </div>
+      <div>
+        <p class="note">Live emitted prompt at <code>b7ecff5</code> <span class="pill">+2 clauses</span></p>
+        <pre>Task:
+- Read the relevant history and diff yourself.
+- Focus findings on risks introduced by changed code, but inspect surrounding code, call sites, shared helpers, tests, and invariants when needed to understand root cause.
+- Determine from the stated intent and relevant evidence whether a bug-fix change claims a durable fix or explicitly authorized short-term containment.
+<span class="keep">- For a claimed durable fix, reconstruct the concrete failing sequence and required invariant, inspect relevant sibling paths and shared state transitions, and ask whether the same authorized failure remains reachable.</span>
+<span class="add">- For any new or changed logic, construct at least one concrete input or state and trace it through the code, looking for a case that produces a wrong result without erroring.</span>
+- When source evidence proves the failure remains reachable, report the concrete path and recommend the earliest supported shared boundary that would make the invariant hold, rather than duplicating another symptom patch.
+- Do not infer a systemic flaw from code shape, duplication, or architectural preference alone. Do not demand a shared abstraction or broad redesign without a concrete reachable path, violated invariant, or immediately competing semantic owner.
+- Do not block explicitly authorized honest containment merely because a later durable fix is possible. Do not expand user scope or turn optional broader improvements into blockers.
+- Do NOT run tests during review. The pipeline has a dedicated test step after review.
+- Analyze for bugs, risks, and code simplification opportunities.
+- "Simplification" means reducing code complexity through non-functional refactoring (e.g. deduplication, clearer control flow). It does NOT mean removing features, changing product behavior, or stripping intentional user-facing output.
+<span class="add">- Treat security issues, performance regressions, breaking changes, insufficient error handling, and a computation that returns a wrong value, label, or set without failing as risks.</span>
+- Do a full review pass before returning. Do not stop after the first valid finding. Continue inspecting the rest of the changed code until you have enumerated all material issues you can substantiate.</pre>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Authoritative-intent conformance clause (agent-source only)</h2>
+    <p class="note">Present when <code>IntentSource == agent</code>. Absent from the inferred-intent prompt (verified).</p>
+    <pre>... later pipeline steps own those. <span class="add">Conformance does not replace correctness review: an authoritative intent obliges flagging contradictions but never substitutes for checking that the algorithm is correct. An implementation that satisfies every required constraint can still compute a wrong value, label, or set; flag those as ordinary source findings.</span></pre>
+  </section>
+
+  <section>
+    <h2>Acceptance criteria vs emitted prompt</h2>
+    <table>
+      <thead>
+        <tr><th>Required</th><th>Observed in emitted prompt</th><th></th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Name silent-wrong-result as a general risk class (wrong value, label, or set without failing)</td>
+          <td>Risk bullet now includes “a computation that returns a wrong value, label, or set without failing”</td>
+          <td class="pass">pass</td>
+        </tr>
+        <tr>
+          <td>Ungate deep analysis for any new or changed logic, as a short general principle</td>
+          <td>One new Task bullet: construct at least one concrete input or state and trace it, looking for a wrong result without erroring</td>
+          <td class="pass">pass</td>
+        </tr>
+        <tr>
+          <td>Keep durable-fix reconstruction pairing</td>
+          <td>Still present, immediately above the new principle</td>
+          <td class="pass">pass</td>
+        </tr>
+        <tr>
+          <td>Conformance does not replace correctness (authoritative intent only)</td>
+          <td>Appended to the agent-source clause; missing from inferred-intent prompt</td>
+          <td class="pass">pass</td>
+        </tr>
+        <tr>
+          <td>Do not enumerate #739-specific probes (read-vs-refresh, zero-cap, greedy-matcher)</td>
+          <td>None of those phrases appear in any captured prompt</td>
+          <td class="pass">pass</td>
+        </tr>
+        <tr>
+          <td>Out of scope: R3/R1/R6/D3/R5/R7</td>
+          <td>No confidence field, review-tier, ACP metrics, shallow-review floor, uncertified-commit provenance, or eval-miss ingest in this change</td>
+          <td class="pass">pass</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+</main>
+</body>
+</html>
