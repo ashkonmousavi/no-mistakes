@@ -1,0 +1,111 @@
+$ NM_HOME=/tmp/nm-eval-phase-a-home no-mistakes-phase-a eval --help
+Inspect automatically collected review cases, capture runs on demand, and compare agent+model candidates. Eval never starts or uses the shared daemon.
+
+Usage:
+  no-mistakes eval [command]
+
+Available Commands:
+  capture     Capture every review pass from a run into local cases
+  relabel     Refresh gold labels when a source PR has merged after capture
+  report      Report local true-positive / false-negative scores, tokens, and cost
+  run         Replay captured review passes and score findings against gold
+  sets        Inspect local case-set size, finding-level gold, and composition
+
+Flags:
+  -h, --help   help for eval
+
+Use "no-mistakes eval [command] --help" for more information about a command.
+$ NM_HOME=/tmp/nm-eval-phase-a-home no-mistakes-phase-a eval capture 01M021QM98BTHHGN1DH6A09E1H
+captured 1 local review case(s)
+  01M021QM98BTHHGN1DH6A09E1H-01M021QM995Z4NFPY7FRTQD2CW  run 01M021QM98BTHHGN1DH6A09E1H round 01M021QM995Z4NFPY7FRTQD2CW
+$ NM_HOME=/tmp/nm-eval-phase-a-home no-mistakes-phase-a eval sets
+LOCAL-ONLY EVAL CASE SETS
+
+all: 1 cases, 0 with finding-level gold (true-positive 0, false-negative 0, false-positive 0), 1 unlabeled / pending, 0 candidate findings queued
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=unlabeled
+
+labeled: 0 cases, 0 with finding-level gold (true-positive 0, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+
+diversified: 0 cases, 0 with finding-level gold (true-positive 0, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  cap: 32, pins: 0
+  warning: diversified is empty: no labeled gold (unlabeled cases are not filled)
+
+tune: 0 cases, 0 with finding-level gold (true-positive 0, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+$ NM_HOME=/tmp/nm-eval-phase-a-home no-mistakes-phase-a eval capture 01M021QMEGKEYZGKQK8PNQCDD2
+captured 1 local review case(s)
+  01M021QMEGKEYZGKQK8PNQCDD2-01M021QMEGKEYZGKQK8W2HZS3J  run 01M021QMEGKEYZGKQK8PNQCDD2 round 01M021QMEGKEYZGKQK8W2HZS3J
+$ NM_HOME=/tmp/nm-eval-phase-a-home no-mistakes-phase-a eval capture 01M021QMJSXTPY75RNWAJ3V6PR
+captured 1 local review case(s)
+  01M021QMJSXTPY75RNWAJ3V6PR-01M021QMJTFSY1XE9CA94RKJN3  run 01M021QMJSXTPY75RNWAJ3V6PR round 01M021QMJTFSY1XE9CA94RKJN3
+$ NM_HOME=/tmp/nm-eval-phase-a-home no-mistakes-phase-a eval capture 01M021QMQ41J9Z6C7QG2C4XYVP
+captured 1 local review case(s)
+  01M021QMQ41J9Z6C7QG2C4XYVP-01M021QMQ544GP47ZHD180HCPC  run 01M021QMQ41J9Z6C7QG2C4XYVP round 01M021QMQ544GP47ZHD180HCPC
+$ NM_HOME=/tmp/nm-eval-phase-a-home no-mistakes-phase-a eval capture 01M021QMVCJ5623FC45NVS3X02
+captured 1 local review case(s)
+  01M021QMVCJ5623FC45NVS3X02-01M021QMVCJ5623FC45PNXZG0P  run 01M021QMVCJ5623FC45NVS3X02 round 01M021QMVCJ5623FC45PNXZG0P
+$ NM_HOME=/tmp/nm-eval-phase-a-home no-mistakes-phase-a eval sets
+LOCAL-ONLY EVAL CASE SETS
+
+all: 5 cases, 4 with finding-level gold (true-positive 3, false-negative 0, false-positive 1), 1 unlabeled / pending, 0 candidate findings queued
+  3  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=error/ask-user
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=false-positive
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=unlabeled
+
+labeled: 4 cases, 4 with finding-level gold (true-positive 3, false-negative 0, false-positive 1), 0 unlabeled / pending, 0 candidate findings queued
+  3  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=error/ask-user
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=false-positive
+
+diversified: 4 cases, 4 with finding-level gold (true-positive 3, false-negative 0, false-positive 1), 0 unlabeled / pending, 0 candidate findings queued
+  cap: 32, pins: 4
+  3  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=error/ask-user
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=false-positive
+
+tune: 0 cases, 0 with finding-level gold (true-positive 0, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  warning: tune is empty; do not fit matcher thresholds on diversified
+$ NM_HOME=/tmp/nm-eval-phase-a-home no-mistakes-phase-a eval sets
+LOCAL-ONLY EVAL CASE SETS
+
+all: 5 cases, 4 with finding-level gold (true-positive 3, false-negative 0, false-positive 1), 1 unlabeled / pending, 0 candidate findings queued
+  3  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=error/ask-user
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=false-positive
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=unlabeled
+
+labeled: 4 cases, 4 with finding-level gold (true-positive 3, false-negative 0, false-positive 1), 0 unlabeled / pending, 0 candidate findings queued
+  3  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=error/ask-user
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=false-positive
+
+diversified: 1 cases, 1 with finding-level gold (true-positive 1, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  cap: 1, pins: 1
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=error/ask-user
+
+tune: 3 cases, 3 with finding-level gold (true-positive 2, false-negative 0, false-positive 1), 0 unlabeled / pending, 0 candidate findings queued
+  2  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=error/ask-user
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=false-positive
+$ NM_HOME=/tmp/nm-eval-phase-a-home no-mistakes-phase-a eval report
+LOCAL-ONLY EVAL REPORT
+
+claude+no-fp-gold (cohort phase-a-no-fp)
+  replays: 1 across 1 repeat(s); labeled: 1; failures: 0
+  finding scores: true-positive 2, false-negative 0, false-positive 0, pending 1
+  recall: 100.0% (2/2 gold issues)
+  precision bounds: 66.7%-100.0% (adjudicated 100.0%; pending treated as FP for the lower bound)
+  F1: withheld (no false-positive gold; precision in [66.7%, 100.0%])
+  queued unmatched candidate findings: 1 (not scored as false-positive)
+  token cost: 100 fresh-input + output tokens per reported replay
+  wall time: 1.5s average
+  recall-vs-cost frontier: true
+
+claude+with-fp-gold (cohort phase-a-with-fp)
+  replays: 1 across 1 repeat(s); labeled: 1; failures: 0
+  finding scores: true-positive 2, false-negative 0, false-positive 1, pending 0
+  recall: 100.0% (2/2 gold issues)
+  precision bounds: 66.7%-66.7% (adjudicated 66.7%; pending treated as FP for the lower bound)
+  F1: 80.0% (headline; false-positive gold is present)
+  token cost: 100 fresh-input + output tokens per reported replay
+  wall time: 1.5s average
+  recall-vs-cost frontier: true
+$ NM_HOME=/tmp/nm-eval-phase-a-home no-mistakes-phase-a eval relabel 01M021QMVCJ5623FC45NVS3X02
+relabeled 1 local review case(s)
+
+# planted user-fix runs: 01M021QMEGKEYZGKQK8PNQCDD2, 01M021QMJSXTPY75RNWAJ3V6PR, 01M021QMQ41J9Z6C7QG2C4XYVP
+# shipped-unfixed run: 01M021QMVCJ5623FC45NVS3X02 case 01M021QMVCJ5623FC45NVS3X02-01M021QMVCJ5623FC45PNXZG0P

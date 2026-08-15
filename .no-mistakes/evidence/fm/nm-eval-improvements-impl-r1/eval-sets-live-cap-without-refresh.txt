@@ -1,0 +1,18 @@
+LOCAL-ONLY EVAL CASE SETS
+
+all: 5 cases, 4 with finding-level gold (true-positive 3, false-negative 0, false-positive 1), 1 unlabeled / pending, 0 candidate findings queued
+  3  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=error/ask-user
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=false-positive
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=unlabeled
+
+labeled: 4 cases, 4 with finding-level gold (true-positive 3, false-negative 0, false-positive 1), 0 unlabeled / pending, 0 candidate findings queued
+  3  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=error/ask-user
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=false-positive
+
+diversified: 1 cases, 1 with finding-level gold (true-positive 1, false-negative 0, false-positive 0), 0 unlabeled / pending, 0 candidate findings queued
+  cap: 1, pins: 1
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=error/ask-user
+
+tune: 3 cases, 3 with finding-level gold (true-positive 2, false-negative 0, false-positive 1), 0 unlabeled / pending, 0 candidate findings queued
+  2  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=error/ask-user
+  1  repo=2c23c83cc1d9, language=go, size=tiny, severity=error, type=false-positive

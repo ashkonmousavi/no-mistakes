@@ -1,0 +1,16 @@
+Inspect automatically collected review cases, capture runs on demand, and compare agent+model candidates. Eval never starts or uses the shared daemon.
+
+Usage:
+  no-mistakes eval [command]
+
+Available Commands:
+  capture     Capture every review pass from a run into local cases
+  relabel     Refresh gold labels when a source PR has merged after capture
+  report      Report local true-positive / false-negative scores, tokens, and cost
+  run         Replay captured review passes and score findings against gold
+  sets        Inspect local case-set size, finding-level gold, and composition
+
+Flags:
+  -h, --help   help for eval
+
+Use "no-mistakes eval [command] --help" for more information about a command.
