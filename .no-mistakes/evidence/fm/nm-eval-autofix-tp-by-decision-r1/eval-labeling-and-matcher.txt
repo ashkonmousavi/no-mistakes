@@ -1,0 +1,17 @@
+=== RUN   TestCaptureWritesShippedUnfixedAsFalsePositive
+--- PASS: TestCaptureWritesShippedUnfixedAsFalsePositive (0.32s)
+=== RUN   TestGoldFromRoundLabelsByRecordedDecision
+=== RUN   TestGoldFromRoundLabelsByRecordedDecision/selected_for_fix_and_merged_is_true-positive_gold
+=== RUN   TestGoldFromRoundLabelsByRecordedDecision/user_selected_for_fix_needs_no_merge
+=== RUN   TestGoldFromRoundLabelsByRecordedDecision/skipped_and_merged_is_shipped-unfixed_false-positive_gold
+=== RUN   TestGoldFromRoundLabelsByRecordedDecision/auto-fix_selection_leaves_an_unselected_sibling_shipped_unfixed
+=== RUN   TestGoldFromRoundLabelsByRecordedDecision/no_recorded_decision_stays_unlabeled_even_on_a_merged_run
+=== RUN   TestGoldFromRoundLabelsByRecordedDecision/an_aborted_round_records_no_decision
+=== RUN   TestGoldFromRoundLabelsByRecordedDecision/skipped_without_a_merge_stays_unlabeled
+=== RUN   TestGoldFromRoundLabelsByRecordedDecision/informational_no-op_findings_are_never_labeled
+--- PASS: TestGoldFromRoundLabelsByRecordedDecision (0.00s)
+=== RUN   TestScoreCandidateRecoversMatchTheTieredMatcherLost
+--- PASS: TestScoreCandidateRecoversMatchTheTieredMatcherLost (0.00s)
+=== RUN   TestMaxWeightAssignmentMatchesBruteForceOptimum
+--- PASS: TestMaxWeightAssignmentMatchesBruteForceOptimum (0.00s)
+ok  	github.com/kunchenguid/no-mistakes/internal/eval	0.568s
