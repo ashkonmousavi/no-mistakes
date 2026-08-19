@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="814" height="742" viewBox="0 0 814 742">
+<rect width="100%" height="100%" rx="14" fill="#111318"/>
+<style>.term { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 16px; fill: #e6e8eb; white-space: pre; }</style>
+<text x="28" y="46" class="term">╭─ eval case sets ────────────────────────────────────────────────────────────╮</text>
+<text x="28" y="68" class="term">│                                                                             │</text>
+<text x="28" y="90" class="term">│   Diversified holdout (official gold-only set)                              │</text>
+<text x="28" y="112" class="term">│   Cases                1   pins 1 · cap 32                                  │</text>
+<text x="28" y="134" class="term">│   Gold findings        1   across 1 gold case(s)                            │</text>
+<text x="28" y="156" class="term">│                                                                             │</text>
+<text x="28" y="178" class="term">│   Confusion matrix (finding-level gold)                                     │</text>
+<text x="28" y="200" class="term">│                       real issue    not an issue                            │</text>
+<text x="28" y="222" class="term">│     ────────────────────────────────────────────                            │</text>
+<text x="28" y="244" class="term">│     review raised     TP      1     FP      0                               │</text>
+<text x="28" y="266" class="term">│     review missed     FN      0     TN      -                               │</text>
+<text x="28" y="288" class="term">│     TN is never counted: a correctly silent review leaves no gold           │</text>
+<text x="28" y="310" class="term">│                                                                             │</text>
+<text x="28" y="332" class="term">│   Self-score: the recorded reviews scored against their own gold            │</text>
+<text x="28" y="354" class="term">│   Recall            100%   ████████████████████  1/1 true issues            │</text>
+<text x="28" y="376" class="term">│   Precision        100%-100%   pending counted as FP in the lower bound     │</text>
+<text x="28" y="398" class="term">│   F1                   -   withheld (no false-positive gold)                │</text>
+<text x="28" y="420" class="term">│                                                                             │</text>
+<text x="28" y="442" class="term">│   Composition                                                               │</text>
+<text x="28" y="464" class="term">│      1  org/repo · go · tiny · error · error/ask-user                       │</text>
+<text x="28" y="486" class="term">│                                                                             │</text>
+<text x="28" y="508" class="term">│   Other sets                                                                │</text>
+<text x="28" y="530" class="term">│   all         1 case(s) · 1 gold · 0 unlabeled / pending · 0 queued         │</text>
+<text x="28" y="552" class="term">│   labeled     1 case(s) · 1 gold · 0 unlabeled / pending · 0 queued         │</text>
+<text x="28" y="574" class="term">│   tune        0 case(s) · 0 gold · 0 unlabeled / pending · 0 queued         │</text>
+<text x="28" y="596" class="term">│                                                                             │</text>
+<text x="28" y="618" class="term">│   ⚠ tune is empty; do not fit matcher thresholds on diversified             │</text>
+<text x="28" y="640" class="term">│                                                                             │</text>
+<text x="28" y="662" class="term">│   local-only: cases, gold, and scores never leave this machine              │</text>
+<text x="28" y="684" class="term">│                                                                             │</text>
+<text x="28" y="706" class="term">╰─────────────────────────────────────────────────────────────────────────────╯</text>
+</svg>

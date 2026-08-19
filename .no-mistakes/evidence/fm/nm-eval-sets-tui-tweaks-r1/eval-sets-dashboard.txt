@@ -1,0 +1,31 @@
+╭─ eval case sets ────────────────────────────────────────────────────────────╮
+│                                                                             │
+│   Diversified holdout (official gold-only set)                              │
+│   Cases                1   pins 1 · cap 32                                  │
+│   Gold findings        1   across 1 gold case(s)                            │
+│                                                                             │
+│   Confusion matrix (finding-level gold)                                     │
+│                       real issue    not an issue                            │
+│     ────────────────────────────────────────────                            │
+│     review raised     TP      1     FP      0                               │
+│     review missed     FN      0     TN      -                               │
+│     TN is never counted: a correctly silent review leaves no gold           │
+│                                                                             │
+│   Self-score: the recorded reviews scored against their own gold            │
+│   Recall            100%   ████████████████████  1/1 true issues            │
+│   Precision        100%-100%   pending counted as FP in the lower bound     │
+│   F1                   -   withheld (no false-positive gold)                │
+│                                                                             │
+│   Composition                                                               │
+│      1  org/repo · go · tiny · error · error/ask-user                       │
+│                                                                             │
+│   Other sets                                                                │
+│   all         1 case(s) · 1 gold · 0 unlabeled / pending · 0 queued         │
+│   labeled     1 case(s) · 1 gold · 0 unlabeled / pending · 0 queued         │
+│   tune        0 case(s) · 0 gold · 0 unlabeled / pending · 0 queued         │
+│                                                                             │
+│   ⚠ tune is empty; do not fit matcher thresholds on diversified             │
+│                                                                             │
+│   local-only: cases, gold, and scores never leave this machine              │
+│                                                                             │
+╰─────────────────────────────────────────────────────────────────────────────╯
