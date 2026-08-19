@@ -1,0 +1,48 @@
+End-user verification of eval display safety and ingest validation
+==============================================================
+
+$ NM_HOME=<fresh> no-mistakes eval sets
+╭─ eval case sets ────────────────────────────────────────────────────────────╮
+│                                                                             │
+│   Diversified holdout (official gold-only set)                              │
+│   Cases                0   pins 0 · cap 32                                  │
+│   Gold findings        0   across 0 gold case(s)                            │
+│                                                                             │
+│   Self-score: the recorded reviews scored against their own gold            │
+│     unlabeled / pending (no finding-level gold yet)                         │
+│                                                                             │
+│   Other sets                                                                │
+│   all         0 case(s) · 0 gold · 0 unlabeled / pending · 0 queued         │
+│   labeled     0 case(s) · 0 gold · 0 unlabeled / pending · 0 queued         │
+│   tune        0 case(s) · 0 gold · 0 unlabeled / pending · 0 queued         │
+│                                                                             │
+│   ⚠ diversified is empty: no labeled gold (unlabeled cases are not filled)  │
+│                                                                             │
+│   local-only: cases, gold, and scores never leave this machine              │
+│                                                                             │
+╰─────────────────────────────────────────────────────────────────────────────╯
+pipeline database files after eval sets: NONE
+
+$ NM_HOME=<fresh> no-mistakes eval report
+LOCAL-ONLY EVAL REPORT
+no candidate replays recorded yet
+pipeline database files after eval report: NONE
+
+$ NM_HOME=<fresh> no-mistakes eval run --cases labeled --candidate claude+test --repeats 1
+local eval session : 0 replay(s), candidate claude+test, repeats 1
+case set "labeled" is empty
+exit status: 1
+pipeline database files after eval run: NONE
+
+$ NM_HOME=<fresh> no-mistakes eval miss ingest demo-run --finding {"id":"fn-1","description":"miss","severity":"blocking"}
+finding severity "blocking" is not one of: error, warning, info
+exit status: 1
+
+$ NM_HOME=<fresh> no-mistakes eval miss ingest demo-run --finding {"id":"fn-1","description":"miss","action":"requires-human-review"}
+finding action "requires-human-review" is not one of: auto-fix, ask-user, no-op
+exit status: 1
+
+$ no-mistakes eval miss ingest --help (finding contract excerpt)
+Reads confirmed post-PR misses from --finding JSON (repeatable), not from GitHub comments or an external ledger. Captures the named run if needed, then writes false-negative gold onto the last completed non-blocking review pass.
+  no-mistakes eval miss ingest <run> --finding <json> [flags]
+      --finding stringArray   confirmed miss as JSON finding object with id and description, optional file, line, severity (error|warning|info, default error) and action (auto-fix|ask-user|no-op) (repeatable)
