@@ -1,0 +1,6 @@
+=== RUN   TestDocumentStep_HangingAgentFailsRunAfterTimeout
+    document_test.go:421: persisted run status: failed
+    document_test.go:422: persisted user-facing failure: step document failed: agent document: agent timed out after 20ms (agent silent for 20ms): agent timeout
+--- PASS: TestDocumentStep_HangingAgentFailsRunAfterTimeout (0.15s)
+PASS
+ok  	github.com/kunchenguid/no-mistakes/internal/pipeline/steps	0.463s
