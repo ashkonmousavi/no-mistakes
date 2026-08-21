@@ -1,0 +1,56 @@
+=== RUN   TestEvalJourney
+    eval_test.go:69: eval capture output:
+        captured 1 local review case(s)
+          01M0JTH538N7FJS9F55H69C4T8-01M0JTH5PFQMW7A2DHCQ13732E  run 01M0JTH538N7FJS9F55H69C4T8 round 01M0JTH5PFQMW7A2DHCQ13732E
+    eval_test.go:78: eval sets output:
+        ╭─ eval case sets ────────────────────────────────────────────────────────────╮
+        │                                                                             │
+        │   Diversified holdout (official gold-only set)                              │
+        │   Cases                0   pins 0 · cap 32                                  │
+        │   Gold findings        0   across 0 gold case(s)                            │
+        │                                                                             │
+        │   Self-score: the recorded reviews scored against their own gold            │
+        │     unlabeled / pending (no finding-level gold yet)                         │
+        │                                                                             │
+        │   Other sets                                                                │
+        │   all         1 case(s) · 0 gold · 1 unlabeled / pending · 0 queued         │
+        │   labeled     0 case(s) · 0 gold · 0 unlabeled / pending · 0 queued         │
+        │   tune        0 case(s) · 0 gold · 0 unlabeled / pending · 0 queued         │
+        │                                                                             │
+        │   ⚠ diversified is empty: no labeled gold (unlabeled cases are not filled)  │
+        │                                                                             │
+        │   local-only: cases, gold, and scores never leave this machine              │
+        │                                                                             │
+        ╰─────────────────────────────────────────────────────────────────────────────╯
+    eval_test.go:88: eval run output:
+        replaying 1 case(s) x 1 repeat(s) with claude,model=claude-opus-4-7,effort=high on all (cohort 8e197df767973bdc)
+        
+          ✓ 1/1  01M0JTH538N7FJS9F55H69C4T8-01M0JTH5PFQMW7A2DHCQ13732E repeat 1  TP 0 · FN 0 · FP 0 · pending 1  0s
+        
+        ╭─ eval run ──────────────────────────────────────────────────────────────────╮
+        │                                                                             │
+        │   Candidate                claude,model=claude-opus-4-7,effort=high         │
+        │   Case set                 all · cohort 8e197df767973bdc                    │
+        │   Replays              1   1 case(s) x 1 repeat(s) · 0 failure(s)           │
+        │   Labeled              0   replay(s) of cases with finding-level gold       │
+        │                                                                             │
+        │   unlabeled / pending (no finding-level gold in this set yet)               │
+        │                                                                             │
+        │   Tokens              28   fresh-input + output per replay                  │
+        │   Wall time           0s   average per replay                               │
+        │                                                                             │
+        ╰─────────────────────────────────────────────────────────────────────────────╯
+        local eval session 1787338201412404000-0468e86d5aaedaaf: 1 replay(s), candidate claude,model=claude-opus-4-7,effort=high, repeats 1
+    eval_test.go:115: eval report output:
+        LOCAL-ONLY EVAL REPORT
+        
+        claude,model=claude-opus-4-7,effort=high (cohort 8e197df767973bdc)
+          replays: 1 across 1 repeat(s); labeled: 0; failures: 0
+          finding scores: unlabeled / pending (no finding-level gold yet)
+          queued unmatched candidate findings: 1 (not scored as false-positive)
+          token cost: 28 fresh-input + output tokens per reported replay
+          wall time: 0.0s average
+          recall-vs-cost frontier: unavailable (no true-issue gold)
+--- PASS: TestEvalJourney (4.69s)
+PASS
+ok  	github.com/kunchenguid/no-mistakes/internal/e2e	4.975s
