@@ -1,0 +1,3 @@
+exempt=true
+exempt-reason=author dependabot[bot] is a bot and bot authors are exempt
+compliant=true

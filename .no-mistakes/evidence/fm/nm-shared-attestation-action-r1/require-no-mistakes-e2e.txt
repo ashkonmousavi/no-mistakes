@@ -1,0 +1,34 @@
+=== compliant ===
+Found no-mistakes signature in PR #812 body.
+Found compliant pipeline step attestation.
+exit_status=0 (expected 0)
+GITHUB_OUTPUT:
+exempt=false
+compliant=true
+
+=== stale-attestation ===
+::error::Pipeline attestation head_sha does not match the current PR head.
+
+attestation.head_sha: 0123456789abcdef0123456789abcdef01234567
+PR head: ffffffffffffffffffffffffffffffffffffffff
+
+A later push must not pass on an older attestation. Re-run 'git push no-mistakes' so the PR body attestation binds to the current head.
+
+See CONTRIBUTING.md for setup and the full workflow.
+
+PR author: kunchenguid
+Found no-mistakes signature in PR #812 body.
+exit_status=1 (expected 1)
+GITHUB_OUTPUT:
+exempt=false
+compliant=false
+exempt=false
+
+=== opted-in-bot-exemption ===
+Skipping no-mistakes enforcement: author dependabot[bot] is a bot and bot authors are exempt.
+exit_status=0 (expected 0)
+GITHUB_OUTPUT:
+exempt=true
+exempt-reason=author dependabot[bot] is a bot and bot authors are exempt
+compliant=true
+
