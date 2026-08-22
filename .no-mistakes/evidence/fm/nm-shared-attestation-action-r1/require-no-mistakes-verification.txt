@@ -1,0 +1,33 @@
+Shared require-no-mistakes action - executable verifier evidence
+
+SCENARIO 1: documented, head-bound completed attestation
+Found no-mistakes signature in PR #819 body.
+Found structurally compliant pipeline step attestation.
+::warning::PR-body attestation is author-editable and is not cryptographic proof that no-mistakes produced it.
+exit_status=0
+exempt=false
+compliant=true
+
+SCENARIO 2: stale attestation after PR head advances
+::error::Pipeline attestation head_sha does not match the current PR head.
+
+attestation.head_sha: 1111111111111111111111111111111111111111
+PR head: 2222222222222222222222222222222222222222
+
+A later push must not pass on an older attestation. Re-run 'git push no-mistakes' so the PR body attestation binds to the current head.
+
+See CONTRIBUTING.md for setup and the full workflow.
+
+PR author: 
+Found no-mistakes signature in PR #819 body.
+exit_status=1
+exempt=false
+compliant=false
+exempt=false
+
+SCENARIO 3: caller-configured bot exemption does not claim compliance
+Skipping no-mistakes enforcement: author renovate[bot] is a bot and bot authors are exempt.
+exit_status=0
+exempt=true
+exempt-reason=author renovate[bot] is a bot and bot authors are exempt
+compliant=false
