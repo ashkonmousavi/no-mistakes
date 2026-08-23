@@ -1,0 +1,25 @@
+Shared require-no-mistakes action behavioral transcript
+
+CASE: duplicate failed then completed is accepted (last record wins)
+EXIT: 0
+Found no-mistakes signature in PR #test body.
+Found structurally compliant pipeline step attestation.
+::warning::PR-body attestation is author-editable and is not cryptographic proof that no-mistakes produced it.
+
+CASE: completed record with skip-shaped sibling is accepted
+EXIT: 0
+Found no-mistakes signature in PR #test body.
+Found structurally compliant pipeline step attestation.
+::warning::PR-body attestation is author-editable and is not cryptographic proof that no-mistakes produced it.
+
+CASE: duplicate completed then failed is rejected (last record wins)
+EXIT: 1
+::error::Required no-mistakes pipeline steps are not completed: review (status=failed).
+
+This repository requires review, test, document to have status=completed. Quota skips and agent skips are not compliant.
+
+Contributions to this repository must be submitted via 'git push no-mistakes'.
+See CONTRIBUTING.md for setup and the full workflow.
+
+PR author: 
+Found no-mistakes signature in PR #test body.
