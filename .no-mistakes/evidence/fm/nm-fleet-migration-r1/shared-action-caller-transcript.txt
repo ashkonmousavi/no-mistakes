@@ -1,0 +1,22 @@
+$ Composite action with no pr-* inputs, reading a compliant pull_request event payload
+Found no-mistakes signature in PR #549 body.
+Found structurally compliant pipeline step attestation.
+::warning::PR-body attestation is author-editable and is not cryptographic proof that no-mistakes produced it.
+exit: 0
+outputs:
+  exempt=false
+  compliant=true
+
+$ Same no-input caller with event head changed after attestation
+::error::Pipeline attestation head_sha does not match the current PR head.
+
+attestation.head_sha: 0123456789abcdef0123456789abcdef01234567
+PR head: ffffffffffffffffffffffffffffffffffffffff
+
+A later push must not pass on an older attestation. Re-run 'git push no-mistakes' so the PR body attestation binds to the current head.
+
+See CONTRIBUTING.md for setup and the full workflow.
+
+PR author: human-contributor
+Found no-mistakes signature in PR #549 body.
+exit: 1
