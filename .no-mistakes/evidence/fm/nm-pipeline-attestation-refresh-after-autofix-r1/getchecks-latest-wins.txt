@@ -1,0 +1,17 @@
+=== RUN   TestEvidenceGetChecksLatestSameNameWinsWithoutWorkflowResurrection
+GetChecks observable result after full rollup/workflow union:
+[
+  {
+    "Name": "gate",
+    "Bucket": "pass",
+    "Kind": "run",
+    "State": "SUCCESS",
+    "CompletedAt": "2026-08-26T08:39:50Z",
+    "StartedAt": "2026-08-26T08:39:44Z",
+    "Link": "https://github.com/test/repo/actions/runs/102/job/202",
+    "PreRunFailure": false
+  }
+]
+--- PASS: TestEvidenceGetChecksLatestSameNameWinsWithoutWorkflowResurrection (0.02s)
+PASS
+ok  	github.com/kunchenguid/no-mistakes/internal/scm/github	0.256s
