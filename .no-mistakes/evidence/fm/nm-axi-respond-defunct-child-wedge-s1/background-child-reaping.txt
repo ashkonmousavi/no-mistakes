@@ -1,0 +1,30 @@
+OS-observable detached-child reaping regression
+==============================================
+
+Counterfactual: with only the asynchronous cmd.Wait() call temporarily removed,
+the focused behavioral test observed the exited update-check process remain as a
+direct child for the full deadline:
+
+$ go test ./internal/update -run '^TestSpawnBackgroundLeavesNoUnreapedChild$' -count=1 -v
+=== RUN   TestSpawnBackgroundLeavesNoUnreapedChild
+    background_reap_unix_test.go:73: background update-check child [21913] did not exit and get reaped
+--- FAIL: TestSpawnBackgroundLeavesNoUnreapedChild (5.05s)
+FAIL
+FAIL github.com/kunchenguid/no-mistakes/internal/update 5.352s
+COUNTERFACTUAL_EXIT=1
+
+The production line was restored immediately, then the same OS-observable
+regression passed 20 consecutive executions:
+
+$ go test ./internal/update -run '^TestSpawnBackgroundLeavesNoUnreapedChild$' -count=20
+ok github.com/kunchenguid/no-mistakes/internal/update 2.235s
+
+The complete update package also passed under the race detector:
+
+$ go test -race ./internal/update -count=1
+ok github.com/kunchenguid/no-mistakes/internal/update 1.716s
+
+The CLI package passed with the startup/background-update routing exercised:
+
+$ go test ./cmd/no-mistakes -count=1
+ok github.com/kunchenguid/no-mistakes/cmd/no-mistakes 0.239s
