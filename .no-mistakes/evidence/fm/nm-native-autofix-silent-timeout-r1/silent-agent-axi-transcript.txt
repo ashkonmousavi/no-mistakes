@@ -1,0 +1,106 @@
+=== RUN   TestSilentAgentTimeoutReportsMeasuredEvidence
+    silent_agent_timeout_test.go:86: stock axi run surface:
+        run: running
+          intent: completed
+          rebase: running
+          rebase: completed
+          review: running
+          review: failed
+        run: failed
+        run:
+          id: "01M137F0D4DCC1VP53Q8BN3KK4"
+          branch: feature/silent-agent
+          status: failed
+          head: e4f61892
+          findings: none
+          steps[9]{step,status,findings,duration_ms}:
+            intent,completed,0,0
+            rebase,completed,0,342
+            review,failed,0,3053
+            test,pending,0,0
+            document,pending,0,0
+            lint,pending,0,0
+            push,pending,0,0
+            pr,pending,0,0
+            ci,pending,0,0
+        branch_sync:
+          state: user_owned
+          changed: false
+          local:
+            branch: feature/silent-agent
+            head: e4f6189296bd4a6d64e85f9ee71bdf417d873bde
+            clean: true
+          pipeline:
+            run: "01M137F0D4DCC1VP53Q8BN3KK4"
+            status: failed
+            phase: ""
+            submitted_head: e4f6189296bd4a6d64e85f9ee71bdf417d873bde
+            current_head: e4f6189296bd4a6d64e85f9ee71bdf417d873bde
+            pushed_head: ""
+            pushed_at: 0
+            push_generation: 0
+          target:
+            kind: ""
+            remote: origin
+            url: /var/folders/0k/bf8mwt2n5qddzk24r20gfk0c0000gn/T/nm-e2e-4160042078/upstream.git
+            ref: ""
+          remote:
+            observed_head: ""
+            freshness: pipeline_push
+            observed_at: 0
+          relation: equal
+          safety: user_owned
+          pr_state: none
+        outcome: failed
+        error: "step review failed: agent review timed out after 3s: agent produced no output at all in 3s after its subprocess started (pid=96439); agent reported: claude exited: signal: terminated:"
+        help[2]: "Commit post-pipeline follow-up work on top of the existing branch so every pipeline fix commit remains present. Never abort-and-restart, reset, or replace the branch in a way that drops prior gate-fix commits.","Before a post-pipeline local commit or fresh run, follow the structured `branch_sync.next_action`. Run `no-mistakes axi sync` only when its code is `sync`; that guarded sync may be a strict fast-forward or a content-equivalent diverged advance that anchors the pre-sync head before moving the branch with reset semantics. Run `no-mistakes axi sync --recover` only when its code is `recover_custody` (a terminal run left unpublished pipeline commits preserved in the local gate). A `user_owned` state means cancellation released the branch before changing the submitted head: the exact branch and head are yours, immediately usable, and no sync action is needed. Process blocked or pipeline-owned states instead of improvising reset, stash, merge, rebase, force, or branch replacement."
+    silent_agent_timeout_test.go:87: stock axi status surface:
+        run:
+          id: "01M137F0D4DCC1VP53Q8BN3KK4"
+          branch: feature/silent-agent
+          status: failed
+          head: e4f61892
+          findings: none
+          steps[9]{step,status,findings,duration_ms}:
+            intent,completed,0,0
+            rebase,completed,0,342
+            review,failed,0,3053
+            test,pending,0,0
+            document,pending,0,0
+            lint,pending,0,0
+            push,pending,0,0
+            pr,pending,0,0
+            ci,pending,0,0
+        branch_sync:
+          state: user_owned
+          changed: false
+          local:
+            branch: feature/silent-agent
+            head: e4f6189296bd4a6d64e85f9ee71bdf417d873bde
+            clean: true
+          pipeline:
+            run: "01M137F0D4DCC1VP53Q8BN3KK4"
+            status: failed
+            phase: ""
+            submitted_head: e4f6189296bd4a6d64e85f9ee71bdf417d873bde
+            current_head: e4f6189296bd4a6d64e85f9ee71bdf417d873bde
+            pushed_head: ""
+            pushed_at: 0
+            push_generation: 0
+          target:
+            kind: ""
+            remote: origin
+            url: /var/folders/0k/bf8mwt2n5qddzk24r20gfk0c0000gn/T/nm-e2e-4160042078/upstream.git
+            ref: ""
+          remote:
+            observed_head: ""
+            freshness: pipeline_push
+            observed_at: 0
+          relation: equal
+          safety: user_owned
+          pr_state: none
+        outcome: failed
+        error: "step review failed: agent review timed out after 3s: agent produced no output at all in 3s after its subprocess started (pid=96439); agent reported: claude exited: signal: terminated:"
+--- PASS: TestSilentAgentTimeoutReportsMeasuredEvidence (8.57s)
+PASS
+ok  	github.com/kunchenguid/no-mistakes/internal/e2e	8.847s
