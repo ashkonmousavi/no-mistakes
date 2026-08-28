@@ -503,7 +503,8 @@ func TestPushStep_RedactsForkURLInGitErrors(t *testing.T) {
 // failure the correction-commit helper exists to survive: core.hooksPath=.husky
 // with a tracked pre-commit hook sourcing the generated .husky/_/husky.sh that
 // this worktree never had. The formatter or the Test step's evidence agent left
-// an uncommitted edit behind, and the run must still deliver it.
+// an uncommitted edit behind. Push must preserve it, request a full rereview,
+// and deliver it only after the durable approval moves to that exact commit.
 func TestPushStep_CommitsLeftoverChangesWhenLegacyHuskyRuntimeIsMissing(t *testing.T) {
 	upstream := t.TempDir()
 	gitCmd(t, upstream, "init", "--bare")
@@ -550,8 +551,12 @@ func TestPushStep_CommitsLeftoverChangesWhenLegacyHuskyRuntimeIsMissing(t *testi
 	setupGateMirror(t, sctx)
 	recordReviewApproval(t, sctx, headSHA)
 
-	if _, err := (&PushStep{}).Execute(sctx); err != nil {
-		t.Fatalf("push failed on a worktree whose legacy Husky runtime is absent: %v", err)
+	outcome, err := (&PushStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatalf("push preparation failed on a worktree whose legacy Husky runtime is absent: %v", err)
+	}
+	if outcome == nil || outcome.RestartFrom != types.StepReview {
+		t.Fatalf("push preparation restart = %#v, want %s", outcome, types.StepReview)
 	}
 
 	if got := gitStatusPorcelain(t, dir); got != "" {
@@ -561,8 +566,17 @@ func TestPushStep_CommitsLeftoverChangesWhenLegacyHuskyRuntimeIsMissing(t *testi
 	if pushedHead == headSHA {
 		t.Fatal("expected a new correction commit carrying the leftover change")
 	}
+	if got := gitCmd(t, upstream, "rev-parse", "refs/heads/feature"); got != headSHA {
+		t.Fatalf("remote changed to %s before correction %s was rereviewed", got, pushedHead)
+	}
+	recordReviewApproval(t, sctx, pushedHead)
+	if outcome, err := (&PushStep{}).Execute(sctx); err != nil {
+		t.Fatalf("push failed after exact-head rereview: %v", err)
+	} else if outcome.RestartFrom != "" {
+		t.Fatalf("exact reviewed head requested another rereview from %s", outcome.RestartFrom)
+	}
 	if got := gitCmd(t, upstream, "rev-parse", "refs/heads/feature"); got != pushedHead {
-		t.Fatalf("remote head = %s, want pushed correction commit %s", got, pushedHead)
+		t.Fatalf("remote head = %s, want reviewed correction commit %s", got, pushedHead)
 	}
 	if got := gitCmd(t, dir, "show", pushedHead+":feature.txt"); got != "formatted feature code" {
 		t.Fatalf("delivered feature.txt = %q, want the leftover change", got)

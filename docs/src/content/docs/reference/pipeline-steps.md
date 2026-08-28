@@ -190,8 +190,8 @@ Pushes the validated branch to the configured push target.
 - Commits any uncommitted changes left by pipeline agents or the formatter with message `no-mistakes: apply agent fixes`
 - Without fork routing, successful run-start validation selects the upstream URL from the working clone; when it matches the gate worktree's `origin`, the worktree URL is used so embedded credentials retained outside the database can authenticate. If validation fails, the run continues with its prior routing.
 - With GitHub fork routing, the push target is `repos.fork_url`
-- Immediately before remote mutation, reloads the durable review-approved commit and refuses to push when that binding is missing, malformed, or unreachable
-- Requires the commit proposed for push to equal or descend from the review-approved commit, allowing commits made by later pipeline steps without authorizing unrelated history
+- After Test, Document, or Lint creates a descendant commit, restarts immediately at Review with the durable `final_head_rereview` reason. Push performs the same check after formatter and leftover-change preparation, before any remote mutation. Three final-head rereviews is the convergence limit.
+- Immediately before remote mutation, reloads the durable review-approved commit and requires live `HEAD` to equal it exactly. A descendant restarts at Review; a missing, malformed, unreachable, backward, or divergent approval refuses publication.
 - Re-reads the push target via `git ls-remote` before pushing
 - For existing branches, refuses to force-push when the live remote carries commits the pipeline has not incorporated by patch-id
 - Fails closed when the remote safety check cannot verify whether the push would discard existing remote work

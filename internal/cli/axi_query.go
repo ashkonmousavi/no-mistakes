@@ -185,6 +185,7 @@ func annotateRunView(env *axiEnv, rv *runView) {
 			if stats, err := env.d.StepRoundStats(step.ID); err == nil {
 				step.RoundCount = stats.TotalRounds
 				step.FixRoundCount = stats.FixRounds
+				step.RoundTrigger = stats.LatestTrigger
 				step.PendingFixSource = stats.PendingFixSource
 			}
 		}

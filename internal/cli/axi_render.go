@@ -88,6 +88,7 @@ type stepView struct {
 	AgentPID         *int
 	RoundCount       int
 	FixRoundCount    int
+	RoundTrigger     string
 	AutoFixLimit     int
 	PendingFixSource string
 	QuietWarning     time.Duration
@@ -133,6 +134,7 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 			AgentPID:         s.AgentPID,
 			RoundCount:       s.RoundCount,
 			FixRoundCount:    s.FixRoundCount,
+			RoundTrigger:     s.RoundTrigger,
 			AutoFixLimit:     s.AutoFixLimit,
 			PendingFixSource: s.PendingFixSource,
 		}
@@ -347,6 +349,9 @@ func (s stepView) agentPIDString() string {
 }
 
 func (s stepView) roundSummary() string {
+	if s.Name == string(types.StepReview) && s.RoundTrigger == "final_head_rereview" {
+		return fmt.Sprintf("final_head_rereview %d", s.RoundCount)
+	}
 	if s.Status == string(types.StepStatusFixing) {
 		attempt := s.FixRoundCount
 		if s.PendingFixSource != "" {
@@ -468,6 +473,9 @@ func gateFieldsWithHelp(gate stepView, help []string) []toon.Field {
 	}
 	if parsed.RiskLevel != "" {
 		gfields = append(gfields, toon.Field{Key: "risk", Value: parsed.RiskLevel})
+	}
+	if gate.RoundTrigger == "final_head_rereview" {
+		gfields = append(gfields, toon.Field{Key: "reason", Value: gate.RoundTrigger})
 	}
 	// Point-of-use reminder at the review gate: review auto-fix defaults to
 	// disabled, so agents should expect blocking and ask-user findings to park

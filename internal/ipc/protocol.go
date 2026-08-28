@@ -289,6 +289,7 @@ type StepResultInfo struct {
 	FixSummaries     []string `json:"fix_summaries,omitempty"`
 	RoundCount       int      `json:"round_count,omitempty"`
 	FixRoundCount    int      `json:"fix_round_count,omitempty"`
+	RoundTrigger     string   `json:"round_trigger,omitempty"`
 	AutoFixLimit     int      `json:"auto_fix_limit,omitempty"`
 	PendingFixSource string   `json:"pending_fix_source,omitempty"`
 	Error            *string  `json:"error,omitempty"`

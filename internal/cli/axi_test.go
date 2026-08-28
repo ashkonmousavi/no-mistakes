@@ -194,6 +194,46 @@ func TestRunObjectRendersActiveStepDiagnostics(t *testing.T) {
 	}
 }
 
+func TestActiveReviewStatusDistinguishesFinalHeadRereview(t *testing.T) {
+	started := int64(1)
+	rv := runView{
+		ID:     "run-final-head",
+		Status: string(types.RunRunning),
+		Steps: []stepView{{
+			Name:           string(types.StepReview),
+			Status:         string(types.StepStatusRunning),
+			StartedAt:      &started,
+			RoundCount:     2,
+			RoundTrigger:   "final_head_rereview",
+			LastActivityAt: &started,
+		}},
+	}
+	out := axiDoc(runObjectField(rv))
+	if !strings.Contains(out, "final_head_rereview 2") {
+		t.Fatalf("active status did not expose durable rereview reason:\n%s", out)
+	}
+}
+
+func TestParkedReviewStatusDistinguishesFinalHeadRereview(t *testing.T) {
+	fields := gateFields(stepView{
+		Name:           string(types.StepReview),
+		Status:         string(types.StepStatusAwaitingApproval),
+		RoundTrigger:   "final_head_rereview",
+		FindingsJSON:   `{"findings":[],"summary":"review decision"}`,
+		LastActivity:   "parked",
+		FixRoundCount:  0,
+		RoundCount:     2,
+		AutoFixLimit:   0,
+		QuietWarning:   0,
+		StartedAt:      nil,
+		LastActivityAt: nil,
+	})
+	out := axiDoc(fields...)
+	if !strings.Contains(out, "reason: final_head_rereview") {
+		t.Fatalf("parked status did not expose durable rereview reason:\n%s", out)
+	}
+}
+
 func TestStatusRendersCurrentAutoFixAttemptWithPersistedLimit(t *testing.T) {
 	database := openTestDB(t)
 	repo, err := database.InsertRepo(t.TempDir(), "origin", "main")

@@ -149,6 +149,7 @@ func TestExecutor_FailedOrInterruptedRereviewCannotAuthorizePush(t *testing.T) {
 				if err := pipeline.ValidateRecoveredRun(sctx.DB, parked, steps); err != nil {
 					t.Fatalf("parked rereview is not recoverable: %v", err)
 				}
+				assertFinalHeadRereviewTrigger(t, sctx)
 				cancel()
 				select {
 				case <-done:
@@ -287,4 +288,26 @@ func waitForFinalHeadReview(t *testing.T, sctx *pipeline.StepContext, want types
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("review did not reach %s", want)
+}
+
+func assertFinalHeadRereviewTrigger(t *testing.T, sctx *pipeline.StepContext) {
+	t.Helper()
+	steps, err := sctx.DB.GetStepsByRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range steps {
+		if step.StepName != types.StepReview {
+			continue
+		}
+		rounds, err := sctx.DB.GetRoundsByStep(step.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rounds) < 2 || rounds[len(rounds)-1].Trigger != "final_head_rereview" {
+			t.Fatalf("review rounds do not durably identify rereview: %#v", rounds)
+		}
+		return
+	}
+	t.Fatal("review step not found")
 }

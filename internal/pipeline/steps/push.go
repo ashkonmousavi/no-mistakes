@@ -62,6 +62,34 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 	}
 
 	ref := normalizedBranchRef(sctx.Run.Branch)
+	headBeingPushed, err := git.HeadSHA(ctx, sctx.WorkDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve head before push: %w", err)
+	}
+	needsRereview, err := reviewApprovedPushHeadDecision(sctx, headBeingPushed)
+	if err != nil {
+		return nil, err
+	}
+	if needsRereview {
+		// Preserve a clean forward commit even when it was made directly by an
+		// agent rather than commitPipelineCorrection. The next Review must bind
+		// the exact local head before Push performs any remote mutation.
+		if _, err := git.Run(ctx, sctx.WorkDir, "update-ref", ref, headBeingPushed); err != nil {
+			return nil, fmt.Errorf("update local branch ref before rereview: %w", err)
+		}
+		if headBeingPushed != sctx.Run.HeadSHA {
+			sctx.Run.HeadSHA = headBeingPushed
+			if err := sctx.DB.UpdateRunHeadSHA(sctx.Run.ID, headBeingPushed); err != nil {
+				return nil, err
+			}
+		}
+		sctx.Log("final_head_rereview: push preparation advanced HEAD after review; restarting at Review before publication")
+		return &pipeline.StepOutcome{
+			RestartFrom:   types.StepReview,
+			RestartReason: pipeline.RestartReasonFinalHeadRereview,
+		}, nil
+	}
+
 	branch := strings.TrimPrefix(ref, "refs/heads/")
 
 	pushURL := resolvePushURL(sctx)
@@ -72,14 +100,6 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 		sctx.Log(fmt.Sprintf("pushing to fork %s (%s)...", safeurl.Redact(pushURL), ref))
 	} else {
 		sctx.Log(fmt.Sprintf("pushing to %s (%s)...", safeurl.Redact(pushURL), ref))
-	}
-
-	headBeingPushed, err := git.HeadSHA(ctx, sctx.WorkDir)
-	if err != nil {
-		return nil, fmt.Errorf("resolve head before push: %w", err)
-	}
-	if err := assertReviewApprovedPushHead(sctx, headBeingPushed); err != nil {
-		return nil, err
 	}
 
 	// Decide whether force-pushing would discard commits the pipeline never saw.
@@ -190,47 +210,8 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 	return &pipeline.StepOutcome{}, nil
 }
 
-func assertReviewApprovedPushHead(sctx *pipeline.StepContext, proposedHead string) error {
-	run, err := sctx.DB.GetRun(sctx.Run.ID)
-	if err != nil {
-		return fmt.Errorf("load durable review approval before push: %w", err)
-	}
-	if run == nil || run.ReviewApprovedHeadSHA == nil || strings.TrimSpace(*run.ReviewApprovedHeadSHA) == "" {
-		return fmt.Errorf("refusing to push: run has no durably recorded review-approved head")
-	}
-	approvedHead := strings.TrimSpace(*run.ReviewApprovedHeadSHA)
-	if !isFullGitObjectID(approvedHead) {
-		return fmt.Errorf("refusing to push: durable review-approved head is malformed")
-	}
-	resolved, err := git.Run(sctx.Ctx, sctx.WorkDir, "rev-parse", "--verify", approvedHead+"^{commit}")
-	if err != nil || !strings.EqualFold(strings.TrimSpace(resolved), approvedHead) {
-		return fmt.Errorf("refusing to push: durable review-approved head is unreachable")
-	}
-	if proposedHead != approvedHead {
-		if _, err := git.Run(sctx.Ctx, sctx.WorkDir, "merge-base", "--is-ancestor", approvedHead, proposedHead); err != nil {
-			return fmt.Errorf("refusing to push: proposed head %s violates continuity with review-approved head %s (it is not an equal or descendant commit)", shortObjectID(proposedHead), shortObjectID(approvedHead))
-		}
-	}
-	return nil
-}
-
-func isFullGitObjectID(value string) bool {
-	if len(value) != 40 && len(value) != 64 {
-		return false
-	}
-	for _, r := range value {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
-			return false
-		}
-	}
-	return true
-}
-
-func shortObjectID(value string) string {
-	if len(value) > 12 {
-		return value[:12]
-	}
-	return value
+func reviewApprovedPushHeadDecision(sctx *pipeline.StepContext, proposedHead string) (bool, error) {
+	return pipeline.ReviewHeadNeedsRereview(sctx.Ctx, sctx.DB, sctx.Run.ID, sctx.WorkDir, proposedHead)
 }
 
 // lastKnownBranchTip returns the commit SHA the pipeline last observed or
