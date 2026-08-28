@@ -5,11 +5,12 @@
 === PAUSE TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
 === RUN   TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
 === PAUSE TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
-=== CONT  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
 === CONT  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
-2026/08/28 15:03:43 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
-2026/08/28 15:03:43 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
-    ci_revalidate_repairs_test.go:203: observable delivery: revalidate=true outcome=&pipeline.StepOutcome{NeedsApproval:false, AutoFixable:false, Findings:"", ExitCode:0, PRURL:"", Skipped:false, SkipRemaining:false, RestartFrom:"review", FixSummary:"", ReviewApprovedHeadSHA:"", DurationOverrideMS:0} original=eafb4f48509f98c7badaf131ed647c4d0e3d0975 local=7843e20d9caf8db829e49869a779a57055335778 remote=eafb4f48509f98c7badaf131ed647c4d0e3d0975 approval_kept=false push_binding=eafb4f48509f98c7badaf131ed647c4d0e3d0975
+=== CONT  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
+2026/08/28 15:37:48 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+2026/08/28 15:37:48 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+=== NAME  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
+    ci_revalidate_repairs_test.go:207: observable delivery: restart_from="review" prior_head=cabcc91a695925a5dfb244457067f67623445880 local_head=3c3fd496b8a6b077e2c17098d46e3d945b58173f remote_head=cabcc91a695925a5dfb244457067f67623445880 approval_retained=false published_head=cabcc91a695925a5dfb244457067f67623445880
         CI log:
         monitoring CI for PR #42 (timeout: 30s)...
         CI repair policy: restart validation from Review after a repair (ci.revalidate_repairs: true)
@@ -17,17 +18,17 @@
         running agent to fix CI issues...
         committed CI repair for revalidation
 === NAME  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
-    ci_revalidate_repairs_test.go:203: observable delivery: revalidate=false outcome=&pipeline.StepOutcome{NeedsApproval:true, AutoFixable:false, Findings:"{\"findings\":[{\"severity\":\"warning\",\"description\":\"CI check failing: test\",\"action\":\"\"}],\"summary\":\"CI failures still present after auto-fix attempts\",\"risk_level\":\"\",\"risk_rationale\":\"\"}", ExitCode:0, PRURL:"", Skipped:false, SkipRemaining:false, RestartFrom:"", FixSummary:"", ReviewApprovedHeadSHA:"", DurationOverrideMS:0} original=eafb4f48509f98c7badaf131ed647c4d0e3d0975 local=7843e20d9caf8db829e49869a779a57055335778 remote=7843e20d9caf8db829e49869a779a57055335778 approval_kept=true push_binding=7843e20d9caf8db829e49869a779a57055335778
+    ci_revalidate_repairs_test.go:207: observable delivery: restart_from="" prior_head=cabcc91a695925a5dfb244457067f67623445880 local_head=3c3fd496b8a6b077e2c17098d46e3d945b58173f remote_head=3c3fd496b8a6b077e2c17098d46e3d945b58173f approval_retained=true published_head=3c3fd496b8a6b077e2c17098d46e3d945b58173f
         CI log:
         monitoring CI for PR #42 (timeout: 30s)...
         CI repair policy: publish the repair and keep monitoring (ci.revalidate_repairs: false)
         issues detected: test - auto-fixing (attempt 1/1)...
         running agent to fix CI issues...
-        pushing to /var/folders/0k/bf8mwt2n5qddzk24r20gfk0c0000gn/T/TestCIStep_RevalidateRepairsPolicySelectsRepairDeliverydefault_4103014769/001 (refs/heads/feature)...
+        pushing to /var/folders/0k/bf8mwt2n5qddzk24r20gfk0c0000gn/T/TestCIStep_RevalidateRepairsPolicySelectsRepairDeliverydefault_2976948589/001 (refs/heads/feature)...
         committed and pushed CI repair
         issues detected: test - max auto-fix attempts (1) reached, waiting for manual intervention...
 --- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery (0.00s)
-    --- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review (0.76s)
-    --- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring (0.99s)
+    --- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review (9.60s)
+    --- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring (16.30s)
 PASS
-ok  	github.com/kunchenguid/no-mistakes/internal/pipeline/steps	1.346s
+ok  	github.com/kunchenguid/no-mistakes/internal/pipeline/steps	17.720s
