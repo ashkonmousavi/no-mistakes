@@ -1,0 +1,19 @@
+=== RUN   TestPushStep_RefusesPostReviewClobberWithoutLaterPipelineCommit
+    push_test.go:85: review-approved=b748ae7771b5ba00ffacc0bb004948023f5e65cf clobbered-HEAD=c234feb6627ac485b7cc76322456c9c40d6fc818 push-refused="refusing to push: proposed head c234feb6627a violates continuity with review-approved head b748ae7771b5 (it is not an equal or descendant commit)" remote-still=35ff6282cdd9717a11d7d3d7091bb7b9270555c4 unreviewed-file-shipped=false
+--- PASS: TestPushStep_RefusesPostReviewClobberWithoutLaterPipelineCommit (0.49s)
+=== RUN   TestAssertReviewApprovedPushHead
+=== RUN   TestAssertReviewApprovedPushHead/equal
+=== RUN   TestAssertReviewApprovedPushHead/legitimate_descendant
+=== RUN   TestAssertReviewApprovedPushHead/backward_replacement
+=== RUN   TestAssertReviewApprovedPushHead/divergent_replacement
+=== RUN   TestAssertReviewApprovedPushHead/malformed_approval
+=== RUN   TestAssertReviewApprovedPushHead/unreachable_approval
+--- PASS: TestAssertReviewApprovedPushHead (0.59s)
+    --- PASS: TestAssertReviewApprovedPushHead/equal (0.07s)
+    --- PASS: TestAssertReviewApprovedPushHead/legitimate_descendant (0.13s)
+    --- PASS: TestAssertReviewApprovedPushHead/backward_replacement (0.10s)
+    --- PASS: TestAssertReviewApprovedPushHead/divergent_replacement (0.14s)
+    --- PASS: TestAssertReviewApprovedPushHead/malformed_approval (0.06s)
+    --- PASS: TestAssertReviewApprovedPushHead/unreachable_approval (0.09s)
+PASS
+ok  	github.com/kunchenguid/no-mistakes/internal/pipeline/steps	2.444s
