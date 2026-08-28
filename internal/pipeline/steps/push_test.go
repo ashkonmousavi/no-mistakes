@@ -11,6 +11,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 func setupGateMirror(t *testing.T, sctx *pipeline.StepContext) string {
@@ -91,12 +92,13 @@ func TestPushStep_RefusesPostReviewClobberWithoutLaterPipelineCommit(t *testing.
 	)
 }
 
-func TestAssertReviewApprovedPushHead(t *testing.T) {
+func TestReviewApprovedPushHeadDecision(t *testing.T) {
 	tests := []struct {
-		name      string
-		approval  string
-		proposed  func(t *testing.T, dir, baseSHA, headSHA string) string
-		wantError string
+		name         string
+		approval     string
+		proposed     func(t *testing.T, dir, baseSHA, headSHA string) string
+		wantRereview bool
+		wantError    string
 	}{
 		{
 			name: "equal",
@@ -114,6 +116,7 @@ func TestAssertReviewApprovedPushHead(t *testing.T) {
 				gitCmd(t, dir, "commit", "-m", "document approved change")
 				return gitCmd(t, dir, "rev-parse", "HEAD")
 			},
+			wantRereview: true,
 		},
 		{
 			name: "backward replacement",
@@ -160,10 +163,13 @@ func TestAssertReviewApprovedPushHead(t *testing.T) {
 			}
 			recordReviewApproval(t, sctx, approval)
 			proposed := tt.proposed(t, dir, baseSHA, headSHA)
-			err := assertReviewApprovedPushHead(sctx, proposed)
+			needsRereview, err := reviewApprovedPushHeadDecision(sctx, proposed)
 			if tt.wantError == "" {
 				if err != nil {
 					t.Fatalf("expected continuity approval, got %v", err)
+				}
+				if needsRereview != tt.wantRereview {
+					t.Fatalf("needs rereview = %v, want %v", needsRereview, tt.wantRereview)
 				}
 				return
 			}
@@ -174,12 +180,46 @@ func TestAssertReviewApprovedPushHead(t *testing.T) {
 	}
 }
 
-func TestAssertReviewApprovedPushHead_RefusesMissingLegacyState(t *testing.T) {
+func TestReviewApprovedPushHeadDecision_RefusesMissingLegacyState(t *testing.T) {
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
-	err := assertReviewApprovedPushHead(sctx, headSHA)
+	_, err := reviewApprovedPushHeadDecision(sctx, headSHA)
 	if err == nil || !strings.Contains(err.Error(), "no durably recorded review-approved head") {
 		t.Fatalf("expected missing legacy approval refusal, got %v", err)
+	}
+}
+
+func TestPushStep_DescendantHeadRequestsReviewBeforeRemoteMutation(t *testing.T) {
+	upstream := t.TempDir()
+	gitCmd(t, upstream, "init", "--bare")
+	dir, baseSHA, reviewedHead := setupGitRepo(t)
+	gitCmd(t, dir, "remote", "add", "origin", upstream)
+	gitCmd(t, dir, "push", "origin", "main")
+	gitCmd(t, dir, "push", "origin", "feature")
+
+	if err := os.WriteFile(filepath.Join(dir, "post-review.txt"), []byte("post-review\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "post-review correction")
+	descendant := gitCmd(t, dir, "rev-parse", "HEAD")
+
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, reviewedHead, config.Commands{})
+	sctx.Repo.UpstreamURL = upstream
+	sctx.Run.Branch = "refs/heads/feature"
+	sctx.Run.HeadSHA = descendant
+	setupGateMirror(t, sctx)
+	recordReviewApproval(t, sctx, reviewedHead)
+
+	outcome, err := (&PushStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatalf("push preflight failed instead of requesting rereview: %v", err)
+	}
+	if outcome == nil || outcome.RestartFrom != types.StepReview {
+		t.Fatalf("restart = %#v, want %s", outcome, types.StepReview)
+	}
+	if remote := gitCmd(t, upstream, "rev-parse", "refs/heads/feature"); remote != reviewedHead {
+		t.Fatalf("remote changed to %s before descendant %s was reviewed", remote, descendant)
 	}
 }
 
