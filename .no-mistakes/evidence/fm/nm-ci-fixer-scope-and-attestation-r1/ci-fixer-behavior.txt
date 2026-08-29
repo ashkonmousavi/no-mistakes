@@ -1,0 +1,25 @@
+=== RUN   TestRebindPipelineAttestationHead_VerifyPyRoundTrip
+=== PAUSE TestRebindPipelineAttestationHead_VerifyPyRoundTrip
+=== RUN   TestCIStep_PublishRepairRebindsAttestationAcrossRepairPushes
+--- PASS: TestCIStep_PublishRepairRebindsAttestationAcrossRepairPushes (0.66s)
+=== RUN   TestCIStep_UnsettledRepairPushParksImmediately
+2026/08/29 12:28:26 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+--- PASS: TestCIStep_UnsettledRepairPushParksImmediately (1.03s)
+=== RUN   TestCIStep_PublishRepairSkipsRestampWithoutReader
+--- PASS: TestCIStep_PublishRepairSkipsRestampWithoutReader (0.61s)
+=== RUN   TestCIStep_PublishRepairDoesNotMintAttestation
+--- PASS: TestCIStep_PublishRepairDoesNotMintAttestation (0.71s)
+=== RUN   TestCIStep_AutoFixNoChanges_CountsAsAttempt
+=== PAUSE TestCIStep_AutoFixNoChanges_CountsAsAttempt
+=== RUN   TestCIStep_AutoFixExternalFailureStopsWithAgentConclusion
+=== PAUSE TestCIStep_AutoFixExternalFailureStopsWithAgentConclusion
+=== CONT  TestRebindPipelineAttestationHead_VerifyPyRoundTrip
+=== CONT  TestCIStep_AutoFixExternalFailureStopsWithAgentConclusion
+=== CONT  TestCIStep_AutoFixNoChanges_CountsAsAttempt
+--- PASS: TestRebindPipelineAttestationHead_VerifyPyRoundTrip (0.12s)
+2026/08/29 12:28:29 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+--- PASS: TestCIStep_AutoFixExternalFailureStopsWithAgentConclusion (0.67s)
+2026/08/29 12:28:29 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+--- PASS: TestCIStep_AutoFixNoChanges_CountsAsAttempt (1.26s)
+PASS
+ok  	github.com/kunchenguid/no-mistakes/internal/pipeline/steps	4.510s
