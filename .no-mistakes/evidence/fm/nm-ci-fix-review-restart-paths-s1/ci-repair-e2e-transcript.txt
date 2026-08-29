@@ -1,0 +1,47 @@
+=== RUN   TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery
+=== RUN   TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
+2026/08/28 19:29:52 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+    ci_revalidate_repairs_test.go:208: observable delivery: restart_from="" prior_head=ed6f9158f2170a1e360795cd896ae633bee3885c local_head=0faa3183c0a1bdcbed1b975728d159b9a3017760 remote_head=0faa3183c0a1bdcbed1b975728d159b9a3017760 approval_retained=true published_head=0faa3183c0a1bdcbed1b975728d159b9a3017760
+        CI log:
+        monitoring CI for PR #42 (timeout: 30s)...
+        CI repair policy: publish a repair whose continuity with the reviewed head is provable, otherwise restart validation from Review (ci.revalidate_repairs: false)
+        issues detected: test - auto-fixing (attempt 1/1)...
+        running agent to fix CI issues...
+        pushing to /var/folders/0k/bf8mwt2n5qddzk24r20gfk0c0000gn/T/TestCIStep_RevalidateRepairsPolicySelectsRepairDeliverydefault_3510040901/001 (refs/heads/feature)...
+        committed and pushed CI repair
+        issues detected: test - max auto-fix attempts (1) reached, waiting for manual intervention...
+=== RUN   TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
+2026/08/28 19:30:09 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+    ci_revalidate_repairs_test.go:208: observable delivery: restart_from="review" prior_head=199fd89d7c589a73e92d4f62a6681a67591db1bf local_head=ef81d837fbfe346d2c5111fadc315d2fee04db0f remote_head=199fd89d7c589a73e92d4f62a6681a67591db1bf approval_retained=false published_head=199fd89d7c589a73e92d4f62a6681a67591db1bf
+        CI log:
+        monitoring CI for PR #42 (timeout: 30s)...
+        CI repair policy: always restart validation from Review after a repair (ci.revalidate_repairs: true)
+        issues detected: test - auto-fixing (attempt 1/1)...
+        running agent to fix CI issues...
+        committed CI repair for revalidation
+--- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery (27.04s)
+    --- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring (17.07s)
+    --- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review (9.97s)
+=== RUN   TestCIStep_ConflictRepairAlwaysRevalidates
+=== RUN   TestCIStep_ConflictRepairAlwaysRevalidates/genuine_rebase_replaying_the_reviewed_commit
+    ci_revalidate_repairs_test.go:679: observable conflict delivery: reviewed_head=57c870387d992ba31191312630e8dd6cc633bb54 repaired_head=dbc6df6c6eb26dd7dcd86c89e303bbd746cb53f0 remote_head=57c870387d992ba31191312630e8dd6cc633bb54 reviewed_work_retained=true restart_from=review approval_revoked=true
+        CI log:
+        no changes to commit
+        cannot prove the repaired head continues the reviewed head: repaired head dbc6df6c6eb2 does not descend from reviewed head 57c870387d99; revalidating from Review instead of publishing
+        committed CI repair for revalidation
+=== RUN   TestCIStep_ConflictRepairAlwaysRevalidates/reset_to_base_dropping_the_reviewed_commit
+    ci_revalidate_repairs_test.go:679: observable conflict delivery: reviewed_head=fb42e5c06261ff7bf6109a99c7069768931fd849 repaired_head=60146711250d6f7048c3c4f5859707c1e7452eb0 remote_head=fb42e5c06261ff7bf6109a99c7069768931fd849 reviewed_work_retained=false restart_from=review approval_revoked=true
+        CI log:
+        no changes to commit
+        cannot prove the repaired head continues the reviewed head: repaired head 60146711250d does not descend from reviewed head fb42e5c06261; revalidating from Review instead of publishing
+        committed CI repair for revalidation
+--- PASS: TestCIStep_ConflictRepairAlwaysRevalidates (1.69s)
+    --- PASS: TestCIStep_ConflictRepairAlwaysRevalidates/genuine_rebase_replaying_the_reviewed_commit (0.86s)
+    --- PASS: TestCIStep_ConflictRepairAlwaysRevalidates/reset_to_base_dropping_the_reviewed_commit (0.82s)
+=== RUN   TestCIStep_UnsettledPublicationRetryIsBounded
+2026/08/28 19:30:21 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+    ci_revalidate_repairs_test.go:853: observable unsettled publication: published_head=b5aba730fb2d9820895f63bf22d669b6dd393839 remote_head=b5aba730fb2d9820895f63bf22d669b6dd393839 fix_agent_calls=1 settlement_attempts=3 parked=true
+        finding: {"findings":[{"severity":"warning","description":"The CI repair b5aba730fb2d was pushed and verified on the remote, but settling its local publication state failed 3 times and is not being retried further. CI may already be testing the published commit, but rerunning is unsafe until the gate mirror and durable run state are inspected and reconciled. Inspect the gate repository and run record before rerunning, or continue watching the PR.","action":"ask-user"}],"summary":"CI repair is published but its publication is unsettled","risk_level":"","risk_rationale":""}
+--- PASS: TestCIStep_UnsettledPublicationRetryIsBounded (10.79s)
+PASS
+ok  	github.com/kunchenguid/no-mistakes/internal/pipeline/steps	41.170s
