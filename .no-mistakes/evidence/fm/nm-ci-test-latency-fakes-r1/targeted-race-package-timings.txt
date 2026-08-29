@@ -1,0 +1,6 @@
+$ GOMAXPROCS=3 go test -race -count=1 ./internal/pipeline/steps ./internal/pipeline/steps/citest
+ok  	github.com/kunchenguid/no-mistakes/internal/pipeline/steps	84.906s
+ok  	github.com/kunchenguid/no-mistakes/internal/pipeline/steps/citest	8.322s
+real 87.45
+user 59.78
+sys 54.21
