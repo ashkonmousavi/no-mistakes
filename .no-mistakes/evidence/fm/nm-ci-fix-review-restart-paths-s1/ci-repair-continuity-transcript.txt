@@ -1,0 +1,84 @@
+=== RUN   TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery
+=== PAUSE TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery
+=== RUN   TestCIStep_PartialPublicationRecordsNothing
+=== PAUSE TestCIStep_PartialPublicationRecordsNothing
+=== RUN   TestCIStep_ConflictRepairAlwaysRevalidates
+=== PAUSE TestCIStep_ConflictRepairAlwaysRevalidates
+=== RUN   TestCIStep_ManualRepairFollowsTheSamePolicy
+=== PAUSE TestCIStep_ManualRepairFollowsTheSamePolicy
+=== RUN   TestCIStep_RepairWithoutReviewAuthorityRevalidatesRatherThanPublishing
+=== PAUSE TestCIStep_RepairWithoutReviewAuthorityRevalidatesRatherThanPublishing
+=== RUN   TestCIStep_FailedRevalidationWriteDoesNotAdvanceTheLiveHead
+--- PASS: TestCIStep_FailedRevalidationWriteDoesNotAdvanceTheLiveHead (0.60s)
+=== RUN   TestCIStep_MonitorRestartsAtReviewForAHeldRepair
+=== PAUSE TestCIStep_MonitorRestartsAtReviewForAHeldRepair
+=== RUN   TestAssertReviewApprovedPushHead
+=== RUN   TestAssertReviewApprovedPushHead/equal
+=== RUN   TestAssertReviewApprovedPushHead/legitimate_descendant
+=== RUN   TestAssertReviewApprovedPushHead/backward_replacement
+=== RUN   TestAssertReviewApprovedPushHead/divergent_replacement
+=== RUN   TestAssertReviewApprovedPushHead/malformed_approval
+=== RUN   TestAssertReviewApprovedPushHead/unreachable_approval
+--- PASS: TestAssertReviewApprovedPushHead (1.18s)
+    --- PASS: TestAssertReviewApprovedPushHead/equal (0.35s)
+    --- PASS: TestAssertReviewApprovedPushHead/legitimate_descendant (0.21s)
+    --- PASS: TestAssertReviewApprovedPushHead/backward_replacement (0.15s)
+    --- PASS: TestAssertReviewApprovedPushHead/divergent_replacement (0.24s)
+    --- PASS: TestAssertReviewApprovedPushHead/malformed_approval (0.10s)
+    --- PASS: TestAssertReviewApprovedPushHead/unreachable_approval (0.12s)
+=== RUN   TestAssertReviewApprovedPushHead_UsesStepScopedGit
+--- PASS: TestAssertReviewApprovedPushHead_UsesStepScopedGit (2.68s)
+=== CONT  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery
+=== CONT  TestCIStep_MonitorRestartsAtReviewForAHeldRepair
+=== CONT  TestCIStep_ManualRepairFollowsTheSamePolicy
+=== RUN   TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
+=== CONT  TestCIStep_RepairWithoutReviewAuthorityRevalidatesRatherThanPublishing
+=== CONT  TestCIStep_ConflictRepairAlwaysRevalidates
+=== CONT  TestCIStep_PartialPublicationRecordsNothing
+=== PAUSE TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
+=== RUN   TestCIStep_ManualRepairFollowsTheSamePolicy/publish_policy
+=== RUN   TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
+=== PAUSE TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
+=== CONT  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
+=== RUN   TestCIStep_ConflictRepairAlwaysRevalidates/genuine_rebase_replaying_the_reviewed_commit
+=== CONT  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
+--- PASS: TestCIStep_RepairWithoutReviewAuthorityRevalidatesRatherThanPublishing (1.53s)
+=== NAME  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
+    ci_revalidate_repairs_test.go:209: observable delivery: revalidate=true prior_head=e307aea17db65a209b7cb6e1b20b31fc35c9d324 local_head=fdbf13c025071733aa0974457339a618e75c4360 remote_head=e307aea17db65a209b7cb6e1b20b31fc35c9d324 approval_retained=false published_head=e307aea17db65a209b7cb6e1b20b31fc35c9d324
+        CI log:
+        committed CI repair for revalidation
+=== NAME  TestCIStep_ConflictRepairAlwaysRevalidates/genuine_rebase_replaying_the_reviewed_commit
+    ci_revalidate_repairs_test.go:468: observable conflict delivery: reviewed_head=e307aea17db65a209b7cb6e1b20b31fc35c9d324 repaired_head=71b9c9b18071d038f76f6f0724fe6d753a2d3a0b remote_head=e307aea17db65a209b7cb6e1b20b31fc35c9d324 reviewed_work_retained=true restart_from=review approval_revoked=true
+        CI log:
+        no changes to commit
+        cannot prove the repaired head continues the reviewed head: repaired head 71b9c9b18071 does not descend from reviewed head e307aea17db6; revalidating from Review instead of publishing
+        committed CI repair for revalidation
+=== RUN   TestCIStep_ConflictRepairAlwaysRevalidates/reset_to_base_dropping_the_reviewed_commit
+=== NAME  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
+    ci_revalidate_repairs_test.go:209: observable delivery: revalidate=false prior_head=e307aea17db65a209b7cb6e1b20b31fc35c9d324 local_head=fdbf13c025071733aa0974457339a618e75c4360 remote_head=fdbf13c025071733aa0974457339a618e75c4360 approval_retained=true published_head=fdbf13c025071733aa0974457339a618e75c4360
+        CI log:
+        pushing to /var/folders/0k/bf8mwt2n5qddzk24r20gfk0c0000gn/T/TestCIStep_RevalidateRepairsPolicySelectsRepairDeliverydefault_1257952798/001 (refs/heads/feature)...
+        committed and pushed CI repair
+--- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery (0.00s)
+    --- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review (1.59s)
+    --- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring (1.90s)
+--- PASS: TestCIStep_PartialPublicationRecordsNothing (2.04s)
+=== NAME  TestCIStep_ConflictRepairAlwaysRevalidates/reset_to_base_dropping_the_reviewed_commit
+    ci_revalidate_repairs_test.go:468: observable conflict delivery: reviewed_head=41d7f6d5c8fdefe5e7d48cc3bf0fe549e078db87 repaired_head=498f2cd513afb1c79a5e971fb29f3ca10a5b9a47 remote_head=41d7f6d5c8fdefe5e7d48cc3bf0fe549e078db87 reviewed_work_retained=false restart_from=review approval_revoked=true
+        CI log:
+        no changes to commit
+        cannot prove the repaired head continues the reviewed head: repaired head 498f2cd513af does not descend from reviewed head 41d7f6d5c8fd; revalidating from Review instead of publishing
+        committed CI repair for revalidation
+--- PASS: TestCIStep_ConflictRepairAlwaysRevalidates (2.71s)
+    --- PASS: TestCIStep_ConflictRepairAlwaysRevalidates/genuine_rebase_replaying_the_reviewed_commit (1.88s)
+    --- PASS: TestCIStep_ConflictRepairAlwaysRevalidates/reset_to_base_dropping_the_reviewed_commit (0.83s)
+2026/08/28 21:10:07 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+2026/08/28 21:10:07 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+--- PASS: TestCIStep_MonitorRestartsAtReviewForAHeldRepair (10.90s)
+=== RUN   TestCIStep_ManualRepairFollowsTheSamePolicy/revalidate_policy
+2026/08/28 21:10:24 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+--- PASS: TestCIStep_ManualRepairFollowsTheSamePolicy (28.24s)
+    --- PASS: TestCIStep_ManualRepairFollowsTheSamePolicy/publish_policy (17.99s)
+    --- PASS: TestCIStep_ManualRepairFollowsTheSamePolicy/revalidate_policy (10.25s)
+PASS
+ok  	github.com/kunchenguid/no-mistakes/internal/pipeline/steps	34.198s
