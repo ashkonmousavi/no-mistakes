@@ -1,0 +1,101 @@
+=== RUN   TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery
+=== PAUSE TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery
+=== RUN   TestCIStep_PartialPublicationIsRetryableRatherThanRecorded
+=== PAUSE TestCIStep_PartialPublicationIsRetryableRatherThanRecorded
+=== RUN   TestCIStep_PreRemotePublicationFailureDoesNotAuthorizeSettlementRetry
+=== PAUSE TestCIStep_PreRemotePublicationFailureDoesNotAuthorizeSettlementRetry
+=== RUN   TestCIStep_PendingPublicationRetrySurvivesRestartAndKeepsItsBound
+=== PAUSE TestCIStep_PendingPublicationRetrySurvivesRestartAndKeepsItsBound
+=== RUN   TestCIStep_PendingPublicationSettlesBeforeExpiredTimeout
+=== PAUSE TestCIStep_PendingPublicationSettlesBeforeExpiredTimeout
+=== RUN   TestCIStep_RetriesUnsettledPublicationAfterFixBudgetIsSpent
+=== PAUSE TestCIStep_RetriesUnsettledPublicationAfterFixBudgetIsSpent
+=== RUN   TestCIStep_RetriesUnsettledPublicationBeforeNewHeadCheckState
+=== PAUSE TestCIStep_RetriesUnsettledPublicationBeforeNewHeadCheckState
+=== RUN   TestCIStep_ConflictRepairAlwaysRevalidates
+=== PAUSE TestCIStep_ConflictRepairAlwaysRevalidates
+=== RUN   TestCIStep_RepairWithoutReviewAuthorityRevalidatesRatherThanPublishing
+=== PAUSE TestCIStep_RepairWithoutReviewAuthorityRevalidatesRatherThanPublishing
+=== RUN   TestCIStep_DifferingHeadWithoutAnAttemptedPublicationStillRunsTheFixAgent
+=== PAUSE TestCIStep_DifferingHeadWithoutAnAttemptedPublicationStillRunsTheFixAgent
+=== RUN   TestCIStep_UnsettledPublicationRetryIsBounded
+=== PAUSE TestCIStep_UnsettledPublicationRetryIsBounded
+=== RUN   TestCIStep_FailedRevalidationWriteDoesNotAdvanceTheLiveHead
+=== PAUSE TestCIStep_FailedRevalidationWriteDoesNotAdvanceTheLiveHead
+=== CONT  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery
+=== CONT  TestCIStep_RetriesUnsettledPublicationAfterFixBudgetIsSpent
+=== CONT  TestCIStep_FailedRevalidationWriteDoesNotAdvanceTheLiveHead
+=== RUN   TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
+=== PAUSE TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
+=== CONT  TestCIStep_UnsettledPublicationRetryIsBounded
+=== CONT  TestCIStep_DifferingHeadWithoutAnAttemptedPublicationStillRunsTheFixAgent
+=== CONT  TestCIStep_ConflictRepairAlwaysRevalidates
+=== CONT  TestCIStep_RepairWithoutReviewAuthorityRevalidatesRatherThanPublishing
+=== CONT  TestCIStep_PendingPublicationRetrySurvivesRestartAndKeepsItsBound
+=== CONT  TestCIStep_PreRemotePublicationFailureDoesNotAuthorizeSettlementRetry
+=== CONT  TestCIStep_PendingPublicationSettlesBeforeExpiredTimeout
+=== RUN   TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
+=== RUN   TestCIStep_ConflictRepairAlwaysRevalidates/genuine_rebase_replaying_the_reviewed_commit
+=== PAUSE TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
+=== PAUSE TestCIStep_ConflictRepairAlwaysRevalidates/genuine_rebase_replaying_the_reviewed_commit
+=== CONT  TestCIStep_PartialPublicationIsRetryableRatherThanRecorded
+=== RUN   TestCIStep_ConflictRepairAlwaysRevalidates/reset_to_base_dropping_the_reviewed_commit
+=== PAUSE TestCIStep_ConflictRepairAlwaysRevalidates/reset_to_base_dropping_the_reviewed_commit
+=== CONT  TestCIStep_RetriesUnsettledPublicationBeforeNewHeadCheckState
+=== RUN   TestCIStep_RetriesUnsettledPublicationBeforeNewHeadCheckState/checks_pending
+=== PAUSE TestCIStep_RetriesUnsettledPublicationBeforeNewHeadCheckState/checks_pending
+=== RUN   TestCIStep_RetriesUnsettledPublicationBeforeNewHeadCheckState/checks_passing
+=== PAUSE TestCIStep_RetriesUnsettledPublicationBeforeNewHeadCheckState/checks_passing
+=== CONT  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
+--- PASS: TestCIStep_FailedRevalidationWriteDoesNotAdvanceTheLiveHead (1.25s)
+=== CONT  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
+--- PASS: TestCIStep_PreRemotePublicationFailureDoesNotAuthorizeSettlementRetry (1.48s)
+=== CONT  TestCIStep_ConflictRepairAlwaysRevalidates/genuine_rebase_replaying_the_reviewed_commit
+--- PASS: TestCIStep_PartialPublicationIsRetryableRatherThanRecorded (1.90s)
+=== CONT  TestCIStep_ConflictRepairAlwaysRevalidates/reset_to_base_dropping_the_reviewed_commit
+=== CONT  TestCIStep_RetriesUnsettledPublicationBeforeNewHeadCheckState/checks_passing
+=== CONT  TestCIStep_RetriesUnsettledPublicationBeforeNewHeadCheckState/checks_pending
+--- PASS: TestCIStep_ConflictRepairAlwaysRevalidates (0.00s)
+    --- PASS: TestCIStep_ConflictRepairAlwaysRevalidates/genuine_rebase_replaying_the_reviewed_commit (1.13s)
+    --- PASS: TestCIStep_ConflictRepairAlwaysRevalidates/reset_to_base_dropping_the_reviewed_commit (1.02s)
+--- PASS: TestCIStep_PendingPublicationRetrySurvivesRestartAndKeepsItsBound (7.02s)
+2026/08/28 18:58:49 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+2026/08/28 18:58:49 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+2026/08/28 18:58:49 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+2026/08/28 18:58:50 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+2026/08/28 18:58:50 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+2026/08/28 18:58:50 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+--- PASS: TestCIStep_RepairWithoutReviewAuthorityRevalidatesRatherThanPublishing (10.69s)
+--- PASS: TestCIStep_PendingPublicationSettlesBeforeExpiredTimeout (10.88s)
+--- PASS: TestCIStep_RetriesUnsettledPublicationAfterFixBudgetIsSpent (11.00s)
+2026/08/28 18:58:50 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+=== NAME  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
+    ci_revalidate_repairs_test.go:208: observable delivery: restart_from="review" prior_head=63e7b228d313f9e2d2781e25b16cc02b64bc9e82 local_head=1825f50e8472fade9df2817ed0dbf96165a5b607 remote_head=63e7b228d313f9e2d2781e25b16cc02b64bc9e82 approval_retained=false published_head=63e7b228d313f9e2d2781e25b16cc02b64bc9e82
+        CI log:
+        monitoring CI for PR #42 (timeout: 30s)...
+        CI repair policy: always restart validation from Review after a repair (ci.revalidate_repairs: true)
+        issues detected: test - auto-fixing (attempt 1/1)...
+        running agent to fix CI issues...
+        committed CI repair for revalidation
+--- PASS: TestCIStep_UnsettledPublicationRetryIsBounded (11.42s)
+2026/08/28 18:58:51 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+2026/08/28 18:58:52 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+=== NAME  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
+    ci_revalidate_repairs_test.go:208: observable delivery: restart_from="" prior_head=8c07a6a1b75dcfe498d97579208abb57d36dea3f local_head=62e6605920ce021985e0d5c9ebdc9928dcd3b815 remote_head=62e6605920ce021985e0d5c9ebdc9928dcd3b815 approval_retained=true published_head=62e6605920ce021985e0d5c9ebdc9928dcd3b815
+        CI log:
+        monitoring CI for PR #42 (timeout: 30s)...
+        CI repair policy: publish a repair whose continuity with the reviewed head is provable, otherwise restart validation from Review (ci.revalidate_repairs: false)
+        issues detected: test - auto-fixing (attempt 1/1)...
+        running agent to fix CI issues...
+        pushing to /var/folders/0k/bf8mwt2n5qddzk24r20gfk0c0000gn/T/TestCIStep_RevalidateRepairsPolicySelectsRepairDeliverydefault_2314368615/001 (refs/heads/feature)...
+        committed and pushed CI repair
+        issues detected: test - max auto-fix attempts (1) reached, waiting for manual intervention...
+--- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery (0.00s)
+    --- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review (10.05s)
+    --- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring (17.70s)
+--- PASS: TestCIStep_DifferingHeadWithoutAnAttemptedPublicationStillRunsTheFixAgent (17.82s)
+--- PASS: TestCIStep_RetriesUnsettledPublicationBeforeNewHeadCheckState (0.00s)
+    --- PASS: TestCIStep_RetriesUnsettledPublicationBeforeNewHeadCheckState/checks_passing (17.44s)
+    --- PASS: TestCIStep_RetriesUnsettledPublicationBeforeNewHeadCheckState/checks_pending (17.12s)
+PASS
+ok  	github.com/kunchenguid/no-mistakes/internal/pipeline/steps	21.578s

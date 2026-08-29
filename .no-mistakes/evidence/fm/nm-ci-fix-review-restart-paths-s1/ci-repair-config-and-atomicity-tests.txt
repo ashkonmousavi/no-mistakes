@@ -1,0 +1,54 @@
+=== RUN   TestCIRevalidateRepairs_GlobalAndProjectPrecedence
+=== PAUSE TestCIRevalidateRepairs_GlobalAndProjectPrecedence
+=== RUN   TestCIRevalidateRepairs_TrustedOnly
+=== PAUSE TestCIRevalidateRepairs_TrustedOnly
+=== RUN   TestCIRevalidateRepairs_TrustedOnlyEvenWithRepoCommandsOptIn
+=== PAUSE TestCIRevalidateRepairs_TrustedOnlyEvenWithRepoCommandsOptIn
+=== RUN   TestCIRevalidateRepairs_RejectsNonBooleanGlobalValue
+=== PAUSE TestCIRevalidateRepairs_RejectsNonBooleanGlobalValue
+=== RUN   TestCIRevalidateRepairs_RejectsNonBooleanRepoValue
+=== PAUSE TestCIRevalidateRepairs_RejectsNonBooleanRepoValue
+=== RUN   TestCIRevalidateRepairs_ShippedDefaultConfigParsesAndKeepsTheDefault
+=== PAUSE TestCIRevalidateRepairs_ShippedDefaultConfigParsesAndKeepsTheDefault
+=== CONT  TestCIRevalidateRepairs_TrustedOnly
+=== CONT  TestCIRevalidateRepairs_RejectsNonBooleanGlobalValue
+=== CONT  TestCIRevalidateRepairs_ShippedDefaultConfigParsesAndKeepsTheDefault
+=== CONT  TestCIRevalidateRepairs_TrustedOnlyEvenWithRepoCommandsOptIn
+=== CONT  TestCIRevalidateRepairs_RejectsNonBooleanRepoValue
+=== CONT  TestCIRevalidateRepairs_GlobalAndProjectPrecedence
+=== RUN   TestCIRevalidateRepairs_GlobalAndProjectPrecedence/absent_everywhere_defaults_to_publishing_the_repair
+=== PAUSE TestCIRevalidateRepairs_GlobalAndProjectPrecedence/absent_everywhere_defaults_to_publishing_the_repair
+=== RUN   TestCIRevalidateRepairs_GlobalAndProjectPrecedence/global_true_selects_revalidation
+=== PAUSE TestCIRevalidateRepairs_GlobalAndProjectPrecedence/global_true_selects_revalidation
+=== RUN   TestCIRevalidateRepairs_GlobalAndProjectPrecedence/project_true_selects_revalidation
+=== PAUSE TestCIRevalidateRepairs_GlobalAndProjectPrecedence/project_true_selects_revalidation
+--- PASS: TestCIRevalidateRepairs_RejectsNonBooleanRepoValue (0.00s)
+=== RUN   TestCIRevalidateRepairs_GlobalAndProjectPrecedence/project_false_overrides_global_true
+=== PAUSE TestCIRevalidateRepairs_GlobalAndProjectPrecedence/project_false_overrides_global_true
+--- PASS: TestCIRevalidateRepairs_TrustedOnlyEvenWithRepoCommandsOptIn (0.00s)
+=== RUN   TestCIRevalidateRepairs_GlobalAndProjectPrecedence/project_true_overrides_global_false
+=== PAUSE TestCIRevalidateRepairs_GlobalAndProjectPrecedence/project_true_overrides_global_false
+--- PASS: TestCIRevalidateRepairs_RejectsNonBooleanGlobalValue (0.00s)
+=== RUN   TestCIRevalidateRepairs_GlobalAndProjectPrecedence/global_true_survives_a_project_that_sets_only_the_rerun_budget
+=== PAUSE TestCIRevalidateRepairs_GlobalAndProjectPrecedence/global_true_survives_a_project_that_sets_only_the_rerun_budget
+=== CONT  TestCIRevalidateRepairs_GlobalAndProjectPrecedence/project_false_overrides_global_true
+=== CONT  TestCIRevalidateRepairs_GlobalAndProjectPrecedence/global_true_survives_a_project_that_sets_only_the_rerun_budget
+=== CONT  TestCIRevalidateRepairs_GlobalAndProjectPrecedence/project_true_selects_revalidation
+=== CONT  TestCIRevalidateRepairs_GlobalAndProjectPrecedence/project_true_overrides_global_false
+=== CONT  TestCIRevalidateRepairs_GlobalAndProjectPrecedence/global_true_selects_revalidation
+--- PASS: TestCIRevalidateRepairs_TrustedOnly (0.00s)
+=== CONT  TestCIRevalidateRepairs_GlobalAndProjectPrecedence/absent_everywhere_defaults_to_publishing_the_repair
+--- PASS: TestCIRevalidateRepairs_GlobalAndProjectPrecedence (0.00s)
+    --- PASS: TestCIRevalidateRepairs_GlobalAndProjectPrecedence/project_false_overrides_global_true (0.00s)
+    --- PASS: TestCIRevalidateRepairs_GlobalAndProjectPrecedence/global_true_survives_a_project_that_sets_only_the_rerun_budget (0.00s)
+    --- PASS: TestCIRevalidateRepairs_GlobalAndProjectPrecedence/project_true_selects_revalidation (0.00s)
+    --- PASS: TestCIRevalidateRepairs_GlobalAndProjectPrecedence/project_true_overrides_global_false (0.00s)
+    --- PASS: TestCIRevalidateRepairs_GlobalAndProjectPrecedence/absent_everywhere_defaults_to_publishing_the_repair (0.00s)
+    --- PASS: TestCIRevalidateRepairs_GlobalAndProjectPrecedence/global_true_selects_revalidation (0.00s)
+--- PASS: TestCIRevalidateRepairs_ShippedDefaultConfigParsesAndKeepsTheDefault (0.01s)
+PASS
+ok  	github.com/kunchenguid/no-mistakes/internal/config	1.445s
+=== RUN   TestUpdateRunPublicationIsAtomic
+--- PASS: TestUpdateRunPublicationIsAtomic (0.06s)
+PASS
+ok  	github.com/kunchenguid/no-mistakes/internal/db	1.410s

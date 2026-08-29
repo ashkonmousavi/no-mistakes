@@ -1,0 +1,24 @@
+=== RUN   TestAssertReviewApprovedPushHead
+=== RUN   TestAssertReviewApprovedPushHead/equal
+=== RUN   TestAssertReviewApprovedPushHead/legitimate_descendant
+=== RUN   TestAssertReviewApprovedPushHead/backward_replacement
+=== RUN   TestAssertReviewApprovedPushHead/divergent_replacement
+=== RUN   TestAssertReviewApprovedPushHead/malformed_approval
+=== RUN   TestAssertReviewApprovedPushHead/unreachable_approval
+--- PASS: TestAssertReviewApprovedPushHead (0.85s)
+    --- PASS: TestAssertReviewApprovedPushHead/equal (0.25s)
+    --- PASS: TestAssertReviewApprovedPushHead/legitimate_descendant (0.15s)
+    --- PASS: TestAssertReviewApprovedPushHead/backward_replacement (0.13s)
+    --- PASS: TestAssertReviewApprovedPushHead/divergent_replacement (0.16s)
+    --- PASS: TestAssertReviewApprovedPushHead/malformed_approval (0.08s)
+    --- PASS: TestAssertReviewApprovedPushHead/unreachable_approval (0.09s)
+=== RUN   TestAssertReviewApprovedPushHead_RefusesMissingLegacyState
+--- PASS: TestAssertReviewApprovedPushHead_RefusesMissingLegacyState (0.08s)
+=== RUN   TestAssertReviewApprovedPushHead_UsesStepScopedGit
+--- PASS: TestAssertReviewApprovedPushHead_UsesStepScopedGit (2.49s)
+=== RUN   TestPushStep_UpdatesGateMirrorRefOnSuccessfulPush
+--- PASS: TestPushStep_UpdatesGateMirrorRefOnSuccessfulPush (0.58s)
+=== RUN   TestPushStep_GateMirrorUpdateFailurePropagatesError
+--- PASS: TestPushStep_GateMirrorUpdateFailurePropagatesError (0.32s)
+PASS
+ok  	github.com/kunchenguid/no-mistakes/internal/pipeline/steps	5.644s

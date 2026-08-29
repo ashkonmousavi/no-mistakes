@@ -1,0 +1,21 @@
+=== RUN   TestCIStep_MergeConflictOnly_AutoFix
+=== PAUSE TestCIStep_MergeConflictOnly_AutoFix
+=== RUN   TestCIStep_ManualRepairFollowsTheSamePolicy
+=== PAUSE TestCIStep_ManualRepairFollowsTheSamePolicy
+=== CONT  TestCIStep_MergeConflictOnly_AutoFix
+=== CONT  TestCIStep_ManualRepairFollowsTheSamePolicy
+=== RUN   TestCIStep_ManualRepairFollowsTheSamePolicy/publish_policy
+=== PAUSE TestCIStep_ManualRepairFollowsTheSamePolicy/publish_policy
+=== RUN   TestCIStep_ManualRepairFollowsTheSamePolicy/revalidate_policy
+=== PAUSE TestCIStep_ManualRepairFollowsTheSamePolicy/revalidate_policy
+=== CONT  TestCIStep_ManualRepairFollowsTheSamePolicy/revalidate_policy
+=== CONT  TestCIStep_ManualRepairFollowsTheSamePolicy/publish_policy
+2026/08/28 19:01:05 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+2026/08/28 19:01:05 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+2026/08/28 19:01:05 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+--- PASS: TestCIStep_MergeConflictOnly_AutoFix (10.14s)
+--- PASS: TestCIStep_ManualRepairFollowsTheSamePolicy (0.00s)
+    --- PASS: TestCIStep_ManualRepairFollowsTheSamePolicy/revalidate_policy (10.19s)
+    --- PASS: TestCIStep_ManualRepairFollowsTheSamePolicy/publish_policy (17.31s)
+PASS
+ok  	github.com/kunchenguid/no-mistakes/internal/pipeline/steps	18.711s
