@@ -1,0 +1,96 @@
+=== RUN   TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery
+=== PAUSE TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery
+=== RUN   TestCIStep_PartialPublicationIsRetryableRatherThanRecorded
+=== PAUSE TestCIStep_PartialPublicationIsRetryableRatherThanRecorded
+=== RUN   TestCIStep_RetriesUnsettledPublicationAfterFixBudgetIsSpent
+=== PAUSE TestCIStep_RetriesUnsettledPublicationAfterFixBudgetIsSpent
+=== RUN   TestCIStep_ConflictRepairAlwaysRevalidates
+=== PAUSE TestCIStep_ConflictRepairAlwaysRevalidates
+=== RUN   TestCIStep_ManualRepairFollowsTheSamePolicy
+=== PAUSE TestCIStep_ManualRepairFollowsTheSamePolicy
+=== RUN   TestCIStep_RepairWithoutReviewAuthorityRevalidatesRatherThanPublishing
+=== PAUSE TestCIStep_RepairWithoutReviewAuthorityRevalidatesRatherThanPublishing
+=== RUN   TestAssertReviewApprovedPushHead
+=== RUN   TestAssertReviewApprovedPushHead/equal
+=== RUN   TestAssertReviewApprovedPushHead/legitimate_descendant
+=== RUN   TestAssertReviewApprovedPushHead/backward_replacement
+=== RUN   TestAssertReviewApprovedPushHead/divergent_replacement
+=== RUN   TestAssertReviewApprovedPushHead/malformed_approval
+=== RUN   TestAssertReviewApprovedPushHead/unreachable_approval
+--- PASS: TestAssertReviewApprovedPushHead (1.02s)
+    --- PASS: TestAssertReviewApprovedPushHead/equal (0.29s)
+    --- PASS: TestAssertReviewApprovedPushHead/legitimate_descendant (0.17s)
+    --- PASS: TestAssertReviewApprovedPushHead/backward_replacement (0.15s)
+    --- PASS: TestAssertReviewApprovedPushHead/divergent_replacement (0.20s)
+    --- PASS: TestAssertReviewApprovedPushHead/malformed_approval (0.09s)
+    --- PASS: TestAssertReviewApprovedPushHead/unreachable_approval (0.12s)
+=== RUN   TestAssertReviewApprovedPushHead_RefusesMissingLegacyState
+--- PASS: TestAssertReviewApprovedPushHead_RefusesMissingLegacyState (0.11s)
+=== RUN   TestAssertReviewApprovedPushHead_UsesStepScopedGit
+--- PASS: TestAssertReviewApprovedPushHead_UsesStepScopedGit (2.55s)
+=== RUN   TestPushStep_UpdatesGateMirrorRefOnSuccessfulPush
+--- PASS: TestPushStep_UpdatesGateMirrorRefOnSuccessfulPush (0.76s)
+=== RUN   TestPushStep_GateMirrorUpdateFailurePropagatesError
+--- PASS: TestPushStep_GateMirrorUpdateFailurePropagatesError (0.37s)
+=== CONT  TestCIStep_PartialPublicationIsRetryableRatherThanRecorded
+=== CONT  TestCIStep_RetriesUnsettledPublicationAfterFixBudgetIsSpent
+=== CONT  TestCIStep_ManualRepairFollowsTheSamePolicy
+=== CONT  TestCIStep_RepairWithoutReviewAuthorityRevalidatesRatherThanPublishing
+=== CONT  TestCIStep_ConflictRepairAlwaysRevalidates
+=== RUN   TestCIStep_ConflictRepairAlwaysRevalidates/genuine_rebase_replaying_the_reviewed_commit
+=== CONT  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery
+=== PAUSE TestCIStep_ConflictRepairAlwaysRevalidates/genuine_rebase_replaying_the_reviewed_commit
+=== RUN   TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
+=== RUN   TestCIStep_ManualRepairFollowsTheSamePolicy/publish_policy
+=== PAUSE TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
+=== RUN   TestCIStep_ConflictRepairAlwaysRevalidates/reset_to_base_dropping_the_reviewed_commit
+=== PAUSE TestCIStep_ManualRepairFollowsTheSamePolicy/publish_policy
+=== PAUSE TestCIStep_ConflictRepairAlwaysRevalidates/reset_to_base_dropping_the_reviewed_commit
+=== CONT  TestCIStep_ConflictRepairAlwaysRevalidates/reset_to_base_dropping_the_reviewed_commit
+=== CONT  TestCIStep_ConflictRepairAlwaysRevalidates/genuine_rebase_replaying_the_reviewed_commit
+=== RUN   TestCIStep_ManualRepairFollowsTheSamePolicy/revalidate_policy
+=== RUN   TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
+=== PAUSE TestCIStep_ManualRepairFollowsTheSamePolicy/revalidate_policy
+=== CONT  TestCIStep_ManualRepairFollowsTheSamePolicy/revalidate_policy
+=== CONT  TestCIStep_ManualRepairFollowsTheSamePolicy/publish_policy
+=== PAUSE TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
+=== CONT  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
+=== CONT  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
+--- PASS: TestCIStep_ConflictRepairAlwaysRevalidates (0.00s)
+    --- PASS: TestCIStep_ConflictRepairAlwaysRevalidates/reset_to_base_dropping_the_reviewed_commit (1.53s)
+    --- PASS: TestCIStep_ConflictRepairAlwaysRevalidates/genuine_rebase_replaying_the_reviewed_commit (1.64s)
+--- PASS: TestCIStep_PartialPublicationIsRetryableRatherThanRecorded (1.76s)
+2026/08/28 17:17:31 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+2026/08/28 17:17:31 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+2026/08/28 17:17:31 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+2026/08/28 17:17:31 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+2026/08/28 17:17:31 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+2026/08/28 17:17:31 WARN failed to fetch PR review comments err="PR review comments response did not contain the pull request"
+--- PASS: TestCIStep_RepairWithoutReviewAuthorityRevalidatesRatherThanPublishing (10.66s)
+=== NAME  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review
+    ci_revalidate_repairs_test.go:208: observable delivery: restart_from="review" prior_head=8fe6f090154174b12e49c92da03a1d942ff805b4 local_head=58a819e2208f3bf2e72dda7feca06bb0f57ea30a remote_head=8fe6f090154174b12e49c92da03a1d942ff805b4 approval_retained=false published_head=8fe6f090154174b12e49c92da03a1d942ff805b4
+        CI log:
+        monitoring CI for PR #42 (timeout: 30s)...
+        CI repair policy: always restart validation from Review after a repair (ci.revalidate_repairs: true)
+        issues detected: test - auto-fixing (attempt 1/1)...
+        running agent to fix CI issues...
+        committed CI repair for revalidation
+--- PASS: TestCIStep_ManualRepairFollowsTheSamePolicy (0.00s)
+    --- PASS: TestCIStep_ManualRepairFollowsTheSamePolicy/revalidate_policy (10.69s)
+    --- PASS: TestCIStep_ManualRepairFollowsTheSamePolicy/publish_policy (17.70s)
+=== NAME  TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring
+    ci_revalidate_repairs_test.go:208: observable delivery: restart_from="" prior_head=8fe6f090154174b12e49c92da03a1d942ff805b4 local_head=58a819e2208f3bf2e72dda7feca06bb0f57ea30a remote_head=58a819e2208f3bf2e72dda7feca06bb0f57ea30a approval_retained=true published_head=58a819e2208f3bf2e72dda7feca06bb0f57ea30a
+        CI log:
+        monitoring CI for PR #42 (timeout: 30s)...
+        CI repair policy: publish a repair whose continuity with the reviewed head is provable, otherwise restart validation from Review (ci.revalidate_repairs: false)
+        issues detected: test - auto-fixing (attempt 1/1)...
+        running agent to fix CI issues...
+        pushing to /var/folders/0k/bf8mwt2n5qddzk24r20gfk0c0000gn/T/TestCIStep_RevalidateRepairsPolicySelectsRepairDeliverydefault_576065514/001 (refs/heads/feature)...
+        committed and pushed CI repair
+        issues detected: test - max auto-fix attempts (1) reached, waiting for manual intervention...
+--- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery (0.00s)
+    --- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/opt_in_holds_the_repair_and_restarts_at_review (10.74s)
+    --- PASS: TestCIStep_RevalidateRepairsPolicySelectsRepairDelivery/default_publishes_the_repair_and_keeps_monitoring (17.76s)
+--- PASS: TestCIStep_RetriesUnsettledPublicationAfterFixBudgetIsSpent (17.95s)
+PASS
+ok  	github.com/kunchenguid/no-mistakes/internal/pipeline/steps	24.332s
