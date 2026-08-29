@@ -1,0 +1,15 @@
+Generated review/fix prompt evidence from ReviewStep.Execute
+
+R1 - initial review action classification:
+- Classify by the remedy, not only by the topic. If the smallest honest remedy for a finding would add new durable state, a schema change, new background, retry, or persistence machinery, a new subsystem, or otherwise EXTEND the change beyond its stated intent rather than CORRECT what it already does, the action must be "ask-user" even when the defect itself looks mechanical. Say in the description that the remedy, not the defect, is what needs authorization.
+
+R2 - fixer instruction:
+- Fix the reported instance narrowly. Prefer doing so by addressing a deeper architectural reason and simplifying it, than introducing machinery to handle the symptoms.
+
+R3 - rereview after this run's fix round:
+- When the defects you are reporting are located in code a prior fix round introduced, and that code exceeds what the original finding required, report a single "ask-user" finding recommending that the prior round be reverted to the minimal fix, instead of filing further repairs on that machinery.
+
+R3 - review of a previous run's uncertified fixer commits:
+- When the defects you are reporting are located in code a prior fix round introduced, and that code exceeds what the original finding required, report a single "ask-user" finding recommending that the prior round be reverted to the minimal fix, instead of filing further repairs on that machinery.
+
+R3 guard - ordinary initial review contains exit ramp: false
