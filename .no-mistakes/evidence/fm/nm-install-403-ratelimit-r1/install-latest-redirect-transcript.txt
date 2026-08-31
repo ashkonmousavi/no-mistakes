@@ -1,0 +1,18 @@
+=== successful end-to-end install from redirect-shaped effective URL ===
+Downloading no-mistakes v9.8.7 for darwin/arm64...
+no-mistakes v9.8.7 installed to <temp>/home/.no-mistakes/bin/no-mistakes
+Command path: <temp>/link/no-mistakes -> <temp>/home/.no-mistakes/bin/no-mistakes
+Add <temp>/link to your PATH and restart your terminal.
+
+Observed curl invocations:
+curl -fsSLI -o /dev/null -w %{url_effective} https://github.com/kunchenguid/no-mistakes/releases/latest
+curl -fsSL https://github.com/kunchenguid/no-mistakes/releases/download/v9.8.7/no-mistakes-v9.8.7-darwin-arm64.tar.gz -o <download-temp>/no-mistakes-v9.8.7-darwin-arm64.tar.gz
+
+Installed binary: executable (exit 0)
+Installed symlink target: <temp>/home/.no-mistakes/bin/no-mistakes
+
+=== non-parseable effective URL ===
+exit_status=1
+Could not determine latest release
+Observed curl invocations:
+curl -fsSLI -o /dev/null -w %{url_effective} https://github.com/kunchenguid/no-mistakes/releases/latest
