@@ -1,0 +1,22 @@
+commit 46e3d1ca7884f0c921bdaf0156eed81d8709914f
+Author:     kunchenguid <kun@kunchenguid.com>
+AuthorDate: Thu Sep 3 03:06:45 2026 -0700
+Commit:     kunchenguid <kun@kunchenguid.com>
+CommitDate: Thu Sep 3 03:06:45 2026 -0700
+
+    no-mistakes(test): Removed the fileExists fallback. Resolution now accepts only exact skill names and configured memory file paths
+---
+ target/resolve.go | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/target/resolve.go b/target/resolve.go
+index 289ded6..54d7c79 100644
+--- a/target/resolve.go
++++ b/target/resolve.go
+@@ -7,6 +7,5 @@ func Resolve(cfg Config, spec string) (Target, error) {
+ 	for _, file := range cfg.MemoryFiles {
+ 		if file == spec { return Target{Kind: KindMemory, File: file}, nil }
+ 	}
+-	if fileExists(spec) { return Target{Kind: KindMemory, File: spec}, nil }
+ 	return Target{}, unknownTarget(spec)
+ }
