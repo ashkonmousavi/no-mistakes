@@ -57,6 +57,11 @@ disable_project_settings: true
 # Read only from the trusted default branch. Defaults to false (CI expected).
 # no_ci: true
 
+# Declare that a passing commands.test is sufficient local validation, so the
+# test step does not launch the evidence agent when user intent is present.
+# Read only from the trusted default branch. Defaults to false.
+# test_command_sufficient: true
+
 # Optional PR target branch, read from the trusted default branch.
 # When unset, PRs target the repository's forge default branch.
 pr:
@@ -226,7 +231,56 @@ no-mistakes does not guess whether an arbitrary shell string is "too broad" - th
 
 When set, the test step runs this exact command first as the baseline and checks the exit code.
 When empty, the agent detects and runs the smallest relevant tests itself (and is instructed never to run the complete repository suite).
-When user intent is available, the agent may still run after a successful baseline command to gather evidence-oriented validation, still under the same targeted-validation contract.
+When user intent is available, the agent runs after a successful baseline command by default to gather evidence-oriented validation, still under the same targeted-validation contract.
+Set [`test_command_sufficient`](#test_command_sufficient) to declare that the passing command is itself the validation and retire that second pass.
+
+### test_command_sufficient
+
+Declare that a successful `commands.test` run is by itself sufficient local validation.
+
+| | |
+| --- | --- |
+| Type | `bool` |
+| Default | `false` |
+| Trust | Trusted default branch only, and dropped entirely when `allow_repo_commands: true` |
+
+By default the test step launches the evidence agent whenever user intent is available, even after `commands.test` has already passed, because an exit code does not show a reviewer what the change does.
+That second pass is the right default for repositories whose changes are proven by a rendered surface, and pure overhead for repositories whose declared command already is the proof.
+
+When `true`, a passing `commands.test` completes the Test step without launching the evidence agent.
+The command still runs, its exit code is still checked, and the exact command is still recorded as what was tested against the run's head commit.
+The step log names the declaration (`test_command_sufficient: configured test command passed, skipping evidence agent`) so a command-only pass stays inspectable rather than looking like a run that simply had no intent to demonstrate.
+
+Nothing else about Test changes:
+
+- An **empty** `commands.test` still launches the agent. The declaration can never turn into "skip Test".
+- A **failing** command still produces the existing `error` findings and the same actionable failure path.
+- The **fix-mode** repair agent still runs. It answers a prior failure rather than gathering evidence.
+- **Remote CI still owns broad regression** and remains mandatory before a PR is ready. This setting changes how local Test is performed, not whether Test exists, and it is not licence to put a CI-parity suite in `commands.test`.
+
+#### When not to set it
+
+A passing command is not automatically proof of user intent.
+Leave this off when the requested behavior crosses a boundary an exit code cannot show - UI, browser, native application, externally observable CLI, or artifact-dependent behavior - unless the command itself produces and records that evidence.
+There is no automatic detection here: no-mistakes does not guess which of your changes are user-facing, which is exactly why this is an explicit maintainer declaration rather than an inference.
+
+#### Trust
+
+This field permits omission of an agent gate, so it is gate-control configuration.
+It is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`.
+A feature branch cannot declare its own test sufficient to suppress the evidence gathering that reviews it, and cannot clear a trusted declaration either.
+
+Unlike the other trusted-only fields, it is additionally **dropped** when `allow_repo_commands: true` is enabled, rather than merely being read from the trusted copy.
+Sufficiency is a statement about a specific command, and it cannot outlive the trust of the command it describes: under that opt-in `commands.test` comes from the pushed branch, so honoring a trusted sufficiency declaration would let a branch pair a trivially passing command with inherited permission to skip its own evidence gate.
+Repositories using that opt-in keep the evidence agent.
+
+#### Validation
+
+`test_command_sufficient: true` with an empty or whitespace-only `commands.test` fails config parsing closed, naming both keys in the error.
+The combination is the one way the field could be read as permission to skip Test, so it is rejected before any agent or shell command starts rather than resolved at run time.
+This validation also runs on a pushed branch's copy, so a self-contradictory value fails before it merges.
+
+This field is per-repository and is rejected in global config: whether a command proves a change is a product judgement about one repository, not a machine-wide operator default.
 
 ### commands.lint
 
