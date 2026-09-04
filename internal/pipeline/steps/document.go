@@ -142,15 +142,23 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 		return nil, fmt.Errorf("agent document: %w", err)
 	}
 
-	// Commit whatever the agent edited, regardless of how trustworthy its
-	// structured output turns out to be.
+	// Report-only (fork patch, 2026-09-04): the document step never commits.
+	// A post-review commit here forced a full re-review and repeatedly
+	// exhausted the final-head re-review budget, killing runs after their
+	// code had already passed. The agent's edits are logged and discarded;
+	// the findings below stay, so stale documentation is reported for the
+	// author to fix in an ordinary pre-run commit, never silently rewritten.
 	commitSummary := extractDocumentSummary(result.Output, "")
-	fallbackSummary := "update documentation"
 	if combinedLint {
-		fallbackSummary = "update documentation and fix lint"
+		sctx.Log("document step is report-only: discarding agent documentation and lint edits (" + commitSummary + ")")
+	} else {
+		sctx.Log("document step is report-only: discarding agent documentation edits (" + commitSummary + ")")
 	}
-	if err := commitAgentFixes(sctx, s.Name(), commitSummary, fallbackSummary); err != nil {
-		return nil, err
+	if _, err := git.Run(ctx, sctx.WorkDir, "checkout", "--", "."); err != nil {
+		return nil, fmt.Errorf("discard document-step edits: %w", err)
+	}
+	if _, err := git.Run(ctx, sctx.WorkDir, "clean", "-fd"); err != nil {
+		return nil, fmt.Errorf("discard document-step untracked files: %w", err)
 	}
 
 	// Without trustworthy structured output we cannot confirm the agent

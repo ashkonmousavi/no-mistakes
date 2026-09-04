@@ -10,7 +10,9 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
-const maxFinalHeadRereviews = 3
+// Fork patch 2026-09-04: raised from 3 so a run survives more than two legitimate
+// post-review fix commits; the document step no longer counts because it is report-only.
+const maxFinalHeadRereviews = 6
 
 // ReviewHeadNeedsRereview checks the durable completed-review authority for a
 // proposed local head. Exact equality is publication-ready. A descendant is
