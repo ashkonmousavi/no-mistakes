@@ -1,6 +1,7 @@
 package steps
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -47,15 +48,15 @@ const documentScopeDiscipline = `Scope discipline:
 - Prefer consolidation, deletion, and pointers to the owner over addition and synchronization.`
 
 // housekeepingLintSection adds the agent-driven lint duty to the combined
-// document+lint pass.
+// document+lint pass. Read-only, like the document duty: the agent discovers
+// and runs the relevant checks but reports every issue instead of fixing it.
 const housekeepingLintSection = `
 
 Combined lint duty (same pass - no separate lint agent will run):
 - Discover the configured linters and formatters for this repository.
 - Run the relevant checks, preferring only the changed files when possible.
-- Apply safe formatter, linter, and static-analysis fixes yourself, then re-run the relevant checks.
 - Do not run tests or broader behavioral validation.
-- Report only unresolved lint, format, or static-analysis issues as findings with "category" set to "lint". Do not report lint issues you already fixed.
+- This is a read-only review: do not apply any fix. Report every lint, format, or static-analysis issue you find as a finding with "category" set to "lint", naming the file and line.
 
 Set "category" on every finding: "documentation" for documentation findings, "lint" for lint findings.`
 
@@ -123,6 +124,17 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 		sctx.Log("updating documentation...")
 	}
 
+	// The mutation check below only tells us the agent changed something if
+	// nothing was already dirty before it ran. A pre-existing mutation (from
+	// outside this step) must never be misattributed to the agent and swept
+	// up by the failure-cleanup path, so fail closed here instead - with no
+	// discard, since these paths are not this step's to delete.
+	if entryStatus, serr := documentWorktreeMutations(ctx, sctx.WorkDir); serr != nil {
+		return nil, serr
+	} else if entryStatus != "" {
+		return nil, fmt.Errorf("document step requires a clean worktree before the agent runs, found:\n%s", entryStatus)
+	}
+
 	prompt := s.buildPrompt(sctx, baseSHA, ignorePatterns, combinedLint)
 	schema := findingsSchema
 	purpose := "document"
@@ -142,23 +154,31 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 		return nil, fmt.Errorf("agent document: %w", err)
 	}
 
-	// Report-only (fork patch, 2026-09-04): the document step never commits.
-	// A post-review commit here forced a full re-review and repeatedly
-	// exhausted the final-head re-review budget, killing runs after their
-	// code had already passed. The agent's edits are logged and discarded;
-	// the findings below stay, so stale documentation is reported for the
-	// author to fix in an ordinary pre-run commit, never silently rewritten.
-	commitSummary := extractDocumentSummary(result.Output, "")
-	if combinedLint {
-		sctx.Log("document step is report-only: discarding agent documentation and lint edits (" + commitSummary + ")")
-	} else {
-		sctx.Log("document step is report-only: discarding agent documentation edits (" + commitSummary + ")")
+	// Genuinely read-only (2026-09-04, replaces the discard-and-pass fork
+	// patch flagged by advisor finding A1): a prompt that says "fix" while the
+	// step silently discards the agent's edits let a compliant agent report
+	// zero findings and pass while the stale documentation it "fixed" was
+	// thrown away unreported. Any worktree mutation after the agent returns
+	// is now a failed step with a clear error - discarding it is cleanup
+	// after the failure is recorded, never a silent pass. This also keeps a
+	// combined-mode mutation from ever reaching the lint stash below.
+	mutations, err := documentWorktreeMutations(ctx, sctx.WorkDir)
+	if err != nil {
+		return nil, err
 	}
-	if _, err := git.Run(ctx, sctx.WorkDir, "checkout", "--", "."); err != nil {
-		return nil, fmt.Errorf("discard document-step edits: %w", err)
-	}
-	if _, err := git.Run(ctx, sctx.WorkDir, "clean", "-fd"); err != nil {
-		return nil, fmt.Errorf("discard document-step untracked files: %w", err)
+	if mutations != "" {
+		label := "document"
+		if combinedLint {
+			label = "housekeeping"
+		}
+		sctx.Log(label + " step is read-only: agent mutated the worktree, discarding and failing the step")
+		if _, cerr := git.Run(ctx, sctx.WorkDir, "checkout", "--", "."); cerr != nil {
+			return nil, fmt.Errorf("discard document-step mutation: %w", cerr)
+		}
+		if _, cerr := git.Run(ctx, sctx.WorkDir, "clean", "-fd"); cerr != nil {
+			return nil, fmt.Errorf("discard document-step untracked mutation: %w", cerr)
+		}
+		return nil, fmt.Errorf("%s step must be read-only but the agent modified the worktree:\n%s", label, mutations)
 	}
 
 	// Without trustworthy structured output we cannot confirm the agent
@@ -208,18 +228,18 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 func (s *DocumentStep) buildPrompt(sctx *pipeline.StepContext, baseSHA, ignorePatterns string, combinedLint bool) string {
 	historySection := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx)
 
-	intro := "Keep the project documentation accurate for this change."
+	intro := "Review the project documentation for accuracy after this change. This is a read-only review: do not edit any file."
 	if combinedLint {
-		intro = "Perform the combined documentation and lint housekeeping pass for this change."
+		intro = "Perform the combined documentation and lint review pass for this change. This is a read-only review: do not edit any file."
 	}
 
-	editRule := "- Only edit documentation files or doc comments. Do not change executable behavior or tests."
+	editRule := "- This is a read-only review: do not modify, create, or delete any file. Report every stale or incorrect statement instead of fixing it."
 	if combinedLint {
-		editRule = "- Documentation edits must only touch documentation files or doc comments. Lint fixes must be safe, mechanical, and behavior-preserving. Never change functional behavior or tests."
+		editRule = "- This is a read-only review: do not modify, create, or delete any file, including lint or formatting fixes. Report every stale, incorrect, or unresolved issue instead of fixing it."
 	}
 
 	prompt := fmt.Sprintf(
-		`%s Analyze what the change made stale, fix each stale fact in its one authoritative location, and report only what you could not resolve.
+		`%s Analyze what the change made stale and report every defect you find, with the file and line of each stale or incorrect statement.
 
 Context:
 - branch: %s
@@ -238,22 +258,18 @@ Task:
    - Read the diff and changed files to understand what was added, modified, or removed, and the intent of the change.
 
 2. Find what this change made stale
-   - For each fact or contract the change altered, locate its one authoritative owner document (README, docs/, doc comments, config examples, etc.).
+   - For each fact or contract the change altered, locate its one authoritative owner document (README, docs/, doc comments, config examples, etc.). Changed user-facing behavior must leave its authoritative user documentation accurate.
    - Locate existing duplicates of those facts that are now stale.
 
-3. Fix in the authoritative location
-   - Update each altered fact in its owner document. Changed user-facing behavior must leave its authoritative user documentation accurate.
-   - Remove stale duplicates or reduce them to a short pointer to the owner; do not synchronize full copies.
-   - Re-read what you changed to verify it now reflects the code.
-
-4. Report only what remains
-   - Return a finding only for gaps you could not resolve, judgment calls (e.g. ambiguous intent or conflicting docs), or an out-of-scope consolidation worth a follow-up.
-   - Do not report gaps you already fixed.
-   - If nothing remains, return an empty findings array.%s
+3. Report every defect; fix none of them
+   - This is a read-only review: do not edit, create, or delete any file.
+   - Return a finding for every stale, missing, or incorrect statement this change left behind - including ones the placement policy above would call a stale duplicate - naming the file and line number.
+   - Also report judgment calls (e.g. ambiguous intent or conflicting docs) and any out-of-scope consolidation worth a follow-up.
+   - If nothing is stale, return an empty findings array.%s
 
 Rules:
 %s
-- The summary must be one concise sentence fragment suitable for a git commit subject.
+- The summary must be one concise sentence fragment describing the review outcome for the run log.
 - Keep the summary under 10 words.%s`,
 		intro,
 		sctx.Run.Branch,
@@ -336,6 +352,17 @@ func documentApprovalOutcome(summary string) *pipeline.StepOutcome {
 		Findings:      string(findingsJSON),
 		FixSummary:    summary,
 	}
+}
+
+// documentWorktreeMutations reports any tracked or untracked change left in
+// the worktree after the document (or housekeeping) agent pass returns. A
+// non-empty result means the read-only contract was violated.
+func documentWorktreeMutations(ctx context.Context, workDir string) (string, error) {
+	status, err := git.Run(ctx, workDir, "status", "--porcelain")
+	if err != nil {
+		return "", fmt.Errorf("check worktree status after agent document pass: %w", err)
+	}
+	return strings.TrimSpace(status), nil
 }
 
 func hasNonIgnoredDocumentChanges(changedFiles string, ignorePatterns []string) bool {
