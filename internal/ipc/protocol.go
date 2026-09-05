@@ -307,17 +307,20 @@ type StepResultInfo struct {
 	// FixSummaries holds one entry per fix round the pipeline ran for this
 	// step, in round order: the agent's one-line fix summary, or "" when the
 	// round recorded none. Agent surfaces use it to report applied fixes.
-	FixSummaries     []string `json:"fix_summaries,omitempty"`
-	RoundCount       int      `json:"round_count,omitempty"`
-	FixRoundCount    int      `json:"fix_round_count,omitempty"`
-	AutoFixLimit     int      `json:"auto_fix_limit,omitempty"`
-	PendingFixSource string   `json:"pending_fix_source,omitempty"`
-	Error            *string  `json:"error,omitempty"`
-	StartedAt        *int64   `json:"started_at,omitempty"`
-	CompletedAt      *int64   `json:"completed_at,omitempty"`
-	LastActivityAt   *int64   `json:"last_activity_at,omitempty"`
-	LastActivity     *string  `json:"last_activity,omitempty"`
-	AgentPID         *int     `json:"agent_pid,omitempty"`
+	FixSummaries  []string `json:"fix_summaries,omitempty"`
+	RoundCount    int      `json:"round_count,omitempty"`
+	FixRoundCount int      `json:"fix_round_count,omitempty"`
+	// RoundTrigger is the latest round's trigger (e.g. "initial", "auto_fix",
+	// "final_head_rereview") so a client can name why a step is running again.
+	RoundTrigger     string  `json:"round_trigger,omitempty"`
+	AutoFixLimit     int     `json:"auto_fix_limit,omitempty"`
+	PendingFixSource string  `json:"pending_fix_source,omitempty"`
+	Error            *string `json:"error,omitempty"`
+	StartedAt        *int64  `json:"started_at,omitempty"`
+	CompletedAt      *int64  `json:"completed_at,omitempty"`
+	LastActivityAt   *int64  `json:"last_activity_at,omitempty"`
+	LastActivity     *string `json:"last_activity,omitempty"`
+	AgentPID         *int    `json:"agent_pid,omitempty"`
 	// OverrideReason is non-empty when a human answered ActionApprove on this
 	// step's gate despite an unresolved external condition (currently: the CI
 	// step's live checks were still failing). See

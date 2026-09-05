@@ -20,7 +20,7 @@ import (
 func TestAnalyzerEvidenceFailuresFailPipelineJourney(t *testing.T) {
 	scenario := filepath.Join(t.TempDir(), "analyzer-failure-gate.yaml")
 	content := `actions:
-  - match: "report only what you could not resolve.\n\nContext:\n- branch: analyzer-document-malformed-output"
+  - match: "stale or incorrect statement.\n\nContext:\n- branch: analyzer-document-malformed-output"
     text: "documentation unavailable"
     structured_raw: '{"summary":123}'
   - match: "You are validating a code change by testing it. Examine the repository and run the smallest relevant tests yourself.\n\nContext:\n- branch: analyzer-document-malformed-output"

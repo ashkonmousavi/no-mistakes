@@ -10,6 +10,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 	"github.com/spf13/cobra"
 )
@@ -95,6 +96,7 @@ type stepView struct {
 	AgentPID         *int
 	RoundCount       int
 	FixRoundCount    int
+	RoundTrigger     string
 	AutoFixLimit     int
 	PendingFixSource string
 	QuietWarning     time.Duration
@@ -146,6 +148,7 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 			AgentPID:         s.AgentPID,
 			RoundCount:       s.RoundCount,
 			FixRoundCount:    s.FixRoundCount,
+			RoundTrigger:     s.RoundTrigger,
 			AutoFixLimit:     s.AutoFixLimit,
 			PendingFixSource: s.PendingFixSource,
 			WorkScope:        s.WorkScope,
@@ -373,6 +376,12 @@ func (s stepView) agentPIDString() string {
 }
 
 func (s stepView) roundSummary() string {
+	// A Review round triggered by the final head moving is not an ordinary
+	// repeat: naming it keeps "why is Review running again" answerable from
+	// axi status alone.
+	if s.Name == string(types.StepReview) && s.RoundTrigger == string(pipeline.RestartReasonFinalHeadRereview) {
+		return fmt.Sprintf("final_head_rereview %d", s.RoundCount)
+	}
 	if s.Status == string(types.StepStatusFixing) {
 		attempt := s.FixRoundCount
 		if s.PendingFixSource != "" {
@@ -501,6 +510,9 @@ func gateFieldsWithHelp(gate stepView, help []string) []toon.Field {
 	}
 	if parsed.RiskLevel != "" {
 		gfields = append(gfields, toon.Field{Key: "risk", Value: parsed.RiskLevel})
+	}
+	if gate.RoundTrigger == string(pipeline.RestartReasonFinalHeadRereview) {
+		gfields = append(gfields, toon.Field{Key: "reason", Value: gate.RoundTrigger})
 	}
 	// Point-of-use reminder at the review gate: review auto-fix defaults to
 	// disabled, so agents should expect blocking and ask-user findings to park

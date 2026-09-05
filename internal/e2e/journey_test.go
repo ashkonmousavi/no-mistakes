@@ -357,7 +357,7 @@ func cleanReviewScenario(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "scenario.yaml")
 	content := `actions:
-  - match: "report only what you could not resolve.\n\nContext:\n- branch: document-agent-error"
+  - match: "stale or incorrect statement.\n\nContext:\n- branch: document-agent-error"
     text: "document agent error"
     edits:
       - path: "/outside-workdir"
@@ -367,11 +367,11 @@ func cleanReviewScenario(t *testing.T) string {
     edits:
       - path: "/outside-workdir"
         new: "should fail"
-  - match: "report only what you could not resolve.\n\nContext:\n- branch: document-missing-summary"
+  - match: "stale or incorrect statement.\n\nContext:\n- branch: document-missing-summary"
     text: " "
     structured:
       findings: []
-  - match: "report only what you could not resolve.\n\nContext:\n- branch: document-warning"
+  - match: "stale or incorrect statement.\n\nContext:\n- branch: document-warning"
     text: "documentation warning finding"
     structured:
       findings:
@@ -379,7 +379,7 @@ func cleanReviewScenario(t *testing.T) string {
           description: "README missing new CLI flag"
           action: auto-fix
       summary: "README needs updating"
-  - match: "report only what you could not resolve.\n\nContext:\n- branch: document-legacy-finding"
+  - match: "stale or incorrect statement.\n\nContext:\n- branch: document-legacy-finding"
     text: "documentation legacy finding"
     structured:
       items:
@@ -387,14 +387,14 @@ func cleanReviewScenario(t *testing.T) string {
           description: "README missing new CLI flag"
           requires_human_review: false
       summary: "README needs updating"
-  - match: "report only what you could not resolve.\n\nContext:\n- branch: document-malformed-finding"
+  - match: "stale or incorrect statement.\n\nContext:\n- branch: document-malformed-finding"
     text: "documentation malformed finding"
     structured:
       findings:
         - severity: warning
           description: "README missing new CLI flag"
       summary: "README needs updating"
-  - match: "report only what you could not resolve.\n\nContext:\n- branch: document-missing-findings"
+  - match: "stale or incorrect statement.\n\nContext:\n- branch: document-missing-findings"
     text: "documentation missing findings field"
     structured:
       summary: "docs status unavailable"
@@ -1084,7 +1084,10 @@ func assertAgentEditCommitRun(t *testing.T, h *Harness) {
 	config := "ignore_patterns:\n  - '*.generated.go'\n  - 'vendor/**'\ncommands:\n  format: \"nm-format-e2e\"\n"
 	originalHead := h.CommitChange("agent-edits", ".no-mistakes.yaml", config, "configure formatter")
 	h.PushToGate("agent-edits")
-	run := h.WaitForRun("agent-edits", 60*time.Second)
+	// Push preparation commits the agent's leftover edit and the formatter's
+	// output, which advances HEAD past the reviewed commit and sends the run
+	// back through Review before publication - two full pipeline rounds.
+	run := h.WaitForRun("agent-edits", 180*time.Second)
 	if run.Status != types.RunCompleted {
 		t.Fatalf("agent-edits run did not complete: status=%s error=%v", run.Status, deref(run.Error))
 	}
@@ -1746,41 +1749,49 @@ func assertTestAgentNewTestFileRun(t *testing.T, h *Harness) {
 	h.PushToGate("test-agent-new-test-file")
 	// Issue #140: a passing test run whose only finding is an informational
 	// "new test file written by agent" note must not gate on approval; the run
-	// proceeds automatically to completion.
-	run := h.WaitForRun("test-agent-new-test-file", 60*time.Second)
+	// proceeds automatically to completion. The finding's own shape is pinned
+	// at the unit level (internal/pipeline/steps/test_test.go), because the
+	// file the Test step leaves uncommitted is committed by Push preparation,
+	// which advances HEAD past the reviewed commit and sends the run back
+	// through Review before publication - so the final Test round runs against
+	// an already-committed file and legitimately reports no new one.
+	assertAgentWrittenTestFileIsReviewedBeforePublication(t, h, "test-agent-new-test-file", "agent_test.py")
+}
+
+// assertAgentWrittenTestFileIsReviewedBeforePublication is the journey-level
+// proof of the final-commit review guarantee: a file the Test agent wrote after
+// Review cannot reach the remote until Review has seen the commit that carries
+// it.
+func assertAgentWrittenTestFileIsReviewedBeforePublication(t *testing.T, h *Harness, branch, testFile string) {
+	t.Helper()
+	run := h.WaitForRun(branch, 180*time.Second)
 	if run.Status != types.RunCompleted {
-		t.Fatalf("test-agent-new-test-file run status = %s, want completed; error=%v", run.Status, deref(run.Error))
+		t.Fatalf("%s run status = %s, want completed; error=%v", branch, run.Status, deref(run.Error))
 	}
 	testStep, ok := findStep(run.Steps, types.StepTest)
 	if !ok {
-		t.Fatal("expected test step in test-agent-new-test-file run")
+		t.Fatalf("expected test step in %s run", branch)
 	}
 	if testStep.Status != types.StepStatusCompleted {
-		t.Fatalf("test step status = %s, want completed", testStep.Status)
+		t.Fatalf("test step status = %s, want completed (an informational new-test-file note must never gate)", testStep.Status)
 	}
-	if testStep.FindingsJSON == nil {
-		t.Fatal("expected test step to record findings JSON for new test file")
+	reviewStep, ok := findStep(run.Steps, types.StepReview)
+	if !ok {
+		t.Fatalf("expected review step in %s run", branch)
 	}
-	findings, err := types.ParseFindingsJSON(*testStep.FindingsJSON)
+	if reviewStep.RoundCount < 2 {
+		t.Fatalf("review round count = %d, want at least 2: Push preparation committed the agent's new test file, so the published commit must be reviewed", reviewStep.RoundCount)
+	}
+	if reviewStep.RoundTrigger != "final_head_rereview" {
+		t.Fatalf("latest review round trigger = %q, want %q", reviewStep.RoundTrigger, "final_head_rereview")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	published, err := h.runGit(ctx, h.UpstreamDir, "show", "refs/heads/"+branch+":"+testFile)
 	if err != nil {
-		t.Fatalf("parse new test file findings: %v", err)
+		t.Fatalf("the agent-written test file must reach the remote inside a reviewed commit: %v\n%s", err, published)
 	}
-	if len(findings.Items) != 1 {
-		t.Fatalf("expected one new test file finding, got %+v", findings.Items)
-	}
-	item := findings.Items[0]
-	if item.Severity != "info" {
-		t.Fatalf("new test file finding severity = %q, want info", item.Severity)
-	}
-	if item.Action != types.ActionNoOp {
-		t.Fatalf("new test file finding action = %q, want no-op", item.Action)
-	}
-	if item.File != "agent_test.py" {
-		t.Fatalf("new test file finding file = %q, want agent_test.py", item.File)
-	}
-	if !strings.Contains(item.Description, "new test file written by agent: agent_test.py") {
-		t.Fatalf("new test file finding description = %q", item.Description)
-	}
+	assertPushedHead(t, run.HeadSHA, h.UpstreamBranchSHA(branch))
 }
 
 func assertTestAgentStagedNewTestFileRun(t *testing.T, h *Harness) {
@@ -1788,43 +1799,10 @@ func assertTestAgentStagedNewTestFileRun(t *testing.T, h *Harness) {
 	h.CommitChange("test-agent-staged-new-test-file", "test-agent-staged-new-test-file.txt", "test agent staged new test file\n", "add test agent staged new test file")
 	h.PushToGate("test-agent-staged-new-test-file")
 	// Issue #140: same as the untracked case, but the agent stages the new test
-	// file. It is still purely informational, so the run proceeds automatically.
-	run := h.WaitForRun("test-agent-staged-new-test-file", 60*time.Second)
-	if run.Status != types.RunCompleted {
-		t.Fatalf("test-agent-staged-new-test-file run status = %s, want completed; error=%v", run.Status, deref(run.Error))
-	}
-	testStep, ok := findStep(run.Steps, types.StepTest)
-	if !ok {
-		t.Fatal("expected test step in test-agent-staged-new-test-file run")
-	}
-	if testStep.Status != types.StepStatusCompleted {
-		t.Fatalf("test step status = %s, want completed", testStep.Status)
-	}
-	if testStep.FindingsJSON == nil {
-		t.Fatal("expected test step to record findings JSON for staged new test file")
-	}
-	findings, err := types.ParseFindingsJSON(*testStep.FindingsJSON)
-	if err != nil {
-		t.Fatalf("parse staged new test file findings: %v", err)
-	}
-	if len(findings.Items) != 1 {
-		t.Fatalf("expected one staged new test file finding, got %+v", findings.Items)
-	}
-	item := findings.Items[0]
-	if item.Severity != "info" {
-		t.Fatalf("staged new test file finding severity = %q, want info", item.Severity)
-	}
-	if item.Action != types.ActionNoOp {
-		t.Fatalf("staged new test file finding action = %q, want no-op", item.Action)
-	}
-	if item.File != "agent_staged_test.go" {
-		t.Fatalf("staged new test file finding file = %q, want agent_staged_test.go", item.File)
-	}
-	if !strings.Contains(item.Description, "new test file written by agent: agent_staged_test.go") {
-		t.Fatalf("staged new test file finding description = %q", item.Description)
-	}
+	// file. It is still purely informational, so the run proceeds automatically
+	// and the staged file is published only inside a reviewed commit.
+	assertAgentWrittenTestFileIsReviewedBeforePublication(t, h, "test-agent-staged-new-test-file", "agent_staged_test.go")
 }
-
 func assertReviewWarningRun(t *testing.T, h *Harness) {
 	t.Helper()
 	h.CommitChange("review-warning", "review-warning.txt", "review warning\n", "add review warning")

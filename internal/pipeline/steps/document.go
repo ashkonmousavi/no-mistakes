@@ -1,6 +1,7 @@
 package steps
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -47,15 +48,15 @@ const documentScopeDiscipline = `Scope discipline:
 - Prefer consolidation, deletion, and pointers to the owner over addition and synchronization.`
 
 // housekeepingLintSection adds the agent-driven lint duty to the combined
-// document+lint pass.
+// document+lint pass. Read-only, like the document duty: the agent discovers
+// and runs the relevant checks but reports every issue instead of fixing it.
 const housekeepingLintSection = `
 
 Combined lint duty (same pass - no separate lint agent will run):
 - Discover the configured linters and formatters for this repository.
 - Run the relevant checks, preferring only the changed files when possible.
-- Apply safe formatter, linter, and static-analysis fixes yourself, then re-run the relevant checks.
 - Do not run tests or broader behavioral validation.
-- Report only unresolved lint, format, or static-analysis issues as findings with "category" set to "lint". Do not report lint issues you already fixed.
+- This is a read-only review: do not apply any fix. Report every lint, format, or static-analysis issue you find as a finding with "category" set to "lint", naming the file and line.
 
 Set "category" on every finding: "documentation" for documentation findings, "lint" for lint findings.`
 
@@ -123,6 +124,22 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 		sctx.Log("updating documentation...")
 	}
 
+	// The mutation check below can only attribute a change to this agent by
+	// comparing against what was already dirty before it ran. A dirty entry
+	// tree is a normal pipeline state, not an anomaly: the Test step's evidence
+	// agent is told to write focused tests and its new files reach Document
+	// uncommitted (detectNewTestFiles finds them for exactly that reason). So
+	// record the entry state rather than refusing to run - pre-existing paths
+	// are preserved, excluded from the read-only verdict, and never swept up by
+	// the failure cleanup, because they are not this step's to delete.
+	entryStatus, entryFingerprint, err := documentWorktreeFingerprint(ctx, sctx.WorkDir)
+	if err != nil {
+		return nil, err
+	}
+	if entryStatus != "" {
+		sctx.Log("document step: worktree already carries changes from an earlier step; they are preserved and excluded from the read-only check")
+	}
+
 	prompt := s.buildPrompt(sctx, baseSHA, ignorePatterns, combinedLint)
 	schema := findingsSchema
 	purpose := "document"
@@ -142,15 +159,45 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 		return nil, fmt.Errorf("agent document: %w", err)
 	}
 
-	// Commit whatever the agent edited, regardless of how trustworthy its
-	// structured output turns out to be.
-	commitSummary := extractDocumentSummary(result.Output, "")
-	fallbackSummary := "update documentation"
-	if combinedLint {
-		fallbackSummary = "update documentation and fix lint"
-	}
-	if err := commitAgentFixes(sctx, s.Name(), commitSummary, fallbackSummary); err != nil {
+	// Genuinely read-only. The earlier fork patch kept a prompt that told the
+	// agent to fix documentation and never report what it had already fixed,
+	// then silently discarded the agent's edits before computing approval from
+	// the remaining findings: a compliant agent that fixed and reported nothing
+	// produced a passing run while the stale documentation it "fixed" was
+	// thrown away unreported. Any worktree mutation after the agent returns -
+	// tracked or untracked - is now a failed step with a clear error;
+	// discarding it is cleanup after the failure is recorded, never a silent
+	// pass. This is checked before the structured-output validation below, so a
+	// pass that both mutated the worktree and returned opaque output reports
+	// the mutation rather than hiding it, and a combined-mode mutation can
+	// never reach the lint stash.
+	_, exitFingerprint, err := documentWorktreeFingerprint(ctx, sctx.WorkDir)
+	if err != nil {
 		return nil, err
+	}
+	if exitFingerprint != entryFingerprint {
+		label := "document"
+		if combinedLint {
+			label = "housekeeping"
+		}
+		mutations := documentMutationDetail(entryFingerprint, exitFingerprint)
+		if entryStatus == "" {
+			sctx.Log(label + " step is read-only: agent mutated the worktree, discarding and failing the step")
+			if _, cerr := git.Run(ctx, sctx.WorkDir, "checkout", "--", "."); cerr != nil {
+				return nil, fmt.Errorf("discard document-step mutation: %w", cerr)
+			}
+			if _, cerr := git.Run(ctx, sctx.WorkDir, "clean", "-fd"); cerr != nil {
+				return nil, fmt.Errorf("discard document-step untracked mutation: %w", cerr)
+			}
+		} else {
+			// An earlier step's uncommitted work shares this worktree, and a
+			// path-scoped discard cannot separate the two once the agent has
+			// touched a path that was already dirty. Failing without discarding
+			// is the safe half of the contract: nothing publishes from a failed
+			// step, and no other step's work is destroyed to tidy up this one.
+			sctx.Log(label + " step is read-only: agent mutated the worktree; leaving the tree untouched because an earlier step's changes are present")
+		}
+		return nil, fmt.Errorf("%s step must be read-only but the agent modified the worktree:\n%s", label, mutations)
 	}
 
 	// Without trustworthy structured output we cannot confirm the agent
@@ -197,18 +244,18 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 func (s *DocumentStep) buildPrompt(sctx *pipeline.StepContext, baseSHA, ignorePatterns string, combinedLint bool) string {
 	historySection := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx)
 
-	intro := "Keep the project documentation accurate for this change."
+	intro := "Review the project documentation for accuracy after this change. This is a read-only review: do not edit any file."
 	if combinedLint {
-		intro = "Perform the combined documentation and lint housekeeping pass for this change."
+		intro = "Perform the combined documentation and lint housekeeping pass for this change. This is a read-only review: do not edit any file."
 	}
 
-	editRule := "- Only edit documentation files or doc comments. Do not change executable behavior or tests."
+	editRule := "- This is a read-only review: do not modify, create, or delete any file. Report every stale or incorrect statement instead of fixing it."
 	if combinedLint {
-		editRule = "- Documentation edits must only touch documentation files or doc comments. Lint fixes must be safe, mechanical, and behavior-preserving. Never change functional behavior or tests."
+		editRule = "- This is a read-only review: do not modify, create, or delete any file, including lint or formatting fixes. Report every stale, incorrect, or unresolved issue instead of fixing it."
 	}
 
 	prompt := fmt.Sprintf(
-		`%s Analyze what the change made stale, fix each stale fact in its one authoritative location, and report only what you could not resolve.
+		`%s Analyze what the change made stale and report every defect you find, with the file and line of each stale or incorrect statement.
 
 Context:
 - branch: %s
@@ -227,22 +274,18 @@ Task:
    - Read the diff and changed files to understand what was added, modified, or removed, and the intent of the change.
 
 2. Find what this change made stale
-   - For each fact or contract the change altered, locate its one authoritative owner document (README, docs/, doc comments, config examples, etc.).
+   - For each fact or contract the change altered, locate its one authoritative owner document (README, docs/, doc comments, config examples, etc.). Changed user-facing behavior must leave its authoritative user documentation accurate.
    - Locate existing duplicates of those facts that are now stale.
 
-3. Fix in the authoritative location
-   - Update each altered fact in its owner document. Changed user-facing behavior must leave its authoritative user documentation accurate.
-   - Remove stale duplicates or reduce them to a short pointer to the owner; do not synchronize full copies.
-   - Re-read what you changed to verify it now reflects the code.
-
-4. Report only what remains
-   - Return a finding only for gaps you could not resolve, judgment calls (e.g. ambiguous intent or conflicting docs), or an out-of-scope consolidation worth a follow-up.
-   - Do not report gaps you already fixed.
-   - If nothing remains, return an empty findings array.%s
+3. Report every defect; fix none of them
+   - This is a read-only review: do not edit, create, or delete any file.
+   - Return a finding for every stale, missing, or incorrect statement this change left behind - including ones the placement policy above would call a stale duplicate - naming the file and line number.
+   - Also report judgment calls (e.g. ambiguous intent or conflicting docs) and any out-of-scope consolidation worth a follow-up.
+   - If nothing is stale, return an empty findings array.%s
 
 Rules:
 %s
-- The summary must be one concise sentence fragment suitable for a git commit subject.
+- The summary must be one concise sentence fragment describing the review outcome for the run log.
 - Keep the summary under 10 words.%s`,
 		intro,
 		sctx.Run.Branch,
@@ -306,6 +349,72 @@ func splitHousekeepingFindings(findings Findings) (doc Findings, lint Findings) 
 	return doc, lint
 }
 
+// documentWorktreeFingerprint captures the worktree's dirty state precisely
+// enough to attribute a change to the read-only agent. It returns the raw
+// porcelain status and a fingerprint that adds each dirty path's content hash,
+// because a status line alone does not move when an agent edits a file that was
+// already dirty - the exact case an earlier step's uncommitted work creates.
+// Deletions, renames, and unreadable paths fall back to the status line, which
+// already records them.
+func documentWorktreeFingerprint(ctx context.Context, workDir string) (string, string, error) {
+	// --untracked-files=all matters: git's default collapses a wholly untracked
+	// directory to one "?? dir/" line, and a file the agent adds inside it would
+	// leave that line - and so the fingerprint - byte-identical.
+	raw, err := git.Run(ctx, workDir, "status", "--porcelain", "--untracked-files=all")
+	if err != nil {
+		return "", "", fmt.Errorf("check worktree status for the read-only document pass: %w", err)
+	}
+	status := strings.TrimSpace(raw)
+	if status == "" {
+		return "", "", nil
+	}
+	var entries []string
+	for _, line := range strings.Split(status, "\n") {
+		if len(line) < 4 {
+			continue
+		}
+		code := line[:2]
+		path := strings.TrimSpace(line[3:])
+		entry := code + " " + path
+		if strings.Contains(code, "D") || strings.Contains(path, " -> ") {
+			entries = append(entries, entry)
+			continue
+		}
+		hash, herr := git.Run(ctx, workDir, "hash-object", "--", path)
+		if herr != nil {
+			entries = append(entries, entry)
+			continue
+		}
+		entries = append(entries, entry+" "+strings.TrimSpace(hash))
+	}
+	return status, strings.Join(entries, "\n"), nil
+}
+
+// documentMutationDetail reports what the read-only pass changed: fingerprint
+// entries the agent added or altered, plus any it reverted.
+func documentMutationDetail(entryFingerprint, exitFingerprint string) string {
+	before := map[string]bool{}
+	for _, line := range strings.Split(entryFingerprint, "\n") {
+		before[line] = true
+	}
+	after := map[string]bool{}
+	for _, line := range strings.Split(exitFingerprint, "\n") {
+		after[line] = true
+	}
+	var detail []string
+	for _, line := range strings.Split(exitFingerprint, "\n") {
+		if line != "" && !before[line] {
+			detail = append(detail, line)
+		}
+	}
+	for _, line := range strings.Split(entryFingerprint, "\n") {
+		if line != "" && !after[line] {
+			detail = append(detail, "(reverted) "+line)
+		}
+	}
+	return strings.Join(detail, "\n")
+}
+
 func hasNonIgnoredDocumentChanges(changedFiles string, ignorePatterns []string) bool {
 	for _, path := range strings.Split(changedFiles, "\n") {
 		path = strings.TrimSpace(path)
@@ -324,14 +433,4 @@ func hasNonIgnoredDocumentChanges(changedFiles string, ignorePatterns []string) 
 		}
 	}
 	return false
-}
-
-func extractDocumentSummary(raw []byte, fallback string) string {
-	var payload struct {
-		Summary string `json:"summary"`
-	}
-	if err := json.Unmarshal(raw, &payload); err == nil && strings.TrimSpace(payload.Summary) != "" {
-		return payload.Summary
-	}
-	return fallback
 }

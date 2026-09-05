@@ -11,6 +11,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 func setupGateMirror(t *testing.T, sctx *pipeline.StepContext) string {
@@ -218,6 +219,193 @@ func TestAssertReviewApprovedPushHead_UsesStepScopedGit(t *testing.T) {
 	logText := string(logBytes)
 	if !strings.Contains(logText, "rev-parse --verify") || !strings.Contains(logText, "merge-base --is-ancestor") {
 		t.Fatalf("step-scoped git did not run both continuity checks; log:\n%s", logText)
+	}
+}
+
+// TestReviewApprovedPushHeadDecision covers the pre-publication decision that
+// keeps the published commit equal to the reviewed one. It is the discriminating
+// difference from assertReviewApprovedPushHead above, which still guards
+// publication for the CI-repair path and deliberately permits a descendant:
+// here a descendant is preserved but must be reviewed again first.
+func TestReviewApprovedPushHeadDecision(t *testing.T) {
+	tests := []struct {
+		name         string
+		approval     string
+		proposed     func(t *testing.T, dir, baseSHA, headSHA string) string
+		wantRereview bool
+		wantError    string
+	}{
+		{
+			name: "equal head publishes without another review",
+			proposed: func(t *testing.T, dir, baseSHA, headSHA string) string {
+				return headSHA
+			},
+		},
+		{
+			name: "descendant needs another review",
+			proposed: func(t *testing.T, dir, baseSHA, headSHA string) string {
+				if err := os.WriteFile(filepath.Join(dir, "docs.md"), []byte("docs\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				gitCmd(t, dir, "add", "-A")
+				gitCmd(t, dir, "commit", "-m", "document approved change")
+				return gitCmd(t, dir, "rev-parse", "HEAD")
+			},
+			wantRereview: true,
+		},
+		{
+			name: "backward replacement",
+			proposed: func(t *testing.T, dir, baseSHA, headSHA string) string {
+				gitCmd(t, dir, "reset", "--hard", baseSHA)
+				return baseSHA
+			},
+			wantError: "not an equal or descendant",
+		},
+		{
+			name: "divergent replacement",
+			proposed: func(t *testing.T, dir, baseSHA, headSHA string) string {
+				gitCmd(t, dir, "reset", "--hard", baseSHA)
+				if err := os.WriteFile(filepath.Join(dir, "other.txt"), []byte("other\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				gitCmd(t, dir, "add", "-A")
+				gitCmd(t, dir, "commit", "-m", "divergent replacement")
+				return gitCmd(t, dir, "rev-parse", "HEAD")
+			},
+			wantError: "not an equal or descendant",
+		},
+		{
+			name:      "malformed approval",
+			approval:  "HEAD",
+			proposed:  func(t *testing.T, dir, baseSHA, headSHA string) string { return headSHA },
+			wantError: "malformed",
+		},
+		{
+			name:      "unreachable approval",
+			approval:  strings.Repeat("a", 40),
+			proposed:  func(t *testing.T, dir, baseSHA, headSHA string) string { return headSHA },
+			wantError: "unreachable",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir, baseSHA, headSHA := setupGitRepo(t)
+			sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+			approval := tt.approval
+			if approval == "" {
+				approval = headSHA
+			}
+			recordReviewApproval(t, sctx, approval)
+			proposed := tt.proposed(t, dir, baseSHA, headSHA)
+			needsRereview, err := reviewApprovedPushHeadDecision(sctx, proposed)
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("expected continuity approval, got %v", err)
+				}
+				if needsRereview != tt.wantRereview {
+					t.Fatalf("needs rereview = %v, want %v", needsRereview, tt.wantRereview)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("error = %v, want substring %q", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestReviewApprovedPushHeadDecision_RefusesMissingReviewAuthority(t *testing.T) {
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	_, err := reviewApprovedPushHeadDecision(sctx, headSHA)
+	if err == nil || !strings.Contains(err.Error(), "no durably recorded review-approved head") {
+		t.Fatalf("expected missing approval refusal, got %v", err)
+	}
+}
+
+// The decision runs inside the Push step, so it must use the step-scoped git
+// runner for the same reason assertReviewApprovedPushHead does: the step can
+// carry a step-local PATH and credential environment a plain runner would not
+// see. Porting this check onto a plain git.Run would regress that silently.
+func TestReviewApprovedPushHeadDecision_UsesStepScopedGit(t *testing.T) {
+	dir, baseSHA, approvedHead := setupGitRepo(t)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, approvedHead, config.Commands{})
+	recordReviewApproval(t, sctx, approvedHead)
+	if err := os.WriteFile(filepath.Join(dir, "descendant.txt"), []byte("descendant\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "descendant")
+	proposedHead := gitCmd(t, dir, "rev-parse", "HEAD")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := fakeCLIBinDir(t)
+	linkTestBinary(t, binDir, "git")
+	logFile := filepath.Join(t.TempDir(), "git.log")
+	sctx.Env = []string{
+		"PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"FAKE_CLI_MODE=git-passthrough",
+		"FAKE_CLI_REAL_GIT=" + realGit,
+		"FAKE_CLI_LOG=" + logFile,
+	}
+
+	needsRereview, err := reviewApprovedPushHeadDecision(sctx, proposedHead)
+	if err != nil {
+		t.Fatalf("expected descendant continuity, got %v", err)
+	}
+	if !needsRereview {
+		t.Fatal("descendant head reported as publication-ready")
+	}
+	logBytes, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logBytes)
+	if !strings.Contains(logText, "rev-parse --verify") || !strings.Contains(logText, "merge-base --is-ancestor") {
+		t.Fatalf("step-scoped git did not run both continuity checks; log:\n%s", logText)
+	}
+}
+
+// A commit made after Review must not reach the remote before a reviewer has
+// read it. The step returns a Review restart and leaves the remote untouched.
+func TestPushStep_DescendantHeadRequestsReviewBeforeRemoteMutation(t *testing.T) {
+	upstream := t.TempDir()
+	gitCmd(t, upstream, "init", "--bare")
+	dir, baseSHA, reviewedHead := setupGitRepo(t)
+	gitCmd(t, dir, "remote", "add", "origin", upstream)
+	gitCmd(t, dir, "push", "origin", "main")
+	gitCmd(t, dir, "push", "origin", "feature")
+
+	if err := os.WriteFile(filepath.Join(dir, "post-review.txt"), []byte("post-review\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "post-review correction")
+	descendant := gitCmd(t, dir, "rev-parse", "HEAD")
+
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, reviewedHead, config.Commands{})
+	sctx.Repo.UpstreamURL = upstream
+	sctx.Run.Branch = "refs/heads/feature"
+	sctx.Run.HeadSHA = descendant
+	setupGateMirror(t, sctx)
+	recordReviewApproval(t, sctx, reviewedHead)
+
+	outcome, err := (&PushStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatalf("push preflight failed instead of requesting rereview: %v", err)
+	}
+	if outcome == nil || outcome.RestartFrom != types.StepReview {
+		t.Fatalf("restart = %#v, want %s", outcome, types.StepReview)
+	}
+	if outcome.RestartReason != pipeline.RestartReasonFinalHeadRereview {
+		t.Fatalf("restart reason = %q, want %q", outcome.RestartReason, pipeline.RestartReasonFinalHeadRereview)
+	}
+	if remote := gitCmd(t, upstream, "rev-parse", "refs/heads/feature"); remote != reviewedHead {
+		t.Fatalf("remote changed to %s before descendant %s was reviewed", remote, descendant)
 	}
 }
 
@@ -548,22 +736,34 @@ func TestPushStep_CommitsLeftoverChangesWhenLegacyHuskyRuntimeIsMissing(t *testi
 	setupGateMirror(t, sctx)
 	recordReviewApproval(t, sctx, headSHA)
 
-	if _, err := (&PushStep{}).Execute(sctx); err != nil {
+	// The leftover change is committed here (that is the Husky bypass this test
+	// exists for), which advances HEAD past the reviewed commit. The step
+	// therefore returns a Review restart instead of publishing: the correction
+	// is preserved locally and the remote is untouched until a reviewer has
+	// actually read it.
+	outcome, err := (&PushStep{}).Execute(sctx)
+	if err != nil {
 		t.Fatalf("push failed on a worktree whose legacy Husky runtime is absent: %v", err)
+	}
+	if outcome == nil || outcome.RestartFrom != types.StepReview {
+		t.Fatalf("outcome = %#v, want a restart at %s for the post-review correction", outcome, types.StepReview)
 	}
 
 	if got := gitStatusPorcelain(t, dir); got != "" {
 		t.Fatalf("expected clean worktree after the leftover commit, got %q", got)
 	}
-	pushedHead := gitCmd(t, dir, "rev-parse", "HEAD")
-	if pushedHead == headSHA {
+	correction := gitCmd(t, dir, "rev-parse", "HEAD")
+	if correction == headSHA {
 		t.Fatal("expected a new correction commit carrying the leftover change")
 	}
-	if got := gitCmd(t, upstream, "rev-parse", "refs/heads/feature"); got != pushedHead {
-		t.Fatalf("remote head = %s, want pushed correction commit %s", got, pushedHead)
+	if got := gitCmd(t, dir, "rev-parse", "refs/heads/feature"); got != correction {
+		t.Fatalf("local branch ref = %s, want the preserved correction %s", got, correction)
 	}
-	if got := gitCmd(t, dir, "show", pushedHead+":feature.txt"); got != "formatted feature code" {
-		t.Fatalf("delivered feature.txt = %q, want the leftover change", got)
+	if got := gitCmd(t, upstream, "rev-parse", "refs/heads/feature"); got != headSHA {
+		t.Fatalf("remote head = %s, want the reviewed head %s until the correction is reviewed", got, headSHA)
+	}
+	if got := gitCmd(t, dir, "show", correction+":feature.txt"); got != "formatted feature code" {
+		t.Fatalf("committed feature.txt = %q, want the leftover change", got)
 	}
 	if _, err := os.Stat(filepath.Join(hooksDir, "_", "husky.sh")); !os.IsNotExist(err) {
 		t.Fatalf("legacy Husky runtime unexpectedly exists: %v", err)
