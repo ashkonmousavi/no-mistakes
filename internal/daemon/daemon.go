@@ -1387,6 +1387,7 @@ func stepToInfo(d *db.DB, s *db.StepResult) ipc.StepResultInfo {
 	if rounds, err := d.StepRoundStats(s.ID); err == nil {
 		info.RoundCount = rounds.TotalRounds
 		info.FixRoundCount = rounds.FixRounds
+		info.RoundTrigger = rounds.LatestTrigger
 		info.PendingFixSource = rounds.PendingFixSource
 	}
 	return info

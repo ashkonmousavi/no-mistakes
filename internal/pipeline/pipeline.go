@@ -13,6 +13,16 @@ import (
 
 var ErrFatalGateReconciliation = errors.New("fatal gate reconciliation")
 
+// RestartReason is a durable, machine-readable reason for restarting an
+// earlier pipeline step.
+type RestartReason string
+
+const (
+	// RestartReasonFinalHeadRereview marks a restart at Review caused by the
+	// run's final head advancing after Review approved it.
+	RestartReasonFinalHeadRereview RestartReason = "final_head_rereview"
+)
+
 // StepContext provides shared resources to pipeline steps during execution.
 type StepContext struct {
 	Ctx                   context.Context
@@ -108,6 +118,9 @@ type StepOutcome struct {
 	// CI repairs use it when policy requires revalidation or continuity cannot be
 	// proven, sending the new local head back through review before push.
 	RestartFrom types.StepName
+	// RestartReason explains why RestartFrom was requested. Empty preserves the
+	// legacy restart behavior and records the round trigger as "initial".
+	RestartReason RestartReason
 	// FixSummary, when non-empty, is the agent's one-line commit summary for
 	// the fix attempt performed during this round. Steps populate it in fix
 	// mode so the executor can persist it on the round record and later

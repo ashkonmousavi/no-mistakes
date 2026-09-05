@@ -27,8 +27,14 @@ func writeFinalPRScopeScenario(t *testing.T) string {
       summary: "review clean"
       risk_level: medium
       risk_rationale: "medium risk because only two source files changed"
+      risk_scope: source-or-external
   - match: "You are validating a code change by testing it. Examine the repository and run the smallest relevant tests yourself."
     text: "two-file test evidence"
+    edits:
+      - path: "docs/flag.md"
+        new: "# Flag\n"
+      - path: "docs/reference.md"
+        new: "# Reference\n"
     structured:
       findings: []
       summary: "targeted test passed"
@@ -37,15 +43,10 @@ func writeFinalPRScopeScenario(t *testing.T) string {
       testing_summary: "Focused validation passed at the test step target commit."
       artifacts: []
   - match: "Perform the combined documentation and lint housekeeping pass for this change."
-    text: "documentation updated"
-    edits:
-      - path: "docs/flag.md"
-        new: "# Flag\n"
-      - path: "docs/reference.md"
-        new: "# Reference\n"
+    text: "documentation reviewed"
     structured:
       findings: []
-      summary: "update flag documentation"
+      summary: "documentation is accurate"
   - match: "Draft a pull request title and summary for the full branch delta."
     text: "full four-file PR summary"
     structured:
@@ -116,15 +117,20 @@ func TestPRWhatChangedScopesToFinalDiffWhileEvidenceStaysStepScoped(t *testing.T
 
 	const branch = "feature/final-pr-scope"
 	h.CommitChange(branch, "internal/example/flag.go", "package example\n", "add flag behavior")
-	preDocumentHead := h.CommitChange(branch, "cmd/example/main.go", "package main\n", "add flag CLI")
+	testTargetHead := h.CommitChange(branch, "cmd/example/main.go", "package main\n", "add flag CLI")
 	h.PushToGate(branch)
 
-	run := h.WaitForRun(branch, 90*time.Second)
+	// The Test evidence agent writes the two documentation files and leaves
+	// them uncommitted; Push commits them, which advances HEAD past the
+	// commit Review approved and sends the run back through Review before
+	// publication. The branch therefore ships four files while the Test
+	// step's own evidence stays bound to the two-file commit it inspected.
+	run := h.WaitForRun(branch, 180*time.Second)
 	if run.Status != types.RunCompleted {
 		t.Fatalf("run status = %s, want completed (error=%v)", run.Status, run.Error)
 	}
-	if run.HeadSHA == preDocumentHead {
-		t.Fatalf("Document did not advance the tested head %s", preDocumentHead)
+	if run.HeadSHA == testTargetHead {
+		t.Fatalf("the pipeline did not advance the tested head %s", testTargetHead)
 	}
 
 	finalHead, err := h.runGit(ctx, forkDir, "rev-parse", "refs/heads/"+branch)
@@ -149,8 +155,8 @@ func TestPRWhatChangedScopesToFinalDiffWhileEvidenceStaysStepScoped(t *testing.T
 	}
 
 	testPrompt := findInvocationContaining(h.AgentInvocations(), "You are validating a code change")
-	if !strings.Contains(testPrompt, "target commit: "+preDocumentHead) {
-		t.Fatalf("Test evidence was not bound to its pre-Document target %s:\n%s", preDocumentHead, testPrompt)
+	if !strings.Contains(testPrompt, "target commit: "+testTargetHead) {
+		t.Fatalf("Test evidence was not bound to its own target %s:\n%s", testTargetHead, testPrompt)
 	}
 	prPrompt := findInvocationContaining(h.AgentInvocations(), "Draft a pull request title and summary for the full branch delta.")
 	for _, want := range append([]string{"target commit: " + run.HeadSHA}, wantFiles...) {
@@ -167,7 +173,7 @@ func TestPRWhatChangedScopesToFinalDiffWhileEvidenceStaysStepScoped(t *testing.T
 	}
 
 	// The `## What Changed` narrative is final-diff scoped: it must never
-	// present the Test step's own pre-Document evidence as though it
+	// present the Test step's own earlier evidence as though it
 	// described the shipped four-file branch.
 	whatChangedIdx := strings.Index(body, "## What Changed")
 	if whatChangedIdx < 0 {
@@ -178,7 +184,7 @@ func TestPRWhatChangedScopesToFinalDiffWhileEvidenceStaysStepScoped(t *testing.T
 		whatChangedSection = whatChangedSection[:len("## What Changed")+next]
 	}
 	if strings.Contains(whatChangedSection, staleTwoFileEvidence) {
-		t.Fatalf("stale pre-Document Test evidence leaked into the final-diff-scoped What Changed narrative:\n%s", whatChangedSection)
+		t.Fatalf("stale two-file Test evidence leaked into the final-diff-scoped What Changed narrative:\n%s", whatChangedSection)
 	}
 
 	// The deterministic Risk Assessment, Testing, and Pipeline sections stay

@@ -59,6 +59,11 @@ type Executor struct {
 	sessions *RunSessions
 	shared   *RunShared
 	workDir  string
+	// restartReasons carries a typed restart reason into the next execution of
+	// the target step. lastRestartReason carries it out of executeStep without
+	// widening the established return tuple used throughout recovery code.
+	restartReasons    map[types.StepName]RestartReason
+	lastRestartReason RestartReason
 
 	mu          sync.Mutex
 	approvalCh  chan approvalResponse // buffered channel for approval responses
@@ -236,6 +241,7 @@ func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, work
 		if err != nil {
 			return e.failRun(run, repo, fmt.Errorf("restore step %s execution state: %w", step.Name(), err), ctx)
 		}
+		state.restartReason = e.takeRestartReason(step.Name())
 		skipRemaining, restartFrom, err := e.executeStep(ctx, step, sr, run, repo, workDir, logDir, state)
 		if err != nil {
 			return e.failRun(run, repo, err, ctx)
@@ -252,10 +258,12 @@ func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, work
 			break
 		}
 		if restartFrom != "" {
+			restartReason := e.lastRestartReason
 			restartIndex, err := e.prepareRestart(run.ID, restartFrom, i)
 			if err != nil {
 				return e.failRun(run, repo, fmt.Errorf("step %s requested invalid restart from %s", step.Name(), restartFrom), ctx)
 			}
+			e.rememberRestartReason(restartFrom, restartReason)
 			i = restartIndex - 1
 		}
 	}
@@ -292,6 +300,8 @@ func (e *Executor) initializeRunScopes(runID string) {
 	sessionsEnabled := e.config != nil && e.config.SessionReuse && e.agent != nil
 	e.sessions = NewRunSessions(e.db, runID, e.agent, sessionsEnabled)
 	e.shared = &RunShared{}
+	e.restartReasons = make(map[types.StepName]RestartReason)
+	e.lastRestartReason = ""
 }
 
 type stepExecutionState struct {
@@ -301,6 +311,23 @@ type stepExecutionState struct {
 	autoFixAttempts  int
 	executionMS      int64
 	currentRoundID   string
+	restartReason    RestartReason
+}
+
+func (e *Executor) rememberRestartReason(step types.StepName, reason RestartReason) {
+	if reason == "" {
+		return
+	}
+	if e.restartReasons == nil {
+		e.restartReasons = make(map[types.StepName]RestartReason)
+	}
+	e.restartReasons[step] = reason
+}
+
+func (e *Executor) takeRestartReason(step types.StepName) RestartReason {
+	reason := e.restartReasons[step]
+	delete(e.restartReasons, step)
+	return reason
 }
 
 func (e *Executor) durableExecutionState(stepResultID string) (stepExecutionState, error) {
@@ -523,10 +550,12 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 			return e.skipRecoveredRemainder(run, repo, gate.index+1)
 		}
 		if restartFrom != "" {
+			restartReason := e.lastRestartReason
 			restartIndex, indexErr := e.prepareRestart(run.ID, restartFrom, gate.index)
 			if indexErr != nil {
 				return e.failRun(run, repo, fmt.Errorf("step %s requested invalid restart from %s", gate.step.Name(), restartFrom), ctx)
 			}
+			e.rememberRestartReason(restartFrom, restartReason)
 			return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, restartIndex, true)
 		}
 		return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1, false)
@@ -623,6 +652,7 @@ func (e *Executor) executeRecoveredRemainder(ctx context.Context, run *db.Run, r
 		if stateErr != nil {
 			return e.failRun(run, repo, fmt.Errorf("restore step %s execution state: %w", e.steps[index].Name(), stateErr), ctx)
 		}
+		state.restartReason = e.takeRestartReason(e.steps[index].Name())
 		skipRemaining, restartFrom, err := e.executeStep(ctx, e.steps[index], results[index], run, repo, workDir, logDir, state)
 		if err != nil {
 			return e.failRun(run, repo, err, ctx)
@@ -631,10 +661,12 @@ func (e *Executor) executeRecoveredRemainder(ctx context.Context, run *db.Run, r
 			return e.skipRecoveredRemainder(run, repo, index+1)
 		}
 		if restartFrom != "" {
+			restartReason := e.lastRestartReason
 			restartIndex, indexErr := e.prepareRestart(run.ID, restartFrom, index)
 			if indexErr != nil {
 				return e.failRun(run, repo, fmt.Errorf("step %s requested invalid restart from %s", e.steps[index].Name(), restartFrom), ctx)
 			}
+			e.rememberRestartReason(restartFrom, restartReason)
 			revalidating = true
 			index = restartIndex - 1
 		}
@@ -690,6 +722,7 @@ func recoveredLogPath(step *db.StepResult) string {
 // Returns whether to skip the remainder, an optional earlier restart step,
 // and any execution error.
 func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult, run *db.Run, repo *db.Repo, workDir, logDir string, state stepExecutionState) (bool, types.StepName, error) {
+	e.lastRestartReason = ""
 	stepName := step.Name()
 	logPath := filepath.Join(logDir, string(stepName)+".log")
 	finalExitCode := 0
@@ -864,7 +897,10 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	// change were precisely the ones a decision never reached.
 	BindBranchDecisions(sctx)
 
-	nextTrigger := "initial"
+	nextTrigger := string(state.restartReason)
+	if nextTrigger == "" {
+		nextTrigger = "initial"
+	}
 	if sctx.Fixing {
 		nextTrigger = "auto_fix"
 	}
@@ -873,12 +909,19 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	currentRoundID := state.currentRoundID
 	var reviewApprovedHeadSHA string
 	var restartFrom types.StepName
+	var restartReason RestartReason
 
 	// Execute with possible fix loop
 	for {
 		reviewStartingHeadSHA := run.HeadSHA
 		sctx.ReviewStartingHeadSHA = reviewStartingHeadSHA
 		outcome, err := step.Execute(sctx)
+		if err == nil {
+			err = e.bindPostReviewHead(ctx, step, sctx, outcome)
+		}
+		if err == nil {
+			err = e.enforceRestartBound(run.ID, outcome)
+		}
 		roundNum++
 		roundDuration := time.Since(phaseStart).Milliseconds()
 		if err != nil {
@@ -899,6 +942,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			return false, "", fmt.Errorf("step %s failed: %s", stepName, redactedErr)
 		}
 		restartFrom = outcome.RestartFrom
+		restartReason = outcome.RestartReason
 
 		if stepName == types.StepReview {
 			reviewApprovedHeadSHA = outcome.ReviewApprovedHeadSHA
@@ -930,6 +974,9 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		var inserted *db.StepRound
 		var dbErr error
 		roundTrigger := nextTrigger
+		if outcome.RestartReason != "" {
+			roundTrigger = string(outcome.RestartReason)
+		}
 		if stepName == types.StepCI && restartFrom != "" && !sctx.Fixing {
 			roundTrigger = "auto_fix"
 		}
@@ -1150,6 +1197,7 @@ done:
 		return false, "", fmt.Errorf("complete step %s: %w", stepName, err)
 	}
 	e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(status), "", "", &durationMS)
+	e.lastRestartReason = restartReason
 	return skipRemaining, restartFrom, nil
 }
 

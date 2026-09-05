@@ -65,6 +65,38 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 	if err != nil {
 		return nil, fmt.Errorf("resolve head before push: %w", err)
 	}
+
+	// Push preparation (the formatter above, or an agent fix committed here)
+	// can advance HEAD past the commit Review approved. Publishing a descendant
+	// would publish a commit no reviewer ever read, so the run goes back to
+	// Review first. This runs before publishRunHead - the only path that
+	// touches the remote - so a rereview is requested before any remote
+	// mutation, and the forward commit is preserved rather than discarded.
+	needsRereview, err := reviewApprovedPushHeadDecision(sctx, headBeingPushed)
+	if err != nil {
+		return nil, err
+	}
+	if needsRereview {
+		ref := normalizedBranchRef(sctx.Run.Branch)
+		// Preserve a clean forward commit even when an agent made it directly
+		// rather than through commitPipelineCorrection. The next Review must
+		// bind the exact local head.
+		if _, err := stepGitRun(sctx, "update-ref", ref, headBeingPushed); err != nil {
+			return nil, fmt.Errorf("update local branch ref before rereview: %w", err)
+		}
+		if headBeingPushed != sctx.Run.HeadSHA {
+			sctx.Run.HeadSHA = headBeingPushed
+			if err := sctx.DB.UpdateRunHeadSHA(sctx.Run.ID, headBeingPushed); err != nil {
+				return nil, err
+			}
+		}
+		sctx.Log("final_head_rereview: push preparation advanced HEAD after review; restarting at Review before publication")
+		return &pipeline.StepOutcome{
+			RestartFrom:   types.StepReview,
+			RestartReason: pipeline.RestartReasonFinalHeadRereview,
+		}, nil
+	}
+
 	if err := publishRunHead(sctx, headBeingPushed, newHeadSHA); err != nil {
 		return nil, err
 	}
@@ -253,43 +285,32 @@ func assertReviewApprovedPushHead(sctx *pipeline.StepContext, proposedHead strin
 	return nil
 }
 
+// reviewApprovedPushHeadDecision reports whether the proposed head still needs
+// a Review round before it may be published. It delegates to the pipeline-level
+// owner of that decision so the Push step and the executor's post-review head
+// binding apply one rule, and passes the step-scoped git runner so a step-local
+// PATH and credential environment stay in effect.
+func reviewApprovedPushHeadDecision(sctx *pipeline.StepContext, proposedHead string) (bool, error) {
+	return pipeline.ReviewHeadNeedsRereview(sctx.DB, sctx.Run.ID, proposedHead, stepGitRunner(sctx))
+}
+
+// stepGitRunner adapts stepGitRun to the pipeline package's GitRunner.
+func stepGitRunner(sctx *pipeline.StepContext) pipeline.GitRunner {
+	return func(args ...string) (string, error) { return stepGitRun(sctx, args...) }
+}
+
 // reviewApprovedHead returns the run's durable review-approved commit, or ""
-// plus the reason it is unusable. It is the single reader of that authority, so
-// the pre-publication continuity decision and the publication guard itself can
-// never disagree about what "reviewed" means.
+// plus the reason it is unusable. The single reader of that authority lives in
+// the pipeline package (pipeline.ReviewApprovedHead) so the pre-publication
+// continuity decision, the post-review head binding, and the publication guard
+// itself can never disagree about what "reviewed" means.
 func reviewApprovedHead(sctx *pipeline.StepContext, run *db.Run) (string, string) {
-	if run == nil || run.ReviewApprovedHeadSHA == nil || strings.TrimSpace(*run.ReviewApprovedHeadSHA) == "" {
-		return "", "run has no durably recorded review-approved head"
-	}
-	approvedHead := strings.TrimSpace(*run.ReviewApprovedHeadSHA)
-	if !isFullGitObjectID(approvedHead) {
-		return "", "durable review-approved head is malformed"
-	}
-	resolved, err := stepGitRun(sctx, "rev-parse", "--verify", approvedHead+"^{commit}")
-	if err != nil || !strings.EqualFold(strings.TrimSpace(resolved), approvedHead) {
-		return "", "durable review-approved head is unreachable"
-	}
-	return approvedHead, ""
+	return pipeline.ReviewApprovedHead(run, stepGitRunner(sctx))
 }
 
-func isFullGitObjectID(value string) bool {
-	if len(value) != 40 && len(value) != 64 {
-		return false
-	}
-	for _, r := range value {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
-			return false
-		}
-	}
-	return true
-}
+func isFullGitObjectID(value string) bool { return pipeline.IsFullGitObjectID(value) }
 
-func shortObjectID(value string) string {
-	if len(value) > 12 {
-		return value[:12]
-	}
-	return value
-}
+func shortObjectID(value string) string { return pipeline.ShortObjectID(value) }
 
 // lastKnownBranchTip returns the commit SHA the pipeline last observed or
 // produced for this branch on the remote. It checks the current run's recorded

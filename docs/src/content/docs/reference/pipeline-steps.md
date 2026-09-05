@@ -10,6 +10,7 @@ intent → rebase → review → test → document → lint → push → pr → 
 ```
 
 Each step can produce findings, request approval, trigger auto-fix, or apply safe fixes during its own pass. Steps that encounter fatal errors stop the pipeline. Steps can also be pre-skipped when starting a run, skipped by the user, or skipped automatically by the pipeline.
+Pipeline steps do not treat missing, malformed, or semantically incomplete structured analyzer output as a clean result. Such output stops the affected step, including Document; it never creates a gate that unattended AXI mode can accept.
 In the TUI, yolo mode is an explicit override that auto-resolves paused steps: `auto-fix` and `ask-user` findings are fixed once with every finding selected, fix-review gates are approved, and gates with only `no-op` findings are approved as-is.
 Every pipeline agent invocation is prompt-steered to keep intentional writes inside the run worktree and avoid mutating system state outside it.
 This is a soft boundary, not OS-level sandbox enforcement.
@@ -29,9 +30,9 @@ Review flags every newly added violation and requires same-pattern tests encount
 
 When a human resolves a findings gate with Approve, Skip, or Abort without selecting a fix, no-mistakes records that the round's findings were declined. A gate with no findings records no decision. When the human selects only some findings to fix, the unselected complement is recorded as declined; findings merely left out by automatic filtering remain undecided.
 
-Review, Test, Document, and Lint agent prompts receive a sanitized history containing the current step's earlier rounds, decisions from other steps in the same run, and a bounded window of decisions from earlier runs on the same branch. A recorded decision takes precedence over conflicting user-intent wording, and later decisions about the same concern supersede earlier ones. Completing Review does not clear branch decisions.
+Review, Test, Document, Lint, and CI fix agent prompts receive a sanitized history containing the current step's earlier rounds, decisions from other steps in the same run, and a bounded window of decisions from earlier runs on the same branch. A recorded decision takes precedence over conflicting user-intent wording, and later decisions about the same concern supersede earlier ones. Completing Review does not clear branch decisions.
 
-This context is advisory and fails open. It tells agents not to implement or re-report a declined finding unless the current code introduces a materially different problem, but it does not block a step or commit and is not a reversion detector. Rebase and CI fix prompts do not receive this decision history.
+This context is advisory and fails open. It tells agents not to implement or re-report a declined finding unless the current code introduces a materially different problem, but it does not block a step or commit and is not a reversion detector. Rebase fix prompts do not receive this decision history.
 
 ## Intent
 
@@ -136,8 +137,8 @@ Local Test is never a repository-wide regression-suite substitute; broad regress
 - If `commands.test` is empty, or user intent is available after the baseline command passes: the agent validates the change with the **smallest relevant** evidence-oriented tests or manual checks, returning structured findings with severity, description, and `action` (`no-op`, `auto-fix`, `ask-user`). Both the normal evidence agent and the Test-repair agent are instructed not to run the complete repository test suite; a generic driver instruction asking for broad or full-suite confirmation does not override that product boundary. For UI, HTML, CSS, browser, visual layout, or copy-placement changes, the agent attempts reviewer-visible visual evidence and explains in `testing_summary` when screenshots, images, videos, GIFs, or rendered HTML artifacts are not captured.
 - Bounds those agent turns with [`test_agent_timeout`](/no-mistakes/reference/global-config/#test_agent_timeout): each evidence-gathering or Test-repair invocation gets its own budget, and an expired budget cancels the agent and fails the step with a timeout diagnostic rather than leaving the run active indefinitely
 - "Do not run everything" is not "run nothing": when no targeted check can establish the intent, the agent must write or improve a focused test, perform manual verification with evidence, or report a warning finding that sufficient targeted evidence is not possible.
-- The step records the exact tests and checks it exercised in a `tested` array, may include a short natural-language `testing_summary`, and includes an `artifacts` array for reviewer-visible evidence; `path` artifacts may be repository-relative paths or absolute paths under the run's evidence directory, `url` artifacts must be externally visible, and `content` artifacts should be short logs or command output shown directly in the PR.
-- Evidence is always collected under the run's evidence directory (`<NM_HOME>/evidence/<run-id>` by default, see [`test.evidence`](/no-mistakes/reference/global-config/#testevidence)), outside the worktree, so artifacts never enter the branch being validated. On GitHub.com/GHEC, [`test.evidence.attach_media`](/no-mistakes/reference/global-config/#testevidence) (default true) uploads supported image and video artifacts to GitHub user-attachments at PR render time. [`test.evidence.store_in_repo: true`](/no-mistakes/reference/global-config/#testevidence) also publishes that directory to the push-target repository's orphan evidence branch under `<test.evidence.dir>/<branch-slug>` and links the artifacts from the PR body. The config reference owns provider support and fail-closed behavior.
+- The analyzer result must include `tested`, `testing_summary`, and `artifacts`; `tested` records exact tests and checks, `testing_summary` is a short natural-language account of the result, and `artifacts` holds reviewer-visible evidence. `path` artifacts may be repository-relative paths or absolute paths under the run's evidence directory, `url` artifacts must be externally visible, and `content` artifacts should be short logs or command output shown directly in the PR.
+- Evidence is always collected under the run's evidence directory (`<NM_HOME>/evidence/<run-id>` by default, see [`test.evidence`](/no-mistakes/reference/global-config/#testevidence)), outside the worktree, so artifacts never enter the branch being validated. On GitHub.com/GHEC, [`test.evidence.attach_media: true`](/no-mistakes/reference/global-config/#testevidence) (opt-in, default false) uploads supported image and video artifacts to GitHub user-attachments at PR render time. [`test.evidence.store_in_repo: true`](/no-mistakes/reference/global-config/#testevidence) also publishes that directory to the push-target repository's orphan evidence branch under `<test.evidence.dir>/<branch-slug>` and links the artifacts from the PR body. The config reference owns provider support and fail-closed behavior.
 - Before finishing, test agents are instructed to remove transient working-tree artifacts they created, such as downloaded models, caches, build outputs, large binaries, or generated data directories, while preserving intentional source or test-file changes and evidence files under the dedicated evidence directory.
 - Missing evidence for user intent can be reported as a warning with `action: ask-user`. When a host capability or OS permission is unavailable to the agent process, the agent is instructed to name the specific capability or permission and explain how to grant it before the test is rerun.
 - If the agent creates new test files (detected via `git status --porcelain`), they are recorded as informational `no-op` findings and do not require approval when tests pass.
@@ -150,21 +151,22 @@ Local Test is never a repository-wide regression-suite substitute; broad regress
 
 ## Document
 
-Updates matching documentation for code changes and reports only unresolved gaps.
+Reviews documentation for accuracy after a code change and reports every gap it finds. The step is read-only: it never edits or commits documentation.
 
 **Behavior:**
 
 - Diffs the base commit against head and skips the step if there are no non-ignored changed files to document
-- Asks the agent to find every documentation gap, update docs or doc comments for all gaps it can resolve, verify its edits, and commit any documentation changes under the placement policy
+- Asks the agent to find every documentation gap the change left behind and report each one with its file and line, under the placement policy. The agent is told not to modify, create, or delete any file
+- Fingerprints the worktree before the agent runs and again after it returns, and compares the two. Any change the agent made, tracked or untracked, fails the step with an error naming the paths; the changes are discarded as post-failure cleanup, never as a silent pass. Uncommitted work an earlier step left behind (the test step's new test files, for example) is preserved, excluded from the comparison, and never discarded - when it is present the step fails without discarding anything, because a path-scoped discard cannot separate the agent's change from work it did not make
 - The placement policy gives each fact one authoritative owner, prefers removing stale duplicates or replacing them with pointers, avoids new documentation surfaces for perceived gaps, and keeps durable incident lessons near their owner instead of in `AGENTS.md`
 - `document.instructions` can add trusted default-branch ownership rules for the repository
-- When `commands.lint` is empty, performs documentation and agent-driven lint in one combined housekeeping invocation, categorizing findings for the document or lint gate; if that pass is skipped, its structured output is unusable, or a daemon restart loses the in-memory result, lint runs its own agent pass instead
+- When `commands.lint` is empty, performs documentation and agent-driven lint in one combined read-only housekeeping invocation, categorizing findings for the document or lint gate; if that pass is skipped, its structured output is unusable, or a daemon restart loses the in-memory result, lint runs its own agent pass instead
 - Includes user intent when available
-- Returns findings only for unresolved documentation gaps or human judgment calls
+- Returns a finding for every stale, missing, or incorrect statement, plus human judgment calls
 - Requires approval whenever any unresolved documentation finding is returned, including `info` findings
 - Bounds the documentation (and combined housekeeping) agent with [`agent_timeout`](/no-mistakes/reference/global-config/#agent_timeout): an expired budget cancels the agent and fails the step with a timeout diagnostic rather than leaving the run active indefinitely
 
-**Auto-fix:** documentation fixes happen during the initial document pass. Unresolved findings pause for approval instead of starting another automatic document/fix loop. If you manually trigger a fix from the TUI or AXI interface, the agent receives the selected previous findings plus any per-finding user notes, any selected user-authored findings, and the shared [finding decision history](#finding-decision-history).
+**Auto-fix:** the document step never edits documentation, so there is no document fix loop. Findings pause for approval and the author resolves them in an ordinary commit. If you manually trigger a fix from the TUI or AXI interface, the agent receives the selected previous findings plus any per-finding user notes, any selected user-authored findings, and the shared [finding decision history](#finding-decision-history).
 
 **Default auto-fix limit:** not used for automatic document follow-up loops.
 
@@ -175,7 +177,7 @@ Runs linters and static analysis.
 **Behavior:**
 
 - If `commands.lint` is set: runs it via the platform shell (`sh -c` on POSIX, `cmd.exe /c` on Windows). Non-zero exit produces `warning` findings.
-- If `commands.lint` is empty: consumes lint-category findings from the document step's combined housekeeping pass, avoiding a second cold agent invocation. If no usable combined result exists, the lint step detects appropriate linters/formatters, applies safe fixes, reruns the relevant checks, commits any agent changes, and returns structured findings only for unresolved issues.
+- If `commands.lint` is empty: consumes lint-category findings from the document step's combined read-only housekeeping pass, avoiding a second cold agent invocation. That pass reports lint issues without fixing them. If no usable combined result exists, the lint step detects appropriate linters/formatters, applies safe fixes, reruns the relevant checks, commits any agent changes, and returns structured findings only for unresolved issues.
 - Bounds those agent turns, including a configured-lint repair turn, with [`agent_timeout`](/no-mistakes/reference/global-config/#agent_timeout): an expired budget cancels the agent and fails the step with a timeout diagnostic rather than leaving the run active indefinitely
 
 **Approval:** lint findings with `action: ask-user` pause for approval.
@@ -184,7 +186,7 @@ Runs linters and static analysis.
 Combined-pass lint findings use the same gate: `error` and `warning` findings pause for a decision, while `info` findings do not.
 
 **Auto-fix:** when `commands.lint` is configured, the lint step follows the same pattern as test - the agent fixes `action: auto-fix` issues using the previous findings plus any per-finding user notes, any selected user-authored findings from the TUI or AXI interface, and the shared [finding decision history](#finding-decision-history), including earlier fix summaries for this step, then lint re-runs.
-When `commands.lint` is empty, unresolved findings from the combined pass pause for approval instead of starting another automatic lint/fix loop, because the agent already attempted safe fixes during housekeeping.
+When `commands.lint` is empty, findings from the combined pass pause for approval instead of starting another automatic lint/fix loop; the housekeeping pass is read-only and reports issues rather than fixing them.
 
 **Default auto-fix limit:** `3`.
 
@@ -198,8 +200,9 @@ Pushes the validated branch to the configured push target.
 - Commits any uncommitted changes left by pipeline agents or the formatter with message `no-mistakes: apply agent fixes`
 - Without fork routing, successful run-start validation selects the upstream URL from the working clone; when it matches the gate worktree's `origin`, the worktree URL is used so embedded credentials retained outside the database can authenticate. If validation fails, the run continues with its prior routing.
 - With GitHub fork routing, the push target is `repos.fork_url`
-- Immediately before remote mutation, reloads the durable review-approved commit and refuses to push when that binding is missing, malformed, or unreachable
-- Requires the commit proposed for push to equal or descend from the review-approved commit, allowing commits made by later pipeline steps without authorizing unrelated history
+- After Test, Document, or Lint advances the head past the review-approved commit, restarts immediately at Review with the durable `final_head_rereview` reason. Push repeats the same check after formatter and leftover-change preparation, before any remote mutation. Three final-head rereviews is the convergence limit, after which the run fails with `final_head_rereview_limit_exceeded`
+- Immediately before remote mutation, reloads the durable review-approved commit and requires live `HEAD` to equal it exactly, so the commit published is the commit reviewed. A descendant is preserved locally and restarts at Review; a missing, malformed, unreachable, backward, or divergent approval refuses publication
+- A CI repair published without revalidation (`ci.revalidate_repairs: false`, the default) is the one path that still publishes a proven descendant of the reviewed commit without another Review; set `ci.revalidate_repairs: true` to require one
 - Re-reads the push target via `git ls-remote` before pushing
 - For existing branches, refuses to force-push when the live remote carries commits the pipeline has not incorporated by patch-id
 - Fails closed when the remote safety check cannot verify whether the push would discard existing remote work

@@ -175,9 +175,9 @@ no-mistakes axi abort
 no-mistakes axi abort --run <id>
 ```
 
-Before any post-pipeline local commit or fresh run, read `branch_sync`.
-Only when its structured `next_action.code` is `sync`, run `no-mistakes axi sync` first.
-When `next_action.code` is `recover_custody` - a terminal run left unpublished pipeline commits preserved in the local gate - run `no-mistakes axi sync --recover` to return custody, or `no-mistakes rerun` to resume validating the preserved head.
+Before any post-pipeline local commit or fresh run, read `branch_sync` and follow its exact `next_action.command`.
+A `sync` action runs `no-mistakes axi sync` first.
+A `recover_custody` action is ordinary `no-mistakes axi sync --recover` to take a still-available preserved head, or `no-mistakes axi sync --recover --keep-local` when that head is unavailable and you are discarding the missing commits, or when a bound archive preserves divergent later work while custody returns at the reported required head; never substitute one action for the other. `no-mistakes rerun` resumes validating a still-available preserved head.
 A `branch_sync.state` of `user_owned` means the run went terminal before changing the submitted head and cancellation released the branch: it is immediately usable and needs no sync action.
 When `next_action.code` is `continue_active_run`, run the reported command and keep driving the active run.
 If synchronization is blocked, process that state instead of improvising reset, stash, merge, rebase, force, or branch replacement.
@@ -222,7 +222,7 @@ All agents implement the same interface. Each invocation receives:
 
 Each invocation returns:
 
-- **Output** - structured JSON output; native structured responses are returned as-is, while text-parsed fallbacks are validated before return and may use `null` for optional fields
+- **Output** - structured JSON output; when `JSONSchema` is requested, adapters require that it returns some structured output, while pipeline steps validate their own output contracts. Text-parsed fallbacks are validated against the requested schema and may use `null` for optional fields.
 - **Text** - raw text output
 - **Usage** - token counts (input, output, cache read, cache creation)
 - **SessionID** and **Resumed** - the adapter-native session identity and whether this invocation resumed it, when supported

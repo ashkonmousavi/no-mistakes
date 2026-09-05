@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.65.4](https://github.com/kunchenguid/no-mistakes/compare/v1.65.3...v1.65.4) (2026-09-05)
+
+
+### Bug Fixes
+
+* **pipeline:** give CI repairs the recorded decision history ([#976](https://github.com/kunchenguid/no-mistakes/issues/976)) ([7808aea](https://github.com/kunchenguid/no-mistakes/commit/7808aeae2702f301b6da4a7cd39935c0adaaf5fe))
+
+## [1.65.3](https://github.com/kunchenguid/no-mistakes/compare/v1.65.2...v1.65.3) (2026-09-04)
+
+
+### Bug Fixes
+
+* **eval:** preserve agent authentication during replay ([#968](https://github.com/kunchenguid/no-mistakes/issues/968)) ([b99bce8](https://github.com/kunchenguid/no-mistakes/commit/b99bce828e133e2a7682b2bc76a24f3748ff3852))
+
+## [1.65.2](https://github.com/kunchenguid/no-mistakes/compare/v1.65.1...v1.65.2) (2026-09-04)
+
+
+### Bug Fixes
+
+* **branchsync:** recover custody from bound archives ([#954](https://github.com/kunchenguid/no-mistakes/issues/954)) ([e2f575a](https://github.com/kunchenguid/no-mistakes/commit/e2f575aded870cc92e58b56fd5414ab9b4cb3c2b))
+* **pipeline:** fail closed on invalid analyzer output ([#955](https://github.com/kunchenguid/no-mistakes/issues/955)) ([911452b](https://github.com/kunchenguid/no-mistakes/commit/911452b00f942f80238e3c6cc35b8c185146cae8))
+
+## [1.65.1](https://github.com/kunchenguid/no-mistakes/compare/v1.65.0...v1.65.1) (2026-09-04)
+
+
+### Bug Fixes
+
+* **branchsync:** recover custody when preserved heads are missing ([#958](https://github.com/kunchenguid/no-mistakes/issues/958)) ([100c1f5](https://github.com/kunchenguid/no-mistakes/commit/100c1f55cffa8ded4d6f1b9a7a8a4f4cf4098ea4))
+
 ## [1.65.0](https://github.com/kunchenguid/no-mistakes/compare/v1.64.0...v1.65.0) (2026-09-03)
 
 

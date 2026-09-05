@@ -14,8 +14,12 @@ func TestTestEvidenceDefaults(t *testing.T) {
 	if got.Evidence.StoreInRepo {
 		t.Error("default StoreInRepo should be false (opt-in)")
 	}
-	if !got.Evidence.AttachMedia {
-		t.Error("default AttachMedia should be true so default-config PRs upload screenshots")
+	// Publishing evidence off this machine is an operator decision, so the
+	// user-attachment upload is opt-in exactly like the orphan evidence branch.
+	// A default of true would make an upgrade start uploading a repository's
+	// screenshots and recordings with no configuration change.
+	if got.Evidence.AttachMedia {
+		t.Error("default AttachMedia should be false (opt-in), so an upgrade never starts uploading media")
 	}
 	if got.Evidence.Dir != ".no-mistakes/evidence" {
 		t.Errorf("default Dir = %q, want .no-mistakes/evidence", got.Evidence.Dir)
@@ -41,8 +45,8 @@ func TestTestEvidenceMerge_GlobalEnable(t *testing.T) {
 	if cfg.Test.Evidence.Branch != evidence.DefaultBranch {
 		t.Errorf("branch = %q, want default %q", cfg.Test.Evidence.Branch, evidence.DefaultBranch)
 	}
-	if !cfg.Test.Evidence.AttachMedia {
-		t.Error("attach_media should default on when unset")
+	if cfg.Test.Evidence.AttachMedia {
+		t.Error("attach_media should stay off when unset")
 	}
 }
 
@@ -52,6 +56,20 @@ func TestTestEvidenceMerge_AttachMediaOptOut(t *testing.T) {
 	cfg := Merge(global, &RepoConfig{})
 	if cfg.Test.Evidence.AttachMedia {
 		t.Error("explicit attach_media: false should opt out")
+	}
+}
+
+// The default flipped to off, but the mechanism is unchanged: an explicit
+// attach_media: true must still opt a repository in, from either source.
+func TestTestEvidenceMerge_AttachMediaOptIn(t *testing.T) {
+	enabled := true
+	global := &GlobalConfig{Test: TestRaw{Evidence: EvidenceRaw{AttachMedia: &enabled}}}
+	if cfg := Merge(global, &RepoConfig{}); !cfg.Test.Evidence.AttachMedia {
+		t.Error("explicit global attach_media: true should opt in")
+	}
+	repo := &RepoConfig{Test: TestRaw{Evidence: EvidenceRaw{AttachMedia: &enabled}}}
+	if cfg := Merge(&GlobalConfig{}, repo); !cfg.Test.Evidence.AttachMedia {
+		t.Error("explicit repo attach_media: true should opt in")
 	}
 }
 
