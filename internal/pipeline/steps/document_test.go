@@ -242,6 +242,51 @@ func TestDocumentStep_EditToAPreexistingDirtyFileIsDetected(t *testing.T) {
 	}
 }
 
+// TestDocumentStep_EditToAPreexistingDirtyQuotedPathFileIsDetected proves the
+// verdict survives git's core.quotepath escaping: a pre-existing untracked
+// file whose name needs quoting (non-ASCII bytes) still moves the fingerprint
+// when the agent edits its content, even though its porcelain status line -
+// quoted and escaped either way - never moves.
+func TestDocumentStep_EditToAPreexistingDirtyQuotedPathFileIsDetected(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", headSHA)
+
+	leftover := filepath.Join(dir, "café.go")
+	if err := os.WriteFile(leftover, []byte("package leftover\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	statusBefore := gitStatusPorcelain(t, dir)
+	if !strings.Contains(statusBefore, `"`) {
+		t.Fatalf("setup invalidated the premise: expected core.quotepath to escape the non-ASCII path, got %q", statusBefore)
+	}
+
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			if err := os.WriteFile(leftover, []byte("package leftover // edited by the agent\n"), 0o644); err != nil {
+				return nil, err
+			}
+			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"no gaps"}`)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+
+	if got := gitStatusPorcelain(t, dir); got != statusBefore {
+		t.Fatalf("setup invalidated the premise: status changed before the agent ran")
+	}
+
+	step := &DocumentStep{}
+	if _, err := step.Execute(sctx); err == nil {
+		t.Fatal("expected an edit to an already-dirty quoted-path file to fail the read-only document step")
+	} else if !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("error = %v, want a read-only violation", err)
+	}
+	if got := gitStatusPorcelain(t, dir); got != statusBefore {
+		t.Fatalf("premise check: porcelain status must be unchanged by the agent's edit, before=%q after=%q", statusBefore, got)
+	}
+}
+
 func TestDocumentStep_AgentManaged_UnresolvedFindingsNeedApprovalWithoutAutoFixLoop(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)

@@ -360,23 +360,38 @@ func documentWorktreeFingerprint(ctx context.Context, workDir string) (string, s
 	// --untracked-files=all matters: git's default collapses a wholly untracked
 	// directory to one "?? dir/" line, and a file the agent adds inside it would
 	// leave that line - and so the fingerprint - byte-identical.
-	raw, err := git.Run(ctx, workDir, "status", "--porcelain", "--untracked-files=all")
+	//
+	// -z is used to read the records: without it, git's default core.quotepath
+	// escapes any path containing non-ASCII bytes, backslashes, or double quotes
+	// into a C-style quoted string, which would then fail to open at that literal
+	// path and silently fall back to the (unmoving) status line alone.
+	rawZ, err := git.RunRaw(ctx, workDir, "status", "--porcelain", "-z", "--untracked-files=all")
 	if err != nil {
 		return "", "", fmt.Errorf("check worktree status for the read-only document pass: %w", err)
 	}
-	status := strings.TrimSpace(raw)
-	if status == "" {
+	records := strings.Split(strings.TrimSuffix(string(rawZ), "\x00"), "\x00")
+	if len(records) == 1 && records[0] == "" {
 		return "", "", nil
 	}
+	var statusLines []string
 	var entries []string
-	for _, line := range strings.Split(status, "\n") {
-		if len(line) < 4 {
+	for i := 0; i < len(records); i++ {
+		record := records[i]
+		if len(record) < 4 {
 			continue
 		}
-		code := line[:2]
-		path := strings.TrimSpace(line[3:])
+		code := record[:2]
+		path := record[3:]
+		statusLines = append(statusLines, code+" "+path)
 		entry := code + " " + path
-		if strings.Contains(code, "D") || strings.Contains(path, " -> ") {
+		// A rename/copy (R/C) emits the destination record followed by a second
+		// NUL-terminated record holding the source path, rather than the
+		// "old -> new" arrow the non-`-z` format uses.
+		if strings.ContainsAny(code, "RC") && i+1 < len(records) {
+			i++
+			entry += " <- " + records[i]
+		}
+		if strings.Contains(code, "D") {
 			entries = append(entries, entry)
 			continue
 		}
@@ -386,6 +401,10 @@ func documentWorktreeFingerprint(ctx context.Context, workDir string) (string, s
 			continue
 		}
 		entries = append(entries, entry+" "+strings.TrimSpace(hash))
+	}
+	status := strings.Join(statusLines, "\n")
+	if status == "" {
+		return "", "", nil
 	}
 	return status, strings.Join(entries, "\n"), nil
 }
