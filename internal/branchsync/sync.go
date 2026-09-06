@@ -369,6 +369,15 @@ func (s *Service) Refresh(ctx context.Context) State {
 			state.Safety = "blocked_remote_rewritten"
 			state.Relation = RelationUnknown
 			state.Error = "the live remote no longer equals the persisted pipeline push binding; no files or refs were changed"
+			// A hand rebase and force-push is the ordinary way here, and it
+			// leaves the binding permanently unsatisfiable: nothing will ever
+			// make the live remote equal the recorded pushed head again. While
+			// the run is still active the pipeline may yet publish, so the
+			// block stays absolute; once it is terminal the only supported exit
+			// is retiring the stale binding, which adopts and pushes nothing.
+			if terminalRunStatus(run.Status) {
+				state.NextAction = &NextAction{Code: "retire_custody", Command: "no-mistakes axi retire-custody --run " + run.ID}
+			}
 		}
 		return state
 	}
@@ -790,7 +799,18 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 	}
 	if !gateAnchorAvailable {
 		if !objectExists(ctx, gateDir, preserved) {
-			return blockedPlan(state, StatePipelineOwned, "blocked_recover_preserved_head_missing", fmt.Sprintf("the recorded pipeline head %s is missing from the local gate; inspect the recorded and live heads before returning custody; no files or refs were changed", preserved))
+			blocked := blockedPlan(state, StatePipelineOwned, "blocked_recover_preserved_head_missing", fmt.Sprintf("the recorded pipeline head %s is missing from the local gate; inspect the recorded and live heads before returning custody; no files or refs were changed", preserved))
+			// blockedPlan clears NextAction, so this refusal used to be a dead
+			// end: recovery cannot import a head no longer in the gate, and
+			// nothing else in this command offers a way forward. The run is
+			// already proven terminal above (blocked_recover_run_active), so
+			// retiring its binding is the supported exit that adopts and pushes
+			// nothing. classifyPipelineOwned's own missing-head offer is
+			// deliberately NOT replaced: when its stricter proof holds,
+			// `--recover --keep-local` still wins, because it also settles the
+			// gate branch instead of only releasing the claim.
+			blocked.NextAction = &NextAction{Code: "retire_custody", Command: "no-mistakes axi retire-custody --run " + run.ID}
+			return blocked
 		}
 		if err := custody.PreserveRecoveryHead(ctx, gateDir, run.ID, preserved); err != nil {
 			return blockedPlan(state, StatePipelineOwned, "blocked_recover_preserve_failed", "the recorded pipeline head exists but could not be anchored in the local gate; no files or worktree refs were changed")
@@ -1410,7 +1430,16 @@ func (s *Service) inspect(ctx context.Context) (State, *db.Run, bool) {
 	state.PRState = normalizePRState(run.PRState)
 	state.Target = TargetState{Kind: ptr(run.PushTargetKind), URL: displayTarget(s.Repo.PushURL()), Ref: ptr(run.PushRef)}
 	state.Target.Remote = s.remoteName(ctx)
-	state.Remote = RemoteState{ObservedHead: ptr(run.LastPushedSHA), Freshness: "pipeline_push", ObservedAt: value(run.LastPushedAt)}
+	// A pipeline_push claim is only truthful while a successful-push binding
+	// actually exists. A run that never pushed - or whose binding was
+	// explicitly released by `axi retire-custody` - has no observed remote
+	// head, and rendering an empty head under freshness: pipeline_push reads as
+	// a push observation for a binding that is gone.
+	if run.LastPushedSHA != nil {
+		state.Remote = RemoteState{ObservedHead: ptr(run.LastPushedSHA), Freshness: "pipeline_push", ObservedAt: value(run.LastPushedAt)}
+	} else {
+		state.Remote = RemoteState{Freshness: "unknown"}
+	}
 
 	if run.PushActive || pushStepRunning(s.DB, run.ID) {
 		state.State = StatePushInProgress
@@ -1420,11 +1449,18 @@ func (s *Service) inspect(ctx context.Context) (State, *db.Run, bool) {
 		return state, run, false
 	}
 	if run.LastPushedSHA == nil || run.PushTargetFingerprint == nil || run.PushRef == nil || run.PushGeneration == nil || run.SubmittedHeadSHA == nil {
+		// Custody explicitly returned to the operator answers this whole block
+		// first, whatever partial provenance the row still carries. The check
+		// is hoisted rather than repeated per shape because a run whose binding
+		// was released by `axi retire-custody` can reach here with no submitted
+		// head at all (a legacy row), and the per-shape checks below would then
+		// fall through to blocked_legacy_unbound - reporting a branch the
+		// operator was just handed back as unsynchronizable.
+		if run.CustodyReturnedAt != nil {
+			s.classifyCustodyReturned(ctx, &state)
+			return state, run, true
+		}
 		if run.SubmittedHeadSHA != nil && run.HeadSHA != ptr(run.SubmittedHeadSHA) {
-			if run.CustodyReturnedAt != nil {
-				s.classifyCustodyReturned(ctx, &state)
-				return state, run, true
-			}
 			s.classifyPipelineOwned(ctx, &state, run, "the pipeline head has moved but has not been successfully pushed; do not make local follow-up commits yet")
 			return state, run, false
 		}
@@ -1434,10 +1470,6 @@ func (s *Service) inspect(ctx context.Context) (State, *db.Run, bool) {
 		// the managed worktree head: no pipeline-created content exists to
 		// recover, and the branch and head are immediately usable.
 		if run.SubmittedHeadSHA != nil && run.LastPushedSHA == nil {
-			if run.CustodyReturnedAt != nil {
-				s.classifyCustodyReturned(ctx, &state)
-				return state, run, true
-			}
 			if run.Status == types.RunPending || run.Status == types.RunRunning {
 				s.classifyPipelineOwned(ctx, &state, run, "a validation run is active on this branch; do not make local follow-up commits until it finishes")
 				return state, run, false
@@ -2189,10 +2221,12 @@ func RunHeadUnmoved(state State) bool {
 	return state.Pipeline.SubmittedHead != "" && state.Pipeline.CurrentHead == state.Pipeline.SubmittedHead
 }
 
-// classifyCustodyReturned reports a branch whose stranded terminal run was
-// explicitly recovered and never had a push binding: the operator owns the
-// branch again and the only remaining step is starting a fresh run. The
-// relation against the preserved pipeline head is informative only.
+// classifyCustodyReturned reports a branch whose terminal run no longer holds
+// it: either a guarded recovery returned custody of an unpublished head, or
+// `axi retire-custody` released a stale push binding along with custody. Either
+// way no push binding remains, the operator owns the branch again, and the only
+// remaining step is starting a fresh run. The relation against the preserved
+// pipeline head is informative only.
 func (s *Service) classifyCustodyReturned(ctx context.Context, state *State) {
 	state.State = StateCustodyReturned
 	state.Safety = "custody_returned"
