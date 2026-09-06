@@ -286,7 +286,9 @@ Inspect `git log` and any `refs/no-mistakes/recover/<run>` anchor before retirin
 
 `--run` is required and is never inferred from the current branch; a bare invocation exits `2`.
 The repository is resolved from the run itself, so the command works from anywhere, including outside the branch it releases.
-It refuses with exit `1` on a run that is not terminal, on a run that still carries an in-flight push marker or a live push step, on a run belonging to another repository, and on an unknown run id; every refusal writes nothing.
+It refuses with exit `1` on a run that is not terminal, on a run that still carries an in-flight push marker or a live push step, and on an unknown run id; every refusal writes nothing.
+Terminal means the four statuses `RunStatus.Terminal()` reports: `completed`, `failed`, `cancelled`, and `ci_monitor_interrupted`.
+A `ci_monitor_interrupted` run is accepted deliberately: it published nothing further, and PR lookup matches an existing PR by branch alone, so a later run updates that PR rather than opening a duplicate.
 A repeated call on an already-retired run is a successful no-op reporting `retired: false`.
 
 The result names exactly what was withdrawn under `released`: the previously bound `pushed_head`, `push_ref`, and `target_kind`, and whether this call stamped custody.

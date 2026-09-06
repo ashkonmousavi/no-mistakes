@@ -32,9 +32,10 @@ func newAxiRetireCustodyCmd() *cobra.Command {
 			"recovery also settles the local gate branch, while this only releases the\n" +
 			"claim.\n\n" +
 			"--run is required: retiring a binding is per-run and is never inferred from\n" +
-			"the current branch. It refuses on a run that is not terminal, on a run that\n" +
-			"still carries an in-flight push marker, and on a run from another\n" +
-			"repository. A repeated call on an already-retired run is a successful no-op.\n\n" +
+			"the current branch. It refuses on a run that is not terminal and on a run\n" +
+			"that still carries an in-flight push marker. Terminal means completed,\n" +
+			"failed, cancelled, or ci_monitor_interrupted. A repeated call on an\n" +
+			"already-retired run is a successful no-op.\n\n" +
 			"It does not delete commits. Anything the pipeline created stays exactly as\n" +
 			"reachable, or unreachable, as it already was; check `git log` and any\n" +
 			"refs/no-mistakes/recover/<run> anchor before retiring if you still want it.",

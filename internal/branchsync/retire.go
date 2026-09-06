@@ -35,7 +35,8 @@ type Retirement struct {
 // to be dead ends whose only escape was abandoning the branch.
 //
 // It refuses on anything that is not provably finished: an unknown run, a run
-// from another repository, a run that is not terminal, and a run that still
+// from another repository, a run that is not terminal (types.RunStatus.Terminal:
+// completed, failed, cancelled, ci_monitor_interrupted), and a run that still
 // carries an in-flight push marker or a live push step. Refusal never writes.
 //
 // This touches only the run's own database row - never a Git ref, the worktree,
@@ -58,6 +59,10 @@ func (s *Service) RetireCustody(runID string) (Retirement, error) {
 	if run == nil {
 		return Retirement{}, fmt.Errorf("run %q not found", runID)
 	}
+	// An internal invariant, not a reachable CLI refusal: the axi command
+	// resolves the repository from the run itself, so these always match. It
+	// stays because a future caller that resolves the repository from the
+	// working directory must not release another repository's binding.
 	if s.Repo == nil || run.RepoID != s.Repo.ID {
 		return Retirement{}, fmt.Errorf("run %s does not belong to this repository", runID)
 	}
