@@ -459,6 +459,32 @@ func (d *DB) SetRunsCustodyReturned(ids []string) error {
 	return nil
 }
 
+// ReleaseRunPushBindingAndCustody retires a terminal run's claim on its branch
+// in one transaction: the successful-push provenance that made the run the
+// branch's binding owner is cleared, and custody is stamped as returned to the
+// operator. It never touches head_sha, submitted_head_sha, terminal head
+// evidence, or any Git ref - the run's own history stays readable, only its
+// live claim on the branch is withdrawn. Callers must have proven the run is
+// terminal and holds no in-flight push first; this function does not re-check.
+//
+// Clearing last_pushed_sha is what makes the release real rather than
+// cosmetic: branchsync selects and classifies a branch from that column, and
+// steps.lastKnownBranchTip uses it as the force-with-lease fast path. Dropping
+// it removes a fast path only - resolveForcePushDecision then runs the full
+// remoteCommitsNotIncorporated analysis - so a later run fails closed rather
+// than trusting a binding the operator has declared stale.
+func (d *DB) ReleaseRunPushBindingAndCustody(id string) error {
+	ts := now()
+	_, err := d.sql.Exec(
+		`UPDATE runs SET last_pushed_sha = NULL, last_pushed_at = NULL, push_target_kind = NULL, push_target_fingerprint = NULL, push_ref = NULL, push_active = 0, custody_returned_at = COALESCE(custody_returned_at, ?), updated_at = ? WHERE id = ?`,
+		ts, ts, id,
+	)
+	if err != nil {
+		return fmt.Errorf("release run push binding and custody: %w", err)
+	}
+	return nil
+}
+
 // SetRunPushActive marks whether a pipeline phase currently owns a possible
 // branch-head update. Sync refuses while this marker is set.
 func (d *DB) SetRunPushActive(id string, active bool) error {

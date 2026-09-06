@@ -195,6 +195,7 @@ For older active runs with no recorded activity timestamp, AXI falls back to the
 Gate summaries and finding descriptions are bounded in this default status view; truncated values disclose their original length, and the gate help points to `no-mistakes axi logs --step <step> --full` for an implicitly resolved run or `no-mistakes axi logs --run <id> --step <step> --full` for an explicitly selected run.
 Relevant current-branch states also include a cached `branch_sync` object with full SHAs, the run's status, the persisted pipeline push binding, target kind and ref, relation, safety result, PR lifecycle, and a structured next action.
 Cached home and status rendering performs no network read and labels the remote observation `pipeline_push`; only explicit sync check or apply reports `live` freshness.
+A run holding no successful push binding - one that never published, or whose binding was released by `axi retire-custody` - has no observed remote head at all and reports `freshness: unknown` rather than claiming a push observation.
 
 ## no-mistakes axi sync
 
@@ -239,7 +240,7 @@ For behind or diverged worktrees, recovery verifies the preserved head at the ru
 A clean behind worktree fast-forwards.
 A diverged worktree is adopted only when the preserved head provably carries every local change, proven by an executable three-way merge whose result is exactly the preserved head's tree.
 This covers a pipeline rebase onto a newer base without requiring the gate branch to advance to the preserved head.
-Terminalization pins a verified unpublished pipeline head under a run-specific recovery ref, so recovery does not require the gate branch itself to have advanced. If the verified recorded head is absent from both the worktree and an accessible gate and the recovery refs are compatible, status still offers `recover_custody`, but the command is `--recover --keep-local` rather than taking that head. Plain `--recover` without `--keep-local` still refuses.
+Terminalization pins a verified unpublished pipeline head under a run-specific recovery ref, so recovery does not require the gate branch itself to have advanced. If the verified recorded head is absent from both the worktree and an accessible gate and the recovery refs are compatible, status still offers `recover_custody`, but the command is `--recover --keep-local` rather than taking that head. Plain `--recover` without `--keep-local` still refuses. That refusal reports `safety: blocked_recover_preserved_head_missing` and now offers `next_action.code: retire_custody` so it is no longer a dead end; take the offered `--recover --keep-local` when status offers it, because it also settles the gate branch.
 That adoption anchors the pre-recovery local head under `refs/no-mistakes/recover-local/<run>`, then moves the branch with Git operations that refuse on their own rather than after a preceding check: an atomic compare-and-swap on the branch ref, and a working-tree update that aborts instead of overwriting a modified or untracked file.
 The proof is deliberately narrow and never uses patch identity, which discards hunk locations and whitespace and so cannot tell a genuine replay from a same-shaped edit elsewhere.
 Anything it cannot decide - unlanded local commits, or a rebase whose fix rounds also rewrote your own lines - still refuses with the anchor named, because only escalation can tell a deliberate pipeline fix apart from a dropped change.
@@ -255,6 +256,45 @@ A verified archive plan reports its evidence in `branch_sync.recovery`, keeps `n
 `no-mistakes rerun` is the alternative exit for ordinary preserved-head recovery that resumes validating the preserved head instead of taking the branch back; it is not offered for the archive-backed keep-local plan.
 A recovered never-pushed run reports `state: custody_returned`; a recovered pushed run reports its ordinary classification against the last push binding, typically `local_ahead`.
 On a `user_owned` branch, `--recover` is an idempotent no-op success: nothing pipeline-created exists to recover, and no file, ref, or database row changes.
+
+## no-mistakes axi retire-custody
+
+Release one terminal run's push binding and custody of its branch without adopting or publishing any head.
+
+```sh
+no-mistakes axi retire-custody --run <id>
+```
+
+| Flag    | Type     | Default | Description                                                                 |
+| ------- | -------- | ------- | --------------------------------------------------------------------------- |
+| `--run` | `string` | (none)  | The run whose push binding and branch custody are released (required)       |
+
+This is the supported exit from the two branch-sync blocks a guarded recovery cannot finish.
+`safety: blocked_remote_rewritten` follows a hand rebase and force-push of the feature branch: the live remote no longer contains the run's recorded pushed head, and no fetch, retry, or later push can ever make that binding true again.
+`safety: blocked_recover_preserved_head_missing` returned by `axi sync --recover` means the recorded pipeline head is gone from the local gate, so there is nothing left to import.
+Both used to refuse with no `next_action` at all, leaving abandoning the branch for a fresh one as the only way forward.
+
+Both now report `next_action.code: retire_custody` with the exact `no-mistakes axi retire-custody --run <id>` command.
+The rewritten-remote offer appears only once the run is terminal, because an active run may still publish; it comes from the live `axi sync`/`axi sync --check` path, which is the only path that observes a remote, never from a cached status read.
+Where the stricter missing-head proof holds, status keeps offering `next_action.code: recover_custody` with `--recover --keep-local` instead, and that action is preferred: it also settles the local gate branch, while retirement only releases the claim.
+
+The command changes nothing in Git.
+No worktree, local gate, remote, ref, or object is read for mutation or written.
+Only the run's own database row changes: its `last_pushed_sha`, `last_pushed_at`, `push_target_kind`, `push_target_fingerprint`, and `push_ref` are cleared, and `custody_returned_at` is stamped.
+The run's `head_sha`, `submitted_head_sha`, and terminal head evidence are preserved, so any commits the pipeline created stay exactly as reachable - or unreachable - as they already were.
+Inspect `git log` and any `refs/no-mistakes/recover/<run>` anchor before retiring if you still want that work.
+
+`--run` is required and is never inferred from the current branch; a bare invocation exits `2`.
+The repository is resolved from the run itself, so the command works from anywhere, including outside the branch it releases.
+It refuses with exit `1` on a run that is not terminal, on a run that still carries an in-flight push marker or a live push step, and on an unknown run id; every refusal writes nothing.
+Terminal means the four statuses `RunStatus.Terminal()` reports: `completed`, `failed`, `cancelled`, and `ci_monitor_interrupted`.
+A `ci_monitor_interrupted` run is accepted deliberately: it published nothing further, and PR lookup matches an existing PR by branch alone, so a later run updates that PR rather than opening a duplicate.
+A repeated call on an already-retired run is a successful no-op reporting `retired: false`.
+
+The result names exactly what was withdrawn under `released`: the previously bound `pushed_head`, `push_ref`, and `target_kind`, and whether this call stamped custody.
+When the invoking worktree is on the retired run's branch, the result also carries the resulting `branch_sync` object; an explicit `--run` naming another branch's run omits it, because this read would not describe that branch.
+Afterwards the branch reports `state: custody_returned` with `next_action.code: run_pipeline`, and `axi sync` exits `0` on it.
+Retirement is therefore distinct from `--recover`: recovery of a pushed run keeps its binding and reports its ordinary classification, while retirement removes the binding so the branch reads `custody_returned` regardless of what was published.
 
 ## no-mistakes axi logs
 
