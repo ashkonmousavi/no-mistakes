@@ -133,6 +133,20 @@ func IsKnownFindingClass(class string) bool {
 // prompts that have to name what they accept.
 func KnownFindingClasses() []string { return slices.Clone(knownFindingClasses) }
 
+// Finding category constants for the CI step's check findings. The CI step
+// turns each settled issue on the pull request into one finding and the fix
+// half routes by this category: a check finding names its provider check in
+// Finding.Check, a merge-conflict finding asks for a rebase, a transient
+// finding is a provider-attributed outcome no code change can clear, and a
+// review-bot finding carries one unresolved comment from a third-party
+// review bot's check.
+const (
+	FindingCategoryCICheck         = "ci-check"
+	FindingCategoryCIMergeConflict = "ci-merge-conflict"
+	FindingCategoryCITransient     = "ci-transient"
+	FindingCategoryCIReviewBot     = "ci-review-bot"
+)
+
 // Test scenario result constants: the vocabulary the test step's evidence
 // prompt instructs the agent to use for each derived scenario.
 //
@@ -202,7 +216,8 @@ type Finding struct {
 	UserInstructions string `json:"user_instructions,omitempty"`
 	ReviewScope      string `json:"review_scope,omitempty"`
 	// Category separates the combined document+lint housekeeping pass's
-	// findings into their owning gates. Empty everywhere else.
+	// findings into their owning gates and the CI step's findings by kind
+	// (see the FindingCategoryCI* constants). Empty everywhere else.
 	Category string `json:"category,omitempty"`
 	// Class is the document step's editorial/substantive/behavioural
 	// classification. It decides whether the finding gates and whether a
@@ -210,6 +225,12 @@ type Finding struct {
 	// on documentation findings recorded before the classification existed -
 	// which is why readers use ClassOrDefault rather than reading it raw.
 	Class string `json:"class,omitempty"`
+	// Check is the provider check name a CI finding was derived from. CheckID
+	// is the provider's opaque identity for that exact check, so same-named
+	// checks remain distinct through selection and repair. Both are empty on
+	// every non-CI finding.
+	Check   string `json:"check,omitempty"`
+	CheckID string `json:"check_id,omitempty"`
 }
 
 // ClassOrDefault resolves a finding's effective document class, defaulting an
@@ -297,6 +318,8 @@ type findingWire struct {
 	ReviewScope         string `json:"review_scope,omitempty"`
 	Category            string `json:"category,omitempty"`
 	Class               string `json:"class,omitempty"`
+	Check               string `json:"check,omitempty"`
+	CheckID             string `json:"check_id,omitempty"`
 	RequiresHumanReview *bool  `json:"requires_human_review,omitempty"`
 }
 
@@ -600,6 +623,8 @@ func (f *Finding) UnmarshalJSON(data []byte) error {
 	f.ReviewScope = wire.ReviewScope
 	f.Category = wire.Category
 	f.Class = wire.Class
+	f.Check = wire.Check
+	f.CheckID = wire.CheckID
 	if f.Action == "" && wire.RequiresHumanReview != nil {
 		if *wire.RequiresHumanReview {
 			f.Action = ActionAskUser
