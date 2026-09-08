@@ -687,7 +687,7 @@ func nestedRepositoryPreparationCommand() string {
 
 func dependencyFormattingCommand() string {
 	if runtime.GOOS == "windows" {
-		return `if not exist .deps\count exit /b 1 & findstr /x /c:"formatted" feature.txt >nul || echo formatted>>feature.txt`
+		return `if not exist .deps\count (exit /b 1) & findstr /x /c:"formatted" feature.txt >nul || echo formatted>>feature.txt`
 	}
 	return `test -f .deps/count && { grep -qxF formatted feature.txt || echo formatted >> feature.txt; }`
 }

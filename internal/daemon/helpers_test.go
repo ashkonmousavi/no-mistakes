@@ -448,9 +448,11 @@ func waitForRunTerminalState(t *testing.T, d *db.DB, runID string) *db.Run {
 	if runtime.GOOS == "windows" {
 		// Git-backed daemon runs routinely take about 10x longer on Windows,
 		// especially while the git-heavy CI shard runs several packages at once.
-		// Keep the assertion bounded without treating normal process-spawn load as
-		// a pipeline failure.
-		timeout = time.Minute
+		// A 1-minute cap left too little margin under that load (observed:
+		// sibling subtests finishing at ~48s, then timing out at ~60s), so
+		// this is bounded generously without treating normal process-spawn
+		// load as a pipeline failure.
+		timeout = 3 * time.Minute
 	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
