@@ -1451,6 +1451,16 @@ func TestPreRunFailures_FailsClosedOnUnreadableRun(t *testing.T) {
 	}
 }
 
+// These terminal records come from the @actions/artifact 2.3.2 client locked by
+// upload-artifact v4.6.2 and download-artifact v4.3.0; the latter action adds
+// its own Unable-to-download wrapper.
+const (
+	uploadArtifact403Record   = "##[error]Failed to FinalizeArtifact: Received non-retryable error: Failed request: (403) Forbidden"
+	uploadArtifact503Record   = "##[error]Failed to FinalizeArtifact: Failed to make request after 5 attempts: Failed request: (503) Service Unavailable"
+	downloadArtifact403Record = "##[error]Unable to download artifact(s): Failed to ListArtifacts: Received non-retryable error: Failed request: (403) Forbidden"
+	downloadArtifact503Record = "##[error]Unable to download artifact(s): Failed to ListArtifacts: Failed to make request after 5 attempts: Failed request: (503) Service Unavailable"
+)
+
 // An artifact action may fail after every repository-owned step passed. The
 // classifier must bind that narrow exception to the exact PR/head/base and the
 // first workflow attempt, and must use the log only to prove the action identity
@@ -1466,7 +1476,7 @@ func TestArtifactInfrastructureFailures_AdmitsArtifactOnlyFailureOnExactFirstAtt
 			stdout: `[{"total_count":1,"jobs":[{"id":2,"run_id":1,"head_sha":"head-1","name":"build","status":"completed","conclusion":"failure","steps":[{"name":"Run tests","number":2,"status":"completed","conclusion":"success"},{"name":"Upload the sealed distribution","number":3,"status":"completed","conclusion":"failure"}]}]}]` + "\n",
 		},
 		"gh api --method GET repos/test/repo/actions/jobs/2/logs": {
-			stdout: "2026-09-08T00:00:00Z ##[group]Run go test ./...\n2026-09-08T00:00:01Z ok\n2026-09-08T00:00:02Z ##[group]Run actions/upload-artifact@v4\n2026-09-08T00:00:03Z ##[error]FinalizeArtifact failed: HTTP 503\n",
+			stdout: "2026-09-08T00:00:00Z ##[group]Run go test ./...\n2026-09-08T00:00:01Z ok\n2026-09-08T00:00:02Z ##[group]Run actions/upload-artifact@v4\n2026-09-08T00:00:03Z " + uploadArtifact503Record + "\n",
 		},
 		"gh api --method GET repos/test/repo/actions/runs/1/artifacts -f per_page=100 --paginate --slurp": {
 			stdout: `[{"total_count":1,"artifacts":[{"id":91,"name":"sealed-evidence-1","expired":false}]}]`,
@@ -1519,11 +1529,11 @@ func TestArtifactInfrastructureFailures_EachFailedStepOwnsItsActionAndError(t *t
 	}{
 		"recovered earlier 503 then unrelated failure": {
 			steps: `[{"name":"Upload prior evidence","number":2,"conclusion":"success"},{"name":"Upload final evidence","number":3,"conclusion":"failure"}]`,
-			logs:  "##[group]Run actions/upload-artifact@v4\nFinalizeArtifact failed: HTTP 503\nretry succeeded\n##[group]Run actions/upload-artifact@v4\nFinalizeArtifact failed: HTTP 400\n",
+			logs:  "##[group]Run actions/upload-artifact@v4\n" + uploadArtifact503Record + "\nretry succeeded\n##[group]Run actions/upload-artifact@v4\n##[error]Failed to FinalizeArtifact: Received non-retryable error: Failed request: (400) Bad Request\n",
 		},
 		"two failed transfers with one qualifying error": {
 			steps: `[{"name":"Upload first","number":2,"conclusion":"failure"},{"name":"Upload second","number":3,"conclusion":"failure"}]`,
-			logs:  "##[group]Run actions/upload-artifact@v4\nFinalizeArtifact failed: HTTP 503\n##[group]Run actions/upload-artifact@v4\nFinalizeArtifact failed: HTTP 400\n",
+			logs:  "##[group]Run actions/upload-artifact@v4\n" + uploadArtifact503Record + "\n##[group]Run actions/upload-artifact@v4\n##[error]Failed to FinalizeArtifact: Received non-retryable error: Failed request: (400) Bad Request\n",
 		},
 		"successful permitted request followed by another operation 403": {
 			steps: `[{"name":"Download evidence","number":2,"conclusion":"failure"}]`,
@@ -1531,16 +1541,29 @@ func TestArtifactInfrastructureFailures_EachFailedStepOwnsItsActionAndError(t *t
 		},
 		"same action recovered then ended with an unclassified failure": {
 			steps: `[{"name":"Upload evidence","number":2,"conclusion":"failure"}]`,
-			logs:  "##[group]Run actions/upload-artifact@v4\nFinalizeArtifact failed: HTTP 503\nFinalizeArtifact retry succeeded: HTTP 200\nartifact transfer failed: connection reset\n",
+			logs:  "##[group]Run actions/upload-artifact@v4\n" + uploadArtifact503Record + "\nretry succeeded\nartifact transfer failed: connection reset\n",
 		},
 		"same-line success and unrelated failure are not one request tuple": {
 			steps: `[{"name":"Download evidence","number":2,"conclusion":"failure"}]`,
 			logs:  "##[group]Run actions/download-artifact@v4\n##[error]ListArtifacts completed: HTTP 200; DownloadArtifact failed: HTTP 403\n",
 		},
-		"unambiguous permitted request failure remains admitted": {
+		"verified download 403 remains admitted": {
 			steps:         `[{"name":"Download evidence","number":2,"conclusion":"failure"}]`,
-			logs:          "##[group]Run actions/download-artifact@v4\n##[error]ListArtifacts request returned status 503\n",
+			logs:          "##[group]Run actions/download-artifact@v4\n" + downloadArtifact403Record + "\n",
 			wantRetryable: true,
+		},
+		"verified upload exhausted 503 remains admitted": {
+			steps:         `[{"name":"Upload evidence","number":2,"conclusion":"failure"}]`,
+			logs:          "##[group]Run actions/upload-artifact@v4\n" + uploadArtifact503Record + "\n",
+			wantRetryable: true,
+		},
+		"conflicting clause before a valid payload is refused": {
+			steps: `[{"name":"Download evidence","number":2,"conclusion":"failure"}]`,
+			logs:  "##[group]Run actions/download-artifact@v4\n##[error]DownloadArtifact failed: HTTP 403; " + strings.TrimPrefix(downloadArtifact503Record, "##[error]") + "\n",
+		},
+		"conflicting clause after a valid payload is refused": {
+			steps: `[{"name":"Download evidence","number":2,"conclusion":"failure"}]`,
+			logs:  "##[group]Run actions/download-artifact@v4\n" + downloadArtifact503Record + "; DownloadArtifact failed: HTTP 403\n",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -1597,12 +1620,14 @@ func TestArtifactInfrastructureFailures_RequiresRetryableArtifactServiceHTTPStat
 	t.Parallel()
 
 	for name, logText := range map[string]string{
-		"403":                        "##[group]Run go test ./...\nok\n##[group]Run actions/upload-artifact@v4\nFinalizeArtifact failed: HTTP 403 Forbidden",
-		"503":                        "##[group]Run go test ./...\nok\n##[group]Run actions/download-artifact@v4\nListArtifacts request returned status 503",
-		"400 is not infrastructure":  "##[group]Run go test ./...\nok\n##[group]Run actions/upload-artifact@v4\nFinalizeArtifact failed: HTTP 400 Bad Request",
-		"timestamp is not a 5xx":     "##[group]Run go test ./...\nok\n##[group]Run actions/upload-artifact@v4\nFinalizeArtifact failed without an HTTP status",
-		"operation without action":   "FinalizeArtifact failed: HTTP 503",
-		"action without service 5xx": "##[group]Run go test ./...\nok\n##[group]Run actions/upload-artifact@v4\ninput path did not match any files",
+		"403":                                   "##[group]Run go test ./...\nok\n##[group]Run actions/upload-artifact@v4\n" + uploadArtifact403Record,
+		"503":                                   "##[group]Run go test ./...\nok\n##[group]Run actions/download-artifact@v4\n" + downloadArtifact503Record,
+		"400 is not infrastructure":             "##[group]Run go test ./...\nok\n##[group]Run actions/upload-artifact@v4\n##[error]Failed to FinalizeArtifact: Received non-retryable error: Failed request: (400) Bad Request",
+		"retryable 500 cannot be non-retryable": "##[group]Run go test ./...\nok\n##[group]Run actions/upload-artifact@v4\n##[error]Failed to FinalizeArtifact: Received non-retryable error: Failed request: (500) Internal Server Error",
+		"501 cannot exhaust client retries":     "##[group]Run go test ./...\nok\n##[group]Run actions/upload-artifact@v4\n##[error]Failed to FinalizeArtifact: Failed to make request after 5 attempts: Failed request: (501) Not Implemented",
+		"timestamp is not a 5xx":                "##[group]Run go test ./...\nok\n##[group]Run actions/upload-artifact@v4\nFinalizeArtifact failed without an HTTP status",
+		"operation without action":              "FinalizeArtifact failed: HTTP 503",
+		"action without service 5xx":            "##[group]Run go test ./...\nok\n##[group]Run actions/upload-artifact@v4\ninput path did not match any files",
 	} {
 		t.Run(name, func(t *testing.T) {
 			host := New(githubTestCmdFactory(map[string]githubTestResponse{
@@ -1700,7 +1725,7 @@ func TestArtifactInfrastructureFailures_PaginatesCompleteAttemptPopulation(t *te
 	host := New(githubTestCmdFactory(map[string]githubTestResponse{
 		"gh api --method GET repos/test/repo/actions/runs/1":                                                    {stdout: `{"id":1,"head_sha":"head-1","run_attempt":1,"pull_requests":[{"number":42,"head":{"sha":"head-1"},"base":{"ref":"main","sha":"base-1"}}]}`},
 		"gh api --method GET repos/test/repo/actions/runs/1/attempts/1/jobs -f per_page=100 --paginate --slurp": {stdout: `[{"total_count":2,"jobs":[{"id":1,"head_sha":"head-1","name":"prerequisite","status":"completed","conclusion":"success","steps":[{"name":"Run checks","number":2,"conclusion":"success"}]}]},{"total_count":2,"jobs":[{"id":2,"head_sha":"head-1","name":"build","status":"completed","conclusion":"failure","steps":[{"name":"Upload sealed evidence","number":2,"conclusion":"failure"}]}]}]`},
-		"gh api --method GET repos/test/repo/actions/jobs/2/logs":                                               {stdout: "##[group]Run actions/upload-artifact@v4\nFinalizeArtifact failed: HTTP 503\n"},
+		"gh api --method GET repos/test/repo/actions/jobs/2/logs":                                               {stdout: "##[group]Run actions/upload-artifact@v4\n" + uploadArtifact503Record + "\n"},
 		"gh api --method GET repos/test/repo/actions/runs/1/artifacts -f per_page=100 --paginate --slurp":       {stdout: `[{"total_count":2,"artifacts":[{"id":91,"name":"sealed-evidence-1","expired":false}]},{"total_count":2,"artifacts":[{"id":92,"name":"journey-evidence-1","expired":false}]}]`},
 	}), nil, "", "test/repo")
 	got, err := host.ArtifactInfrastructureFailures(context.Background(), &scm.PR{Number: "42", HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{

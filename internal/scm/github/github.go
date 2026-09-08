@@ -1421,7 +1421,7 @@ func actionLogSegments(logs string) []actionLogSegment {
 		if next >= 0 {
 			segmentEnd = lineEnd + next
 		}
-		segments = append(segments, actionLogSegment{action: strings.ToLower(header), text: strings.ToLower(remaining[:segmentEnd])})
+		segments = append(segments, actionLogSegment{action: strings.ToLower(header), text: remaining[:segmentEnd]})
 		remaining = remaining[segmentEnd:]
 	}
 	return segments
@@ -1475,9 +1475,9 @@ func logsProveArtifactInfrastructureFailure(job githubRunJob, logs string) bool 
 // failure for the permitted operation.
 func terminalArtifactRequestFailure(text, operation string) bool {
 	requestLine := -1
-	lines := strings.Split(strings.ToLower(text), "\n")
+	lines := strings.Split(text, "\n")
 	for i, line := range lines {
-		if !strings.Contains(line, operation) {
+		if !strings.Contains(strings.ToLower(line), operation) {
 			continue
 		}
 		if requestLine >= 0 || !artifactRequestRecordFailed(line, operation) {
@@ -1489,7 +1489,7 @@ func terminalArtifactRequestFailure(text, operation string) bool {
 		return false
 	}
 	for _, line := range lines[requestLine+1:] {
-		line = strings.TrimSpace(line)
+		line = strings.ToLower(strings.TrimSpace(line))
 		if line == "" {
 			continue
 		}
@@ -1500,44 +1500,100 @@ func terminalArtifactRequestFailure(text, operation string) bool {
 	return true
 }
 
-// artifactRequestRecordFailed recognizes only the two terminal request forms
-// supported by the pinned artifact-action fixtures. The operation, failure
-// result, and status are parsed as one anchored record; independent clauses or
-// unknown wording fail closed instead of lending one request's status to
-// another request's result.
+// artifactRequestRecordFailed recognizes the bounded terminal form emitted by
+// @actions/artifact 2.3.2, including download-artifact v4.3.0's wrapper. The
+// runner envelope and entire payload are anchored: the parser never seeks
+// forward through another clause to find a qualifying operation.
 func artifactRequestRecordFailed(line, operation string) bool {
-	line = strings.ToLower(strings.TrimSpace(line))
-	if strings.Count(line, operation) != 1 {
+	payload, ok := runnerErrorPayload(line)
+	if !ok {
 		return false
 	}
-	record := strings.TrimSpace(line[strings.Index(line, operation):])
-	prefixes := []string{
-		operation + " failed: http ",
-		operation + " request returned status ",
-	}
-	statusText := ""
-	for _, prefix := range prefixes {
-		if strings.HasPrefix(record, prefix) {
-			statusText = strings.TrimSpace(strings.TrimPrefix(record, prefix))
-			break
+	payload = strings.ToLower(payload)
+	for _, recognized := range []string{
+		"createartifact", "finalizeartifact", "listartifacts",
+		"getsignedartifacturl", "downloadartifact", "uploadartifact",
+	} {
+		count := strings.Count(payload, recognized)
+		if recognized == operation {
+			if count != 1 {
+				return false
+			}
+		} else if count != 0 {
+			return false
 		}
 	}
-	if statusText == "" {
+	prefix := ""
+	switch operation {
+	case "finalizeartifact":
+		prefix = "failed to finalizeartifact: "
+	case "listartifacts":
+		prefix = "unable to download artifact(s): failed to listartifacts: "
+	default:
 		return false
 	}
-	fields := strings.Fields(statusText)
-	if len(fields) == 0 || len(fields[0]) != 3 {
+	if !strings.HasPrefix(payload, prefix) {
 		return false
 	}
-	code, err := strconv.Atoi(fields[0])
-	if err != nil || code != 403 && (code < 500 || code > 599) {
+	result := strings.TrimPrefix(payload, prefix)
+	const nonRetryable = "received non-retryable error: failed request: "
+	const exhausted = "failed to make request after 5 attempts: failed request: "
+	exhaustedRetry := false
+	switch {
+	case strings.HasPrefix(result, nonRetryable):
+		result = strings.TrimPrefix(result, nonRetryable)
+	case strings.HasPrefix(result, exhausted):
+		result = strings.TrimPrefix(result, exhausted)
+		exhaustedRetry = true
+	default:
 		return false
 	}
-	reason := strings.Join(fields[1:], " ")
-	if reason == "" {
-		return true
+	code, ok := artifactRequestStatus(result)
+	if !ok || code != 403 && (code < 500 || code > 599) {
+		return false
 	}
-	return artifactHTTPReason[code] == reason
+	retryableByClient := code == 500 || code == 502 || code == 503 || code == 504
+	if exhaustedRetry != retryableByClient {
+		return false
+	}
+	return true
+}
+
+func runnerErrorPayload(line string) (string, bool) {
+	line = strings.TrimSpace(line)
+	const annotation = "##[error]"
+	if strings.HasPrefix(line, annotation) {
+		payload := strings.TrimPrefix(line, annotation)
+		return payload, strings.TrimSpace(payload) != ""
+	}
+	separator := strings.IndexByte(line, ' ')
+	if separator <= 0 {
+		return "", false
+	}
+	if _, err := time.Parse(time.RFC3339Nano, line[:separator]); err != nil {
+		return "", false
+	}
+	remainder := line[separator+1:]
+	if !strings.HasPrefix(remainder, annotation) {
+		return "", false
+	}
+	payload := strings.TrimPrefix(remainder, annotation)
+	return payload, strings.TrimSpace(payload) != ""
+}
+
+func artifactRequestStatus(result string) (int, bool) {
+	if len(result) < len("(403) x") || result[0] != '(' {
+		return 0, false
+	}
+	closeParen := strings.IndexByte(result, ')')
+	if closeParen != 4 || len(result) <= closeParen+1 || result[closeParen+1] != ' ' {
+		return 0, false
+	}
+	code, err := strconv.Atoi(result[1:closeParen])
+	if err != nil || artifactHTTPReason[code] != result[closeParen+2:] {
+		return 0, false
+	}
+	return code, true
 }
 
 var artifactHTTPReason = map[int]string{
