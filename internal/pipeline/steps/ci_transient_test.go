@@ -34,12 +34,20 @@ type fakeArtifactInfrastructureHost struct {
 
 type fakeCheckRerunner struct {
 	scm.Host
-	calls int
+	calls  int
+	target scm.PRTarget
 }
 
 func (h *fakeCheckRerunner) RerunCheck(context.Context, *scm.PR, scm.Check) error {
 	h.calls++
 	return nil
+}
+
+func (h *fakeCheckRerunner) GetPRTarget(_ context.Context, pr *scm.PR) (scm.PRTarget, error) {
+	if h.target.HeadSHA != "" || h.target.BaseBranch != "" || h.target.BaseSHA != "" {
+		return h.target, nil
+	}
+	return scm.PRTarget{HeadSHA: pr.HeadSHA, BaseBranch: pr.BaseBranch, BaseSHA: pr.BaseSHA}, nil
 }
 
 func (h *fakeArtifactInfrastructureHost) ArtifactInfrastructureFailures(_ context.Context, _ *scm.PR, _ []scm.Check) ([]scm.InfrastructureFailure, error) {
@@ -887,6 +895,21 @@ func TestInfrastructureFailuresWithoutExactRerun_ReportMismatchInsteadOfAutofix(
 	}
 }
 
+// The monitor may have started on main and then observe the same PR retargeted
+// to another branch. That differs from main advancing: the live head/base tuple
+// no longer identifies the candidate at all, so classification must stop.
+func TestVerifyInfrastructurePRTarget_RetargetDuringMonitorIsRefused(t *testing.T) {
+	t.Parallel()
+	host := &fakeCheckRerunner{target: scm.PRTarget{HeadSHA: "head-1", BaseBranch: "release", BaseSHA: "release-1"}}
+	mismatch, err := verifyInfrastructurePRTarget(context.Background(), host, &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(mismatch, "PR target changed during CI monitoring") || !strings.Contains(mismatch, "release") {
+		t.Fatalf("retarget mismatch = %q, want explicit old/new target refusal", mismatch)
+	}
+}
+
 // Infrastructure admission is unavailable until the durable state has been
 // read and structurally validated. A read/decode/reservation failure must occur
 // before any provider request, and a recovered spend covers a later workflow
@@ -927,16 +950,35 @@ func TestInfrastructureRerunDispatch_FailsClosedAcrossPersistenceBoundaries(t *t
 		prepareFreshness(step)
 		step.loadRerunBudget(sctx)
 		host := &fakeCheckRerunner{}
-		step.rerunInfrastructureChecks(sctx, host, &scm.PR{BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
+		step.rerunInfrastructureChecks(sctx, host, &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
 		if host.calls != 0 {
 			t.Fatalf("provider requests = %d after failed state read, want 0", host.calls)
 		}
 	})
 
 	t.Run("corrupt and invalid state", func(t *testing.T) {
+		valid := &infrastructureRerunBudget{}
+		validCheck := checkFor("run:1")
+		valid.spend(validCheck, []scm.Check{validCheck}, "head-1", "main", "base-1")
+		validPayload, err := valid.marshal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var invalidCountPayload persistedInfrastructureRerunBudget
+		if err := json.Unmarshal([]byte(validPayload), &invalidCountPayload); err != nil {
+			t.Fatal(err)
+		}
+		key := infrastructureCandidateKey("head-1", "base-1")
+		invalidCount := invalidCountPayload.Infrastructure[key]
+		invalidCount.Used = -1
+		invalidCountPayload.Infrastructure[key] = invalidCount
+		invalidCountJSON, err := json.Marshal(invalidCountPayload)
+		if err != nil {
+			t.Fatal(err)
+		}
 		for name, encoded := range map[string]string{
 			"corrupt":       `{not-json`,
-			"invalid count": `{"infrastructure":{"head-1\u0000base-1":{"used":-1,"group":"run:1","first_failure":{"name":"build","link":"job-2","reason":"artifact service","head_sha":"head-1","base_branch":"main","base_sha":"base-1"},"observed":[{"name":"build","link":"job-2"}],"grace_remaining":2}}}`,
+			"invalid count": string(invalidCountJSON),
 		} {
 			t.Run(name, func(t *testing.T) {
 				sctx, _ := newContext(t)
@@ -947,7 +989,7 @@ func TestInfrastructureRerunDispatch_FailsClosedAcrossPersistenceBoundaries(t *t
 				prepareFreshness(step)
 				step.loadRerunBudget(sctx)
 				host := &fakeCheckRerunner{}
-				step.rerunInfrastructureChecks(sctx, host, &scm.PR{BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
+				step.rerunInfrastructureChecks(sctx, host, &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
 				if host.calls != 0 {
 					t.Fatalf("provider requests = %d after invalid state, want 0", host.calls)
 				}
@@ -963,7 +1005,7 @@ func TestInfrastructureRerunDispatch_FailsClosedAcrossPersistenceBoundaries(t *t
 			t.Fatal(err)
 		}
 		host := &fakeCheckRerunner{}
-		step.rerunInfrastructureChecks(sctx, host, &scm.PR{BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
+		step.rerunInfrastructureChecks(sctx, host, &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
 		if host.calls != 0 {
 			t.Fatalf("provider requests = %d after failed reservation, want 0", host.calls)
 		}
@@ -985,7 +1027,7 @@ func TestInfrastructureRerunDispatch_FailsClosedAcrossPersistenceBoundaries(t *t
 		prepareFreshness(step)
 		step.loadRerunBudget(sctx)
 		host := &fakeCheckRerunner{}
-		step.rerunInfrastructureChecks(sctx, host, &scm.PR{BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:2")})
+		step.rerunInfrastructureChecks(sctx, host, &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:2")})
 		if host.calls != 0 {
 			t.Fatalf("provider requests = %d after recovered spend, want 0", host.calls)
 		}
@@ -997,9 +1039,23 @@ func TestInfrastructureRerunDispatch_FailsClosedAcrossPersistenceBoundaries(t *t
 		step.publishedHead = func(*pipeline.StepContext) (string, error) { return "head-1", nil }
 		step.baseBranchTip = func(context.Context) (string, bool) { return "base-2", true }
 		host := &fakeCheckRerunner{}
-		step.rerunInfrastructureChecks(sctx, host, &scm.PR{BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
-		if host.calls != 0 {
-			t.Fatalf("provider requests = %d after base advance, want 0", host.calls)
+		issued, outcome := step.rerunInfrastructureChecks(sctx, host, &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
+		if issued || host.calls != 0 || outcome != nil {
+			t.Fatalf("same-branch advance = issued %v, calls %d, outcome %+v; want a quiet freshness refusal distinct from retarget", issued, host.calls, outcome)
+		}
+	})
+
+	t.Run("PR retargeted before dispatch", func(t *testing.T) {
+		sctx, _ := newContext(t)
+		step := &CIStep{infrastructureStateAvailable: true}
+		prepareFreshness(step)
+		host := &fakeCheckRerunner{target: scm.PRTarget{HeadSHA: "head-1", BaseBranch: "release", BaseSHA: "base-1"}}
+		issued, outcome := step.rerunInfrastructureChecks(sctx, host, &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
+		if issued || host.calls != 0 {
+			t.Fatalf("retargeted PR dispatched retry: issued=%v calls=%d", issued, host.calls)
+		}
+		if outcome == nil || !strings.Contains(outcome.Findings, "PR target changed during CI monitoring") {
+			t.Fatalf("retargeted PR outcome = %+v, want explicit monitor-target refusal", outcome)
 		}
 	})
 
@@ -1009,7 +1065,7 @@ func TestInfrastructureRerunDispatch_FailsClosedAcrossPersistenceBoundaries(t *t
 		step.publishedHead = func(*pipeline.StepContext) (string, error) { return "head-2", nil }
 		step.baseBranchTip = func(context.Context) (string, bool) { return "base-1", true }
 		host := &fakeCheckRerunner{}
-		step.rerunInfrastructureChecks(sctx, host, &scm.PR{BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
+		step.rerunInfrastructureChecks(sctx, host, &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
 		if host.calls != 0 {
 			t.Fatalf("provider requests = %d after branch advance, want 0", host.calls)
 		}

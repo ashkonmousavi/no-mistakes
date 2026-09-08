@@ -526,6 +526,20 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 			}
 		} else {
 			consecutiveCheckErrs = 0
+			// GetChecks rereads and binds the PR head. Infrastructure retry also
+			// needs a fresh, same-request head/base binding because the target
+			// branch can be retargeted after monitor entry. An unreadable target
+			// explicitly removes retry admission; a changed target terminates this
+			// candidate instead of classifying or dispatching against stale proof.
+			if sctx.Config.CI.RerunInfrastructure > 0 {
+				if mismatch, targetErr := verifyInfrastructurePRTarget(ctx, host, pr); targetErr != nil {
+					sctx.Log(fmt.Sprintf("warning: could not verify the current PR target before infrastructure classification: %v", targetErr))
+					invalidateInfrastructurePRTarget(pr)
+				} else if mismatch != "" {
+					clearCIMonitorReady(sctx)
+					return ciFailureOutcome(failingCheckNames(checks), false, mismatch), nil
+				}
+			}
 			// A failure the provider produced before the repository's own steps
 			// ran (a setup/action-resolution outage) is infrastructure, not a
 			// verdict on the code. Re-bucket those into the transient path before

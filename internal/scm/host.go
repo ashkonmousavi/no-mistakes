@@ -316,6 +316,23 @@ type PRBaseBranchReader interface {
 	GetPRBaseBranch(ctx context.Context, pr *PR) (string, error)
 }
 
+// PRTarget is the forge's current immutable binding for an existing PR. CI
+// retry admission uses all three fields together: a branch name alone cannot
+// prove that either side still names the candidate whose checks were read.
+type PRTarget struct {
+	HeadSHA    string
+	BaseBranch string
+	BaseSHA    string
+}
+
+// PRTargetReader is implemented by providers that can reread the current head
+// and base binding of an existing PR in one request. A provider without this
+// capability cannot admit an infrastructure retry because separate or stale
+// reads could authorize work for a retargeted candidate.
+type PRTargetReader interface {
+	GetPRTarget(ctx context.Context, pr *PR) (PRTarget, error)
+}
+
 // PRBaseRetargeter is implemented by providers that can change an existing
 // PR's target branch. The PR step uses it when a per-run --base-branch override
 // disagrees with the live forge base of an already-open PR. A host that does

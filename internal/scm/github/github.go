@@ -433,6 +433,36 @@ func (h *Host) GetPRBaseBranch(ctx context.Context, pr *scm.PR) (string, error) 
 	return strings.TrimSpace(string(out)), nil
 }
 
+func (h *Host) GetPRTarget(ctx context.Context, pr *scm.PR) (scm.PRTarget, error) {
+	selector, err := prSelector(pr)
+	if err != nil {
+		return scm.PRTarget{}, err
+	}
+	args := append([]string{"pr", "view", selector}, h.repoArgs()...)
+	args = append(args, "--json", "headRefOid,baseRefName,baseRefOid")
+	out, err := h.cmd(ctx, "gh", args...).Output()
+	if err != nil {
+		return scm.PRTarget{}, fmt.Errorf("gh pr view target: %w", err)
+	}
+	var payload struct {
+		HeadSHA    string `json:"headRefOid"`
+		BaseBranch string `json:"baseRefName"`
+		BaseSHA    string `json:"baseRefOid"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		return scm.PRTarget{}, fmt.Errorf("parse gh pr target: %w", err)
+	}
+	target := scm.PRTarget{
+		HeadSHA:    strings.TrimSpace(payload.HeadSHA),
+		BaseBranch: strings.TrimSpace(payload.BaseBranch),
+		BaseSHA:    strings.TrimSpace(payload.BaseSHA),
+	}
+	if target.HeadSHA == "" || target.BaseBranch == "" || target.BaseSHA == "" {
+		return scm.PRTarget{}, fmt.Errorf("gh pr target is incomplete")
+	}
+	return target, nil
+}
+
 func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 	selector, err := prSelector(pr)
 	if err != nil {
@@ -1429,12 +1459,56 @@ func logsProveArtifactInfrastructureFailure(job githubRunJob, logs string) bool 
 		default:
 			return false
 		}
-		if !strings.Contains(segments[i].text, operation) || !containsArtifactHTTPFailure(segments[i].text) {
+		if !terminalArtifactRequestFailure(segments[i].text, operation) {
 			return false
 		}
 		failures++
 	}
 	return failures > 0
+}
+
+// terminalArtifactRequestFailure binds the permitted operation and retryable
+// response to one request line, then requires that request to be the action's
+// terminal outcome. This deliberately rejects ambiguous multi-request logs: a
+// successful ListArtifacts followed by some other operation's 403, or a 503
+// that recovered before an unclassified failure, proves no retryable terminal
+// failure for the permitted operation.
+func terminalArtifactRequestFailure(text, operation string) bool {
+	requestLine := -1
+	lines := strings.Split(strings.ToLower(text), "\n")
+	for i, line := range lines {
+		if !strings.Contains(line, operation) {
+			continue
+		}
+		if requestLine >= 0 || !containsArtifactHTTPFailure(line) {
+			return false
+		}
+		requestLine = i
+	}
+	if requestLine < 0 {
+		return false
+	}
+	for _, line := range lines[requestLine+1:] {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, "##[error]") || strings.Contains(line, "error") || strings.Contains(line, "fail") || strings.Contains(line, "success") || strings.Contains(line, "succeed") || strings.Contains(line, "recover") || containsHTTPResponseMarker(line) {
+			return false
+		}
+	}
+	return true
+}
+
+func containsHTTPResponseMarker(text string) bool {
+	for _, field := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if field == "http" || field == "status" || field == "response" {
+			return true
+		}
+	}
+	return false
 }
 
 func containsArtifactHTTPFailure(text string) bool {

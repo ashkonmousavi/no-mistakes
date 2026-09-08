@@ -1490,6 +1490,22 @@ func TestArtifactInfrastructureFailures_AdmitsArtifactOnlyFailureOnExactFirstAtt
 	}
 }
 
+func TestGetPRTarget_ReadsHeadAndBaseInOneRequest(t *testing.T) {
+	t.Parallel()
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh pr view 42 --repo test/repo --json headRefOid,baseRefName,baseRefOid": {
+			stdout: `{"headRefOid":"head-1","baseRefName":"main","baseRefOid":"base-1"}`,
+		},
+	}), nil, "", "test/repo")
+	target, err := host.GetPRTarget(context.Background(), &scm.PR{Number: "42"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.HeadSHA != "head-1" || target.BaseBranch != "main" || target.BaseSHA != "base-1" {
+		t.Fatalf("target = %+v, want exact live head/base tuple", target)
+	}
+}
+
 // Each failed structured step must own both its action invocation and its own
 // qualifying service error. An earlier recovered 503 cannot authorize a later
 // unrelated failure, and one 503 cannot authorize two failed transfers.
@@ -1507,6 +1523,14 @@ func TestArtifactInfrastructureFailures_EachFailedStepOwnsItsActionAndError(t *t
 		"two failed transfers with one qualifying error": {
 			steps: `[{"name":"Upload first","number":2,"conclusion":"failure"},{"name":"Upload second","number":3,"conclusion":"failure"}]`,
 			logs:  "##[group]Run actions/upload-artifact@v4\nFinalizeArtifact failed: HTTP 503\n##[group]Run actions/upload-artifact@v4\nFinalizeArtifact failed: HTTP 400\n",
+		},
+		"successful permitted request followed by another operation 403": {
+			steps: `[{"name":"Download evidence","number":2,"conclusion":"failure"}]`,
+			logs:  "##[group]Run actions/download-artifact@v4\nListArtifacts completed: HTTP 200\nDownloadArtifact failed: HTTP 403\n",
+		},
+		"same action recovered then ended with an unclassified failure": {
+			steps: `[{"name":"Upload evidence","number":2,"conclusion":"failure"}]`,
+			logs:  "##[group]Run actions/upload-artifact@v4\nFinalizeArtifact failed: HTTP 503\nFinalizeArtifact retry succeeded: HTTP 200\nartifact transfer failed: connection reset\n",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

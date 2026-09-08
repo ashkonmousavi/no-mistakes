@@ -868,6 +868,15 @@ func (s *CIStep) rerunInfrastructureChecks(sctx *pipeline.StepContext, host scm.
 	if len(candidates) == 0 {
 		return false, nil
 	}
+	if mismatch, err := verifyInfrastructurePRTarget(sctx.Ctx, host, pr); err != nil {
+		sctx.Log(fmt.Sprintf("warning: could not verify the current PR target before re-running infrastructure failure: %v", err))
+		invalidateInfrastructurePRTarget(pr)
+		return false, nil
+	} else if mismatch != "" {
+		sctx.Log(mismatch)
+		invalidateInfrastructurePRTarget(pr)
+		return false, ciFailureOutcome(failingCheckNames(checks), false, mismatch)
+	}
 	publishedHead := publishedBranchHead
 	if s.publishedHead != nil {
 		publishedHead = s.publishedHead
@@ -902,6 +911,37 @@ func (s *CIStep) rerunInfrastructureChecks(sctx *pipeline.StepContext, host scm.
 	}
 	sctx.Log(fmt.Sprintf("re-running CI check %s (%d/%d): %s", check.Name, used, limit, check.InfrastructureReason))
 	return true, nil
+}
+
+func verifyInfrastructurePRTarget(ctx context.Context, host scm.Host, expected *scm.PR) (string, error) {
+	reader, ok := host.(scm.PRTargetReader)
+	if !ok {
+		return "", fmt.Errorf("provider cannot read the PR head/base binding atomically")
+	}
+	actual, err := reader.GetPRTarget(ctx, expected)
+	if err != nil {
+		return "", err
+	}
+	expectedHead := strings.TrimSpace(expected.HeadSHA)
+	expectedBase := strings.TrimSpace(expected.BaseBranch)
+	expectedBaseSHA := strings.TrimSpace(expected.BaseSHA)
+	if expectedHead == "" || expectedBase == "" || expectedBaseSHA == "" {
+		return "", fmt.Errorf("expected PR target binding is incomplete")
+	}
+	if strings.TrimSpace(actual.HeadSHA) != expectedHead || strings.TrimSpace(actual.BaseBranch) != expectedBase || strings.TrimSpace(actual.BaseSHA) != expectedBaseSHA {
+		return fmt.Sprintf("PR target changed during CI monitoring (expected head %s on %s@%s, observed head %s on %s@%s); infrastructure retry refused",
+			shortSHA(expectedHead), expectedBase, shortSHA(expectedBaseSHA), shortSHA(actual.HeadSHA), strings.TrimSpace(actual.BaseBranch), shortSHA(actual.BaseSHA)), nil
+	}
+	return "", nil
+}
+
+func invalidateInfrastructurePRTarget(pr *scm.PR) {
+	if pr == nil {
+		return
+	}
+	pr.HeadSHA = ""
+	pr.BaseBranch = ""
+	pr.BaseSHA = ""
 }
 
 func (s *CIStep) currentBaseBranchTip(sctx *pipeline.StepContext, baseBranch string) (string, bool) {
