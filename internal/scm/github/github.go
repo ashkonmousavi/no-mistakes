@@ -1249,7 +1249,7 @@ func (h *Host) ArtifactInfrastructureFailures(ctx context.Context, pr *scm.PR, c
 		result[i] = scm.InfrastructureFailure{
 			Retryable: true,
 			Group:     "github-actions-run:" + runID,
-			Reason:    "artifact-transfer infrastructure failed; dependent work must pass on recovery",
+			Reason:    artifactInfrastructureReason(classification),
 			HeadSHA:   strings.TrimSpace(pr.HeadSHA),
 			BaseSHA:   strings.TrimSpace(pr.BaseSHA),
 			RerunSafe: classification.rerunSafe,
@@ -1264,7 +1264,16 @@ type artifactRunClassification struct {
 	omittedJobs          map[int]bool
 	skippedDependentJobs map[int]bool
 	rerunSafe            bool
+	dispatchRefusal      string
 	evidence             scm.InfrastructureEvidenceReceipt
+}
+
+func artifactInfrastructureReason(classification artifactRunClassification) string {
+	reason := "artifact-transfer infrastructure failed; dependent work must pass on recovery"
+	if classification.dispatchRefusal != "" {
+		return reason + "; dispatch refused: " + classification.dispatchRefusal
+	}
+	return reason
 }
 
 func (h *Host) classifyArtifactRun(ctx context.Context, run githubWorkflowRun, jobs []githubRunJob, checks []scm.Check, runID, headSHA, baseSHA string) (artifactRunClassification, error) {
@@ -1350,6 +1359,9 @@ func (h *Host) classifyArtifactRun(ctx context.Context, run githubWorkflowRun, j
 		if err != nil {
 			return classification, err
 		}
+		if !classification.rerunSafe {
+			classification.dispatchRefusal = "joined XAU retry-control identity is not reviewed on the unchanged trusted base"
+		}
 	}
 	return classification, nil
 }
@@ -1402,14 +1414,39 @@ var xauRetryRulePaths = []string{
 	"scripts/ci_check_infrastructure_retry.py",
 }
 
+type xauRetryContractIdentity struct {
+	workflowBlobSHA string
+	verifierBlobSHA string
+}
+
+// reviewedXAURetryContractIdentities is intentionally empty until the XAU
+// owner lands a corrected, joined workflow and verifier and their exact blob
+// pair passes cross-repository review. Adding one exact pair here is the bounded
+// activation mechanism; equality between arbitrary base/head files is not.
+var reviewedXAURetryContractIdentities = [...]xauRetryContractIdentity{}
+
+func xauRetryContractIdentityReviewed(identity xauRetryContractIdentity, reviewed []xauRetryContractIdentity) bool {
+	if !isHexSHA(identity.workflowBlobSHA) || !isHexSHA(identity.verifierBlobSHA) {
+		return false
+	}
+	for _, candidate := range reviewed {
+		if identity == candidate {
+			return true
+		}
+	}
+	return false
+}
+
 // xauRetryRuleLanded proves the retry guard is established on the trusted base
-// and unchanged on the candidate. A branch cannot authorize provider mutation
-// by adding a lookalike job/step name or replacing the verifier it will execute.
+// with an explicitly reviewed implementation identity, and unchanged on the
+// candidate. A branch cannot authorize provider mutation with old, lookalike,
+// or independently changed workflow/verifier files.
 func (h *Host) xauRetryRuleLanded(ctx context.Context, baseSHA, headSHA string) (bool, error) {
 	if baseSHA == "" || headSHA == "" {
 		return false, nil
 	}
-	for _, path := range xauRetryRulePaths {
+	var identity xauRetryContractIdentity
+	for index, path := range xauRetryRulePaths {
 		baseBlob, err := h.fetchRepoContentBlob(ctx, path, baseSHA)
 		if err != nil {
 			return false, err
@@ -1421,8 +1458,13 @@ func (h *Host) xauRetryRuleLanded(ctx context.Context, baseSHA, headSHA string) 
 		if baseBlob == "" || headBlob != baseBlob {
 			return false, nil
 		}
+		if index == 0 {
+			identity.workflowBlobSHA = baseBlob
+		} else {
+			identity.verifierBlobSHA = baseBlob
+		}
 	}
-	return true, nil
+	return xauRetryContractIdentityReviewed(identity, reviewedXAURetryContractIdentities[:]), nil
 }
 
 func (h *Host) fetchRepoContentBlob(ctx context.Context, path, ref string) (string, error) {
@@ -1502,22 +1544,52 @@ func xauArtifactReceiptsProveAttemptOne(artifacts []scm.InfrastructureArtifactRe
 	if runID <= 0 || strings.TrimSpace(headSHA) == "" {
 		return false
 	}
-	buildSucceeded := false
-	for _, job := range jobs {
-		if strings.TrimSpace(job.Name) == "build and seal the Dashboard V2 distribution" && strings.EqualFold(strings.TrimSpace(job.Conclusion), "success") {
-			buildSucceeded = true
-		}
-	}
-	foundBuildArtifact := false
+	found := make(map[string]bool, len(artifacts))
 	for _, artifact := range artifacts {
 		name := strings.TrimSpace(artifact.Name)
 		attemptOneName := name == "dashboard-v2-dist-1" || strings.HasSuffix(name, "-a1")
-		if !attemptOneName || artifact.ProviderRunID != int64(runID) || artifact.HeadSHA != strings.TrimSpace(headSHA) || !validSHA256Digest(artifact.Digest) {
+		if !attemptOneName || found[name] || artifact.ProviderRunID != int64(runID) || artifact.HeadSHA != strings.TrimSpace(headSHA) || !validSHA256Digest(artifact.Digest) {
 			return false
 		}
-		foundBuildArtifact = foundBuildArtifact || name == "dashboard-v2-dist-1"
+		found[name] = true
 	}
-	return !buildSucceeded || foundBuildArtifact
+	for _, job := range jobs {
+		if !strings.EqualFold(strings.TrimSpace(job.Conclusion), "success") {
+			continue
+		}
+		required, producer := xauAttemptOneArtifactForProducer(strings.TrimSpace(job.Name), strings.TrimSpace(headSHA))
+		if producer && !found[required] {
+			return false
+		}
+	}
+	return true
+}
+
+func xauAttemptOneArtifactForProducer(jobName, headSHA string) (string, bool) {
+	switch jobName {
+	case "build and seal the Dashboard V2 distribution":
+		return "dashboard-v2-dist-1", true
+	case "repository shard 1 of 4":
+		return "delivery-lane-shard-1-" + headSHA + "-a1", true
+	case "repository shard 2 of 4":
+		return "delivery-lane-shard-2-" + headSHA + "-a1", true
+	case "repository shard 3 of 4":
+		return "delivery-lane-shard-3-" + headSHA + "-a1", true
+	case "repository shard 4 of 4":
+		return "delivery-lane-shard-4-" + headSHA + "-a1", true
+	case "journey smoke (chromium / desktop)":
+		return "xau-journey-evidence-chromium-desktop-" + headSHA + "-a1", true
+	case "journey smoke (firefox / desktop)":
+		return "xau-journey-evidence-firefox-desktop-" + headSHA + "-a1", true
+	case "journey smoke (webkit / desktop)":
+		return "xau-journey-evidence-webkit-desktop-" + headSHA + "-a1", true
+	case "journey smoke (chromium / touch390)":
+		return "xau-journey-evidence-chromium-touch390-" + headSHA + "-a1", true
+	case "journey smoke (webkit / touch390)":
+		return "xau-journey-evidence-webkit-touch390-" + headSHA + "-a1", true
+	default:
+		return "", false
+	}
 }
 
 func validSHA256Digest(digest string) bool {
@@ -2032,8 +2104,20 @@ func artifactRequestStatus(result string) (int, bool) {
 		return 0, false
 	}
 	code, err := strconv.Atoi(result[1:closeParen])
-	if err != nil || artifactHTTPReason[code] != result[closeParen+2:] {
+	if err != nil {
 		return 0, false
+	}
+	reason := result[closeParen+2:]
+	standardReason := artifactHTTPReason[code]
+	if reason != standardReason {
+		// Captured attempt-one run 34250655836 / job 102144122733 adds
+		// this exact intermediary detail to @actions/artifact 2.3.2's 403
+		// status text. Keep the observed provider form bounded; no arbitrary
+		// suffix or generalized 403 prose is admitted.
+		const intermediary403 = "forbidden: error from intermediary with http status code 403 \"forbidden\""
+		if code != 403 || reason != intermediary403 {
+			return 0, false
+		}
 	}
 	return code, true
 }

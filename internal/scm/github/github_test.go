@@ -1467,13 +1467,13 @@ func TestPreRunFailures_FailsClosedOnUnreadableRun(t *testing.T) {
 const (
 	uploadArtifact403Record   = "##[error]Failed to FinalizeArtifact: Received non-retryable error: Failed request: (403) Forbidden"
 	uploadArtifact503Record   = "##[error]Failed to FinalizeArtifact: Failed to make request after 5 attempts: Failed request: (503) Service Unavailable"
-	downloadArtifact403Record = "##[error]Unable to download artifact(s): Failed to ListArtifacts: Received non-retryable error: Failed request: (403) Forbidden"
+	downloadArtifact403Record = "##[error]Unable to download artifact(s): Failed to ListArtifacts: Received non-retryable error: Failed request: (403) Forbidden: Error from intermediary with HTTP status code 403 \"Forbidden\""
 	downloadArtifact503Record = "##[error]Unable to download artifact(s): Failed to ListArtifacts: Failed to make request after 5 attempts: Failed request: (503) Service Unavailable"
 )
 
 func observedShardThreeFailure() githubRunJob {
 	return githubRunJob{
-		ID: 102144122733, HeadSHA: "head-1", Name: "repository shard 3 of 4", Status: "completed", Conclusion: "failure",
+		ID: 102144122733, HeadSHA: "c02baaa297b37d2210638b55cd57794cbb4abf4c", Name: "repository shard 3 of 4", Status: "completed", Conclusion: "failure",
 		Steps: []githubJobStep{
 			{Name: "Set up job", Number: 1, Conclusion: "success"},
 			{Name: "Set up runner", Number: 2, Conclusion: "success"},
@@ -1516,10 +1516,13 @@ func observedShardThreeLogs() string {
 	}, "\n") + "\n"
 }
 
-// Run 34250655836 / job 102144122733 is the captured acceptance case for a
-// mid-job ListArtifacts outage. Its later required steps are retry dependents,
-// not evidence that a product test failed; they must run successfully when the
-// same failed job is recovered.
+// This fixture is a bounded reconstruction of attempt-one run 34250655836 / job
+// 102144122733 at c02baaa297b37d2210638b55cd57794cbb4abf4c. The source receipt
+// was reread with gh-axi: the 2,373-byte structured job receipt hashes to
+// cfa13f9b...d2f6ac0 and the 9,024-byte untruncated failed-log receipt hashes to
+// 45be30d6...5c8130. Only setup noise is abbreviated here; the pinned action and
+// terminal error records are exact. Later required steps are retry dependents,
+// not evidence that a product test failed.
 func TestArtifactFailureDisposition_ObservedDownloadFailureMarksLaterRequiredStepsAsDependents(t *testing.T) {
 	t.Parallel()
 
@@ -1554,7 +1557,13 @@ func TestArtifactFailureDisposition_RealTestFailureAfterInitiatingErrorRefuses(t
 			job.Steps[i].Conclusion = "failure"
 		}
 	}
-	if got, ok := artifactFailureDisposition(job, observedShardThreeLogs()); ok {
+	logs := strings.Replace(
+		observedShardThreeLogs(),
+		"##[group]Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+		"##[group]Run pytest -q\n##[error]test suite failed\n##[group]Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+		1,
+	)
+	if got, ok := artifactFailureDisposition(job, logs); ok {
 		t.Fatalf("real test failure admitted after artifact error: %+v", got)
 	}
 }
@@ -1596,7 +1605,7 @@ func TestJoinedXAUArtifactRetryTopology_AcceptsFiveCellsAndRejectsPopulationDrif
 		t.Fatal("complete five-cell PR topology was rejected")
 	}
 	for name, mutate := range map[string]func([]githubRunJob) []githubRunJob{
-		"missing cell": func(jobs []githubRunJob) []githubRunJob { return jobs[:len(jobs)-1] },
+		"missing cell": func(jobs []githubRunJob) []githubRunJob { return append(jobs[:4], jobs[5:]...) },
 		"duplicate cell": func(jobs []githubRunJob) []githubRunJob {
 			jobs[3].Name = jobs[2].Name
 			return jobs
@@ -1624,6 +1633,66 @@ func TestJoinedXAUArtifactRetryTopology_AcceptsFiveCellsAndRejectsPopulationDrif
 	}
 	if joinedXAUArtifactRetryTopology("schedule", push) {
 		t.Fatal("an unsupported event was admitted by the joined topology")
+	}
+}
+
+func joinedXAUAttemptOneArtifacts(headSHA string) []scm.InfrastructureArtifactReceipt {
+	names := []string{
+		"dashboard-v2-dist-1",
+		"delivery-lane-shard-1-" + headSHA + "-a1",
+		"delivery-lane-shard-2-" + headSHA + "-a1",
+		"delivery-lane-shard-3-" + headSHA + "-a1",
+		"delivery-lane-shard-4-" + headSHA + "-a1",
+		"xau-journey-evidence-chromium-desktop-" + headSHA + "-a1",
+		"xau-journey-evidence-firefox-desktop-" + headSHA + "-a1",
+		"xau-journey-evidence-webkit-desktop-" + headSHA + "-a1",
+		"xau-journey-evidence-chromium-touch390-" + headSHA + "-a1",
+		"xau-journey-evidence-webkit-touch390-" + headSHA + "-a1",
+	}
+	artifacts := make([]scm.InfrastructureArtifactReceipt, len(names))
+	for i, name := range names {
+		artifacts[i] = scm.InfrastructureArtifactReceipt{ID: int64(i + 1), Name: name, Digest: "sha256:" + strings.Repeat("a", 64), ProviderRunID: 1, HeadSHA: headSHA}
+	}
+	return artifacts
+}
+
+func githubArtifactPages(artifacts []scm.InfrastructureArtifactReceipt) string {
+	items := make([]string, len(artifacts))
+	for i, artifact := range artifacts {
+		items[i] = fmt.Sprintf(
+			`{"id":%d,"name":%q,"digest":%q,"expired":false,"workflow_run":{"id":%d,"head_sha":%q}}`,
+			artifact.ID, artifact.Name, artifact.Digest, artifact.ProviderRunID, artifact.HeadSHA,
+		)
+	}
+	return fmt.Sprintf(`[{"total_count":%d,"artifacts":[%s]}]`, len(items), strings.Join(items, ","))
+}
+
+// Pre-dispatch proof must retain every successful producer the XAU recovery
+// helper will consume. A producer that is itself legitimately retried may
+// publish its replacement later and therefore owes no attempt-one artifact.
+func TestXAUArtifactReceiptsProveAttemptOne_RequiresEverySuccessfulProducer(t *testing.T) {
+	t.Parallel()
+
+	jobs := joinedXAUJobPopulation()
+	artifacts := joinedXAUAttemptOneArtifacts("head-1")
+	if !xauArtifactReceiptsProveAttemptOne(artifacts, 1, "head-1", jobs) {
+		t.Fatal("complete retained producer set was rejected")
+	}
+	for name, missingIndex := range map[string]int{"bundle": 0, "shard": 1, "journey": 5} {
+		t.Run(name, func(t *testing.T) {
+			incomplete := append([]scm.InfrastructureArtifactReceipt(nil), artifacts[:missingIndex]...)
+			incomplete = append(incomplete, artifacts[missingIndex+1:]...)
+			if xauArtifactReceiptsProveAttemptOne(incomplete, 1, "head-1", jobs) {
+				t.Fatalf("missing successful %s producer artifact was admitted", name)
+			}
+		})
+	}
+	retriedProducerJobs := append([]githubRunJob(nil), jobs...)
+	retriedProducerJobs[8].Conclusion = "failure"
+	withoutRetriedShard := append([]scm.InfrastructureArtifactReceipt(nil), artifacts[:1]...)
+	withoutRetriedShard = append(withoutRetriedShard, artifacts[2:]...)
+	if !xauArtifactReceiptsProveAttemptOne(withoutRetriedShard, 1, "head-1", retriedProducerJobs) {
+		t.Fatal("artifact expected only from a legitimately retried producer was required before dispatch")
 	}
 }
 
@@ -1695,12 +1764,12 @@ func TestArtifactInfrastructureFailures_BuildOutageMarksEverySkippedConsumerAsDe
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got[1].Retryable || !got[1].RerunSafe {
-		t.Fatalf("initiating build disposition = %+v, want safe retry", got[1])
+	if !got[1].Retryable || got[1].RerunSafe || !strings.Contains(got[1].Reason, "identity is not reviewed") {
+		t.Fatalf("initiating build disposition = %+v, want classified but identity-gated retry", got[1])
 	}
 	for _, index := range []int{2, 3, 4, 5, 6, 8, 9, 10, 11, 13} {
-		if !got[index].RerunDependent || !got[index].RerunSafe || got[index].Group != got[1].Group {
-			t.Fatalf("dependent %q disposition = %+v, want same safe group as build", checks[index].Name, got[index])
+		if !got[index].RerunDependent || got[index].RerunSafe || got[index].Group != got[1].Group {
+			t.Fatalf("dependent %q disposition = %+v, want same identity-gated group as build", checks[index].Name, got[index])
 		}
 	}
 	if !got[7].RerunOmission || got[12].Group != "" {
@@ -1759,13 +1828,16 @@ func TestArtifactInfrastructureFailures_JoinedFiveCellDependencyFamilyIsOneSafeG
 		"##[group]Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
 		"##[error]No files were found with the provided path: /tmp/evidence. No artifacts will be uploaded.",
 	}, "\n") + "\n"
+	allArtifacts := joinedXAUAttemptOneArtifacts("head-1")
+	retainedArtifacts := append([]scm.InfrastructureArtifactReceipt(nil), allArtifacts[:3]...)
+	retainedArtifacts = append(retainedArtifacts, allArtifacts[5:]...)
 	host := New(githubTestCmdFactory(map[string]githubTestResponse{
 		"gh api --method GET repos/test/repo/actions/runs/1":                                                    {stdout: `{"id":1,"event":"pull_request","head_sha":"head-1","run_attempt":1,"pull_requests":[{"number":42,"head":{"sha":"head-1"},"base":{"ref":"main","sha":"base-1"}}]}`},
 		"gh api --method GET repos/test/repo/actions/runs/1/attempts/1/jobs -f per_page=100 --paginate --slurp": {stdout: `[{"total_count":14,"jobs":` + string(jobsJSON) + `}]`},
 		"gh api --method GET repos/test/repo/actions/jobs/11/logs":                                              {stdout: shardLogs},
 		"gh api --method GET repos/test/repo/actions/jobs/12/logs":                                              {stdout: shardLogs},
 		"gh api --method GET repos/test/repo/actions/jobs/14/logs":                                              {stdout: "##[group]Run retry guard\n##[group]Run actions/download-artifact@v4\n##[group]Run fan-in proof\n"},
-		"gh api --method GET repos/test/repo/actions/runs/1/artifacts -f per_page=100 --paginate --slurp":       {stdout: `[{"total_count":1,"artifacts":[{"id":91,"name":"dashboard-v2-dist-1","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expired":false,"workflow_run":{"id":1,"head_sha":"head-1"}}]}]`},
+		"gh api --method GET repos/test/repo/actions/runs/1/artifacts -f per_page=100 --paginate --slurp":       {stdout: githubArtifactPages(retainedArtifacts)},
 		"gh api --method GET repos/test/repo/contents/.github/workflows/xau-ci.yml -f ref=base-1":               {stdout: `{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"file"}`},
 		"gh api --method GET repos/test/repo/contents/.github/workflows/xau-ci.yml -f ref=head-1":               {stdout: `{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"file"}`},
 		"gh api --method GET repos/test/repo/contents/scripts/ci_check_infrastructure_retry.py -f ref=base-1":   {stdout: `{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","type":"file"}`},
@@ -1777,8 +1849,8 @@ func TestArtifactInfrastructureFailures_JoinedFiveCellDependencyFamilyIsOneSafeG
 		t.Fatal(err)
 	}
 	for _, index := range []int{10, 11, 13} {
-		if !got[index].Retryable || !got[index].RerunSafe || got[index].Group != "github-actions-run:1" {
-			t.Fatalf("failure %q disposition = %+v, want one safe group", checks[index].Name, got[index])
+		if !got[index].Retryable || got[index].RerunSafe || got[index].Group != "github-actions-run:1" || !strings.Contains(got[index].Reason, "identity is not reviewed") {
+			t.Fatalf("failure %q disposition = %+v, want one complete but identity-gated group", checks[index].Name, got[index])
 		}
 	}
 	if !got[7].RerunOmission || got[7].Group != "github-actions-run:1" {
@@ -1788,12 +1860,12 @@ func TestArtifactInfrastructureFailures_JoinedFiveCellDependencyFamilyIsOneSafeG
 	if len(receipt.LogJobIDs) != 3 || len(receipt.DependentJobs) != 1 || receipt.DependentJobs[0] != 14 || len(receipt.DependentSteps) != 10 {
 		t.Fatalf("dependency-family receipt = %+v", receipt)
 	}
-	if len(receipt.Artifacts) != 1 || receipt.Artifacts[0].Digest == "" || receipt.Artifacts[0].ProviderRunID != 1 || receipt.Artifacts[0].HeadSHA != "head-1" {
+	if len(receipt.Artifacts) != 8 || receipt.Artifacts[0].Digest == "" || receipt.Artifacts[0].ProviderRunID != 1 || receipt.Artifacts[0].HeadSHA != "head-1" {
 		t.Fatalf("producer provenance receipt = %+v", receipt.Artifacts)
 	}
 }
 
-func TestXAURetryRuleLanded_RequiresIdenticalTrustedWorkflowAndVerifier(t *testing.T) {
+func TestXAURetryRuleLanded_RequiresReviewedIdentityAndUnchangedTrustedFiles(t *testing.T) {
 	t.Parallel()
 
 	for name, tc := range map[string]struct {
@@ -1801,7 +1873,7 @@ func TestXAURetryRuleLanded_RequiresIdenticalTrustedWorkflowAndVerifier(t *testi
 		verifier string
 		want     bool
 	}{
-		"identical landed rule":         {workflow: strings.Repeat("a", 40), verifier: strings.Repeat("b", 40), want: true},
+		"identical but unreviewed rule": {workflow: strings.Repeat("a", 40), verifier: strings.Repeat("b", 40)},
 		"workflow changed on candidate": {workflow: strings.Repeat("c", 40), verifier: strings.Repeat("b", 40)},
 		"verifier changed on candidate": {workflow: strings.Repeat("a", 40), verifier: strings.Repeat("d", 40)},
 	} {
@@ -1822,6 +1894,27 @@ func TestXAURetryRuleLanded_RequiresIdenticalTrustedWorkflowAndVerifier(t *testi
 				t.Fatalf("xauRetryRuleLanded() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestXAURetryContractIdentityReviewed_RequiresExactReviewedPair(t *testing.T) {
+	t.Parallel()
+
+	reviewed := []xauRetryContractIdentity{{workflowBlobSHA: strings.Repeat("a", 40), verifierBlobSHA: strings.Repeat("b", 40)}}
+	if !xauRetryContractIdentityReviewed(reviewed[0], reviewed) {
+		t.Fatal("exact reviewed workflow/verifier pair was rejected")
+	}
+	for name, identity := range map[string]xauRetryContractIdentity{
+		"workflow substitution": {workflowBlobSHA: strings.Repeat("c", 40), verifierBlobSHA: strings.Repeat("b", 40)},
+		"verifier substitution": {workflowBlobSHA: strings.Repeat("a", 40), verifierBlobSHA: strings.Repeat("d", 40)},
+		"missing verifier":      {workflowBlobSHA: strings.Repeat("a", 40)},
+	} {
+		if xauRetryContractIdentityReviewed(identity, reviewed) {
+			t.Fatalf("%s was accepted as a reviewed pair: %+v", name, identity)
+		}
+	}
+	if len(reviewedXAURetryContractIdentities) != 0 {
+		t.Fatalf("production identity allowlist = %+v, want explicit non-dispatch until the corrected XAU join is reviewed", reviewedXAURetryContractIdentities)
 	}
 }
 

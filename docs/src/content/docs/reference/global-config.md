@@ -618,7 +618,7 @@ The per-repo [`ci.rerun_transient`](/no-mistakes/reference/repo-config/#cirerun_
 
 ### ci.rerun_infrastructure
 
-Candidate-wide allowance for the artifact-infrastructure classifier described by the [repository setting](/no-mistakes/reference/repo-config/#cirerun_infrastructure). It is independent of `ci.rerun_transient`. GitHub dispatch is available only for the exact joined XAU dependency-family contract described there; every other topology remains non-dispatching.
+Candidate-wide allowance for the artifact-infrastructure classifier described by the [repository setting](/no-mistakes/reference/repo-config/#cirerun_infrastructure). It is independent of `ci.rerun_transient`. GitHub dispatch is conditional on the exact joined XAU dependency-family contract and a reviewed workflow/verifier blob pair described there. The reviewed-pair allowlist currently has no entries, so setting this value to `1` classifies evidence but does not dispatch.
 
 | | |
 |---|---|
