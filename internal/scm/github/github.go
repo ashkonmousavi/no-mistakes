@@ -1480,7 +1480,7 @@ func terminalArtifactRequestFailure(text, operation string) bool {
 		if !strings.Contains(line, operation) {
 			continue
 		}
-		if requestLine >= 0 || !containsArtifactHTTPFailure(line) {
+		if requestLine >= 0 || !artifactRequestRecordFailed(line, operation) {
 			return false
 		}
 		requestLine = i
@@ -1500,31 +1500,66 @@ func terminalArtifactRequestFailure(text, operation string) bool {
 	return true
 }
 
+// artifactRequestRecordFailed recognizes only the two terminal request forms
+// supported by the pinned artifact-action fixtures. The operation, failure
+// result, and status are parsed as one anchored record; independent clauses or
+// unknown wording fail closed instead of lending one request's status to
+// another request's result.
+func artifactRequestRecordFailed(line, operation string) bool {
+	line = strings.ToLower(strings.TrimSpace(line))
+	if strings.Count(line, operation) != 1 {
+		return false
+	}
+	record := strings.TrimSpace(line[strings.Index(line, operation):])
+	prefixes := []string{
+		operation + " failed: http ",
+		operation + " request returned status ",
+	}
+	statusText := ""
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(record, prefix) {
+			statusText = strings.TrimSpace(strings.TrimPrefix(record, prefix))
+			break
+		}
+	}
+	if statusText == "" {
+		return false
+	}
+	fields := strings.Fields(statusText)
+	if len(fields) == 0 || len(fields[0]) != 3 {
+		return false
+	}
+	code, err := strconv.Atoi(fields[0])
+	if err != nil || code != 403 && (code < 500 || code > 599) {
+		return false
+	}
+	reason := strings.Join(fields[1:], " ")
+	if reason == "" {
+		return true
+	}
+	return artifactHTTPReason[code] == reason
+}
+
+var artifactHTTPReason = map[int]string{
+	403: "forbidden",
+	500: "internal server error",
+	501: "not implemented",
+	502: "bad gateway",
+	503: "service unavailable",
+	504: "gateway timeout",
+	505: "http version not supported",
+	507: "insufficient storage",
+	508: "loop detected",
+	510: "not extended",
+	511: "network authentication required",
+}
+
 func containsHTTPResponseMarker(text string) bool {
 	for _, field := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 	}) {
 		if field == "http" || field == "status" || field == "response" {
 			return true
-		}
-	}
-	return false
-}
-
-func containsArtifactHTTPFailure(text string) bool {
-	fields := strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-	})
-	for i, field := range fields {
-		code, err := strconv.Atoi(field)
-		if err != nil || code != 403 && (code < 500 || code > 599) {
-			continue
-		}
-		start := max(0, i-4)
-		for _, marker := range fields[start:i] {
-			if marker == "http" || marker == "status" || marker == "response" {
-				return true
-			}
 		}
 	}
 	return false

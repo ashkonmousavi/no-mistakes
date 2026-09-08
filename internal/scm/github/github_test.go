@@ -1513,8 +1513,9 @@ func TestArtifactInfrastructureFailures_EachFailedStepOwnsItsActionAndError(t *t
 	t.Parallel()
 
 	for name, fixture := range map[string]struct {
-		steps string
-		logs  string
+		steps         string
+		logs          string
+		wantRetryable bool
 	}{
 		"recovered earlier 503 then unrelated failure": {
 			steps: `[{"name":"Upload prior evidence","number":2,"conclusion":"success"},{"name":"Upload final evidence","number":3,"conclusion":"failure"}]`,
@@ -1532,19 +1533,29 @@ func TestArtifactInfrastructureFailures_EachFailedStepOwnsItsActionAndError(t *t
 			steps: `[{"name":"Upload evidence","number":2,"conclusion":"failure"}]`,
 			logs:  "##[group]Run actions/upload-artifact@v4\nFinalizeArtifact failed: HTTP 503\nFinalizeArtifact retry succeeded: HTTP 200\nartifact transfer failed: connection reset\n",
 		},
+		"same-line success and unrelated failure are not one request tuple": {
+			steps: `[{"name":"Download evidence","number":2,"conclusion":"failure"}]`,
+			logs:  "##[group]Run actions/download-artifact@v4\n##[error]ListArtifacts completed: HTTP 200; DownloadArtifact failed: HTTP 403\n",
+		},
+		"unambiguous permitted request failure remains admitted": {
+			steps:         `[{"name":"Download evidence","number":2,"conclusion":"failure"}]`,
+			logs:          "##[group]Run actions/download-artifact@v4\n##[error]ListArtifacts request returned status 503\n",
+			wantRetryable: true,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			host := New(githubTestCmdFactory(map[string]githubTestResponse{
 				"gh api --method GET repos/test/repo/actions/runs/1":                                                    {stdout: `{"id":1,"head_sha":"head-1","run_attempt":1,"pull_requests":[{"number":42,"head":{"sha":"head-1"},"base":{"ref":"main","sha":"base-1"}}]}`},
 				"gh api --method GET repos/test/repo/actions/runs/1/attempts/1/jobs -f per_page=100 --paginate --slurp": {stdout: `[{"total_count":1,"jobs":[{"id":2,"head_sha":"head-1","name":"build","status":"completed","conclusion":"failure","steps":` + fixture.steps + `}]}]`},
 				"gh api --method GET repos/test/repo/actions/jobs/2/logs":                                               {stdout: fixture.logs},
+				"gh api --method GET repos/test/repo/actions/runs/1/artifacts -f per_page=100 --paginate --slurp":       {stdout: `[{"total_count":0,"artifacts":[]}]`},
 			}), nil, "", "test/repo")
 			got, err := host.ArtifactInfrastructureFailures(context.Background(), &scm.PR{Number: "42", HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{{Name: "build", Bucket: scm.CheckBucketFail, State: "FAILURE", Link: "https://github.com/test/repo/actions/runs/1/job/2"}})
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got[0].Retryable {
-				t.Fatalf("cross-bound evidence was admitted: %+v", got[0])
+			if got[0].Retryable != fixture.wantRetryable {
+				t.Fatalf("Retryable = %v, want %v: %+v", got[0].Retryable, fixture.wantRetryable, got[0])
 			}
 		})
 	}
