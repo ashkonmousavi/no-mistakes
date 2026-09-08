@@ -167,3 +167,52 @@ func TestWaitForRunPrefersNewestRunOnBranch(t *testing.T) {
 		t.Fatalf("GetRuns calls = %d, want at least 2 polls", calls.Load())
 	}
 }
+
+// TestWaitForRunAfterIgnoresPriorTerminalUntilReplacementAppears proves a
+// trigger's brief old-only observation cannot satisfy the wait for its new run.
+func TestWaitForRunAfterIgnoresPriorTerminalUntilReplacementAppears(t *testing.T) {
+	nmHome, err := os.MkdirTemp("/tmp", "nm-e2e-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(nmHome) })
+	p := paths.WithRoot(nmHome)
+	server := ipc.NewServer()
+	var calls atomic.Int32
+	server.Handle(ipc.MethodGetRuns, func(_ context.Context, _ json.RawMessage) (interface{}, error) {
+		old := ipc.RunInfo{ID: "run-old", Branch: "feature/e2e", Status: types.RunCompleted, CreatedAt: 10, UpdatedAt: 10}
+		if calls.Add(1) == 1 {
+			return ipc.GetRunsResult{Runs: []ipc.RunInfo{old}}, nil
+		}
+		return ipc.GetRunsResult{Runs: []ipc.RunInfo{
+			{ID: "run-new", Branch: "feature/e2e", Status: types.RunCompleted, CreatedAt: 20, UpdatedAt: 20},
+			old,
+		}}, nil
+	})
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.Serve(p.Socket()) }()
+	t.Cleanup(func() {
+		server.Close()
+		if err := <-errCh; err != nil {
+			t.Errorf("ipc server: %v", err)
+		}
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		client, dialErr := ipc.Dial(p.Socket())
+		if dialErr == nil {
+			client.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	h := &Harness{t: t, NMHome: nmHome, WorkDir: t.TempDir()}
+	run := h.WaitForRunAfter("feature/e2e", "run-old", 2*time.Second)
+	if run.ID != "run-new" {
+		t.Fatalf("WaitForRunAfter returned %q, want replacement run-new", run.ID)
+	}
+	if calls.Load() < 2 {
+		t.Fatalf("GetRuns calls = %d, want old-only observation followed by replacement", calls.Load())
+	}
+}

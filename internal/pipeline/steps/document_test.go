@@ -48,6 +48,9 @@ func TestDocumentStep_ReadOnly_ReportsFindingsWithoutTouchingWorktree(t *testing
 	if outcome.AutoFixable {
 		t.Error("expected no auto-fix loop for the read-only document step")
 	}
+	if outcome.FixSummary != noChangesAppliedSummary {
+		t.Fatalf("fix summary = %q, want %q for a report-only step", outcome.FixSummary, noChangesAppliedSummary)
+	}
 	if status := gitStatusPorcelain(t, dir); status != "" {
 		t.Fatalf("expected clean worktree, got %q", status)
 	}
@@ -287,7 +290,10 @@ func TestDocumentStep_EditToAPreexistingDirtyQuotedPathFileIsDetected(t *testing
 	}
 }
 
-func TestDocumentStep_AgentManaged_UnresolvedFindingsNeedApprovalWithoutAutoFixLoop(t *testing.T) {
+// TestDocumentStep_ReadOnly_UnresolvedFindingsReportNoChangesApplied proves an
+// analyzer's descriptive summary cannot be persisted as if this report-only
+// step had applied a fix.
+func TestDocumentStep_ReadOnly_UnresolvedFindingsReportNoChangesApplied(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 
@@ -309,6 +315,9 @@ func TestDocumentStep_AgentManaged_UnresolvedFindingsNeedApprovalWithoutAutoFixL
 	}
 	if outcome.AutoFixable {
 		t.Error("expected unresolved documentation findings not to trigger an auto-fix round")
+	}
+	if outcome.FixSummary != noChangesAppliedSummary {
+		t.Fatalf("fix summary = %q, want %q", outcome.FixSummary, noChangesAppliedSummary)
 	}
 	var findings Findings
 	if err := json.Unmarshal([]byte(outcome.Findings), &findings); err != nil {

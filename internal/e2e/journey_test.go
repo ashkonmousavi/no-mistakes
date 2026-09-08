@@ -418,6 +418,13 @@ func cleanReviewScenario(t *testing.T) string {
       tested:
         - "fakeagent: simulated test run"
       testing_summary: "simulated tests passed"
+      scenarios:
+        - name: "fakeagent: simulated end-to-end scenario"
+          result: pass
+          live: true
+          evidence: "fakeagent: simulated test run"
+          reason: ""
+      verdict: go
       artifacts: []
       title: "docs: update README"
       body: "## Summary\ndocumentation update"
@@ -449,8 +456,15 @@ func cleanReviewScenario(t *testing.T) string {
       tested:
         - "fakeagent: simulated test run"
       testing_summary: "simulated tests passed"
+      scenarios:
+        - name: "fakeagent: simulated end-to-end scenario"
+          result: pass
+          live: true
+          evidence: "fakeagent: simulated test run"
+          reason: ""
+      verdict: go
       artifacts: []
-  - match: "You are validating a code change by testing it. Examine the repository and run the smallest relevant tests yourself.\n\nContext:\n- branch: test-agent-new-test-file"
+  - match: "You are validating a code change by driving the product itself. Derive the scenarios this change must satisfy, then run each one against the real running product.\n\nContext:\n- branch: test-agent-new-test-file"
     text: "tests passed after adding a regression test"
     edits:
       - path: "agent_test.py"
@@ -463,14 +477,21 @@ func cleanReviewScenario(t *testing.T) string {
       tested:
         - "fakeagent: simulated test run"
       testing_summary: "simulated tests passed"
+      scenarios:
+        - name: "fakeagent: simulated end-to-end scenario"
+          result: pass
+          live: true
+          evidence: "fakeagent: simulated test run"
+          reason: ""
+      verdict: go
       artifacts: []
-  - match: "You are validating a code change by testing it. Examine the repository and run the smallest relevant tests yourself.\n\nContext:\n- branch: test-malformed-structured-output"
+  - match: "You are validating a code change by driving the product itself. Derive the scenarios this change must satisfy, then run each one against the real running product.\n\nContext:\n- branch: test-malformed-structured-output"
     text: "tests found some issues"
     structured_raw: '{"summary":123}'
   - match: "Detect the linting and formatting tools for this project, run the relevant checks yourself, apply safe fixes, and verify the result.\n\nContext:\n- branch: lint-malformed-structured-output"
     text: "lint found some issues"
     structured_raw: '{"summary":123}'
-  - match: "You are validating a code change by testing it. Examine the repository and run the smallest relevant tests yourself.\n\nContext:\n- branch: test-agent-staged-new-test-file"
+  - match: "You are validating a code change by driving the product itself. Derive the scenarios this change must satisfy, then run each one against the real running product.\n\nContext:\n- branch: test-agent-staged-new-test-file"
     text: "tests passed after staging a regression test"
     edits:
       - path: "agent_staged_test.go"
@@ -483,8 +504,15 @@ func cleanReviewScenario(t *testing.T) string {
       tested:
         - "fakeagent: simulated test run"
       testing_summary: "simulated tests passed"
+      scenarios:
+        - name: "fakeagent: simulated end-to-end scenario"
+          result: pass
+          live: true
+          evidence: "fakeagent: simulated test run"
+          reason: ""
+      verdict: go
       artifacts: []
-  - match: "You are validating a code change by testing it. Examine the repository and run the smallest relevant tests yourself."
+  - match: "You are validating a code change by driving the product itself. Derive the scenarios this change must satisfy, then run each one against the real running product."
     text: "tests passed with no evidence artifacts"
     structured:
       findings: []
@@ -492,6 +520,13 @@ func cleanReviewScenario(t *testing.T) string {
       tested:
         - "fakeagent: simulated test run"
       testing_summary: "simulated tests passed"
+      scenarios:
+        - name: "fakeagent: simulated end-to-end scenario"
+          result: pass
+          live: true
+          evidence: "fakeagent: simulated test run"
+          reason: ""
+      verdict: go
       artifacts: []
   - match: "Review the code changes and return structured findings with a risk assessment.\n\nContext:\n- branch: feature/e2e"
     text: "looks good"
@@ -512,6 +547,13 @@ func cleanReviewScenario(t *testing.T) string {
       tested:
         - "fakeagent: simulated review"
       testing_summary: "not run during review"
+      scenarios:
+        - name: "fakeagent: simulated end-to-end scenario"
+          result: pass
+          live: true
+          evidence: "fakeagent: simulated test run"
+          reason: ""
+      verdict: go
   - match: "Review the code changes and return structured findings"
     text: "looks good"
     structured:
@@ -530,6 +572,13 @@ func cleanReviewScenario(t *testing.T) string {
       tested:
         - "fakeagent: simulated review"
       testing_summary: "not run during review"
+      scenarios:
+        - name: "fakeagent: simulated end-to-end scenario"
+          result: pass
+          live: true
+          evidence: "fakeagent: simulated test run"
+          reason: ""
+      verdict: go
   - text: "no issues found"
     structured:
       findings: []
@@ -540,6 +589,13 @@ func cleanReviewScenario(t *testing.T) string {
       tested:
         - "fakeagent: simulated test run"
       testing_summary: "simulated tests passed"
+      scenarios:
+        - name: "fakeagent: simulated end-to-end scenario"
+          result: pass
+          live: true
+          evidence: "fakeagent: simulated test run"
+          reason: ""
+      verdict: go
       artifacts: []
       title: "feat: fakeagent change"
       body: "## Summary\nfakeagent canned PR body"
@@ -954,7 +1010,11 @@ func assertRootNoActiveRunOnOtherBranch(t *testing.T, h *Harness, activeRun *ipc
 	if err != nil {
 		t.Fatalf("bare nm on main while %s is active: %v\n%s", activeRun.Branch, err, out)
 	}
-	for _, want := range []string{"No active run", "Recent runs", activeRun.Branch, string(activeRun.Status), "git push no-mistakes"} {
+	// Branch-scoped home status is the contract: main owns no active run. The
+	// foreign run may finish between the active IPC observation above and this
+	// separate CLI process, so requiring the stale word "running" would test
+	// timing rather than attribution. Its branch remains present in history.
+	for _, want := range []string{"No active run", "Recent runs", activeRun.Branch, "git push no-mistakes"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("bare nm output should contain %q while another branch is active, got:\n%s", want, out)
 		}
@@ -1063,7 +1123,7 @@ func assertEmptyDiffAfterRebaseRun(t *testing.T, h *Harness) {
 	if sawPromptContainingAll(invs, "Review the code changes", "branch: empty-after-rebase") {
 		t.Fatal("empty-after-rebase run should skip review without calling the agent")
 	}
-	if sawPromptContainingAll(invs, "You are validating a code change by testing it", "branch: empty-after-rebase") {
+	if sawPromptContainingAll(invs, "You are validating a code change by driving the product itself", "branch: empty-after-rebase") {
 		t.Fatal("empty-after-rebase run should skip test without calling the agent")
 	}
 	if sawPromptContainingAll(invs, "Find what this change made stale", "branch: empty-after-rebase") {
@@ -1371,8 +1431,11 @@ func assertConfiguredCommandRun(t *testing.T, h *Harness) {
 	if err != nil {
 		t.Fatalf("parse configured test findings: %v", err)
 	}
-	if len(findings.Tested) != 1 || findings.Tested[0] != "nm-test-e2e" {
-		t.Fatalf("expected configured test command to be recorded, got %+v", findings.Tested)
+	if len(findings.Tested) == 0 || findings.Tested[0] != "nm-test-e2e" {
+		t.Fatalf("expected configured test command to be recorded first, got %+v", findings.Tested)
+	}
+	if len(findings.Scenarios) == 0 || findings.Verdict == "" {
+		t.Fatalf("expected the evidence turn to run after the green baseline, got scenarios=%+v verdict=%q", findings.Scenarios, findings.Verdict)
 	}
 	logData, err := os.ReadFile(testCommandLog)
 	if err != nil {
@@ -1396,8 +1459,8 @@ func assertConfiguredCommandRun(t *testing.T, h *Harness) {
 		t.Fatalf("configured lint command log = %q", string(lintLogData))
 	}
 	invs := h.AgentInvocations()
-	if sawPromptContainingAll(invs, "You are validating a code change by testing it", "branch: configured-commands") {
-		t.Fatalf("configured test command should not call the agent for test detection; invocations:\n%s", summarisePrompts(invs))
+	if !sawPromptContainingAll(invs, "You are validating a code change by driving the product itself", "branch: configured-commands") {
+		t.Fatalf("configured test command must still be followed by the evidence turn; invocations:\n%s", summarisePrompts(invs))
 	}
 	if sawPromptContainingAll(invs, "Detect the linting and formatting tools", "branch: configured-commands") {
 		t.Fatalf("configured lint command should not call the agent for lint detection; invocations:\n%s", summarisePrompts(invs))
@@ -1953,7 +2016,7 @@ func assertSupersededRunCancellation(t *testing.T, h *Harness) {
 	if cancelled.Error == nil || !strings.Contains(*cancelled.Error, "superseded by new push") {
 		t.Fatalf("expected superseded run error, got %v", deref(cancelled.Error))
 	}
-	second := h.WaitForRun("superseded-run", 60*time.Second)
+	second := h.WaitForRunAfter("superseded-run", first.ID, 60*time.Second)
 	if second.ID == first.ID {
 		t.Fatal("expected second superseded-run push to create a new run")
 	}
@@ -2100,8 +2163,8 @@ func assertFailingTestCommandRun(t *testing.T, h *Harness) {
 	if findings.Items[0].ID != "test-1" {
 		t.Fatalf("expected normalized failing test finding ID test-1, got %q", findings.Items[0].ID)
 	}
-	if len(findings.Tested) != 1 || findings.Tested[0] != "nm-test-fails-e2e" {
-		t.Fatalf("expected failing test command to be recorded, got %+v", findings.Tested)
+	if len(findings.Tested) < 2 || findings.Tested[0] != "nm-test-fails-e2e" {
+		t.Fatalf("expected failing test command followed by live evidence checks, got %+v", findings.Tested)
 	}
 	if testStep.DurationMS == nil {
 		t.Fatal("expected awaiting failing test step to expose execution duration")
@@ -2774,7 +2837,7 @@ func assertNoUnexpectedAutofixCommits(t *testing.T, run *ipc.RunInfo, featureHea
 
 func assertNoCommandTestStep(t *testing.T, steps []ipc.StepResultInfo, invs []Invocation) {
 	t.Helper()
-	if !sawPromptContainingAll(invs, "You are validating a code change by testing it", "branch: feature/e2e", "action", "tested", "testing_summary") {
+	if !sawPromptContainingAll(invs, "You are validating a code change by driving the product itself", "branch: feature/e2e", "action", "tested", "testing_summary") {
 		t.Errorf("expected a test prompt with branch metadata, action guidance, and test reporting fields in invocations, got %d:\n%s", len(invs), summarisePrompts(invs))
 	}
 	step, ok := findStep(steps, types.StepTest)

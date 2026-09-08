@@ -68,6 +68,13 @@ func TestRerunIntentProvenanceJourney(t *testing.T) {
 
 func runCLIAndWait(t *testing.T, h *Harness, dir, branch string, args ...string) *ipc.RunInfo {
 	t.Helper()
+	var priorRunID string
+	for _, run := range h.Runs() {
+		if run.Branch == branch {
+			priorRunID = run.ID
+			break
+		}
+	}
 	out, err := h.RunInDir(dir, args...)
 	if err != nil {
 		t.Fatalf("%s: %v\n%s", strings.Join(args, " "), err, out)
@@ -76,7 +83,7 @@ func runCLIAndWait(t *testing.T, h *Harness, dir, branch string, args ...string)
 		t.Fatalf("%s output missing rerun confirmation:\n%s", strings.Join(args, " "), out)
 	}
 	t.Logf("CLI %s: %s", strings.Join(args, " "), strings.TrimSpace(out))
-	run := h.WaitForRun(branch, 90*time.Second)
+	run := h.WaitForRunAfter(branch, priorRunID, 90*time.Second)
 	if run.Status != types.RunCompleted {
 		t.Fatalf("%s status=%s error=%v", strings.Join(args, " "), run.Status, run.Error)
 	}

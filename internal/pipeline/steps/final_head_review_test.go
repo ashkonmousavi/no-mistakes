@@ -197,6 +197,30 @@ func TestExecutor_FinalHeadRereviewLoopIsBounded(t *testing.T) {
 	}
 }
 
+// TestExecutor_ContinuouslyMutatingFormatterHitsFinalHeadRereviewBound proves
+// the production Push path cannot loop forever when a misconfigured formatter
+// changes the reviewed head on every attempt. Nothing reaches the remote, and
+// the stable refusal code distinguishes the bound from an ordinary test error.
+func TestExecutor_ContinuouslyMutatingFormatterHitsFinalHeadRereviewBound(t *testing.T) {
+	upstream, dir, submitted, sctx, executorPaths := setupFinalHeadExecutor(t, config.Commands{
+		Format: "printf 'formatter pass\\n' >> feature.txt",
+	})
+	review := &finalHeadStep{name: types.StepReview, run: approveFinalHead}
+	push := &finalHeadPush{}
+	exec := pipeline.NewExecutor(sctx.DB, executorPaths, sctx.Config, sctx.Agent, []pipeline.Step{review, push}, nil)
+
+	err := exec.Execute(context.Background(), sctx.Run, sctx.Repo, dir)
+	if err == nil || !strings.Contains(err.Error(), "final_head_rereview_limit_exceeded") {
+		t.Fatalf("error = %v, want stable rereview limit code", err)
+	}
+	if review.count() > 5 || push.count() > 5 {
+		t.Fatalf("mutating formatter exceeded the small rereview bound: review=%d push=%d", review.count(), push.count())
+	}
+	if remote := gitCmd(t, upstream, "rev-parse", "refs/heads/feature"); remote != submitted {
+		t.Fatalf("remote changed from submitted %s to %s", submitted, remote)
+	}
+}
+
 func setupFinalHeadExecutor(t *testing.T, commands config.Commands) (string, string, string, *pipeline.StepContext, *paths.Paths) {
 	t.Helper()
 	upstream := t.TempDir()

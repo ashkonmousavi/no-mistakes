@@ -234,7 +234,10 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 		NeedsApproval: needsApproval,
 		AutoFixable:   false,
 		Findings:      string(findingsJSON),
-		FixSummary:    docFindings.Summary,
+		// Document is report-only in this fork. A descriptive analyzer summary
+		// names what it found, not a fix the round applied; recording it as the
+		// fix summary would make downstream history claim work happened here.
+		FixSummary: noChangesAppliedSummary,
 	}, nil
 }
 
@@ -433,7 +436,6 @@ func documentMutationDetail(entryFingerprint, exitFingerprint string) string {
 	}
 	return strings.Join(detail, "\n")
 }
-
 func hasNonIgnoredDocumentChanges(changedFiles string, ignorePatterns []string) bool {
 	for _, path := range strings.Split(changedFiles, "\n") {
 		path = strings.TrimSpace(path)
