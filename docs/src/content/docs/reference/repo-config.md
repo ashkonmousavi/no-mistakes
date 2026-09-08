@@ -478,7 +478,7 @@ Reruns are skipped when:
 
 ### ci.rerun_infrastructure
 
-How many times one exact head/base candidate may retry an independently proven artifact-transfer infrastructure failure.
+Reserved candidate-wide budget for an independently proven artifact-transfer infrastructure failure. GitHub classification is implemented, but dispatch remains disabled because GitHub's retry primitives also run dependent jobs and therefore exceed the approved failed-jobs-only boundary.
 
 | | |
 |---|---|
@@ -487,16 +487,20 @@ How many times one exact head/base candidate may retry an independently proven a
 | Range | `0` to `1`; values outside it are clamped |
 | Trust | Read only from the trusted default branch |
 
-This budget is separate from `ci.rerun_transient`: enabling cancellation retries does not enable this classifier, and an artifact retry never spends a cancellation allowance. The first failure and its head/base, provider link, bounded reason, and completion time are retained in the run's durable CI rerun record before GitHub is asked to rerun the job.
+This budget is separate from `ci.rerun_transient`: enabling cancellation retries does not enable this classifier, and infrastructure classification never spends a cancellation allowance. The default remains `0`; setting `1` permits the extra read-only classification calls but does not issue a GitHub rerun.
 
 With a value of `1`, a failed GitHub Actions check qualifies only when all of these are proven:
 
-- The workflow run is its first attempt and belongs to the same pull request, exact head SHA, and current forge base branch that the CI step is certifying.
+- The workflow run is its first attempt and belongs to the same pull request, exact head SHA, current forge base branch, and freshly resolved base SHA that the CI step is certifying.
+- The attempt-specific jobs endpoint is fully paginated and its page counts, complete job population, exact check/job IDs, head SHA, terminal status, and conclusions agree. Unknown, skipped, pending, or unrepresented siblings refuse classification.
 - Structured workflow-job data reports every non-artifact step successful. The only failed step or steps are artifact upload/download steps; skipped, cancelled, timed-out, missing, unknown, test, and lint outcomes fail closed.
-- The failed job log identifies `actions/upload-artifact` or `actions/download-artifact` and reports `FinalizeArtifact` or `ListArtifacts` failing with HTTP 403 or 5xx. Raw logs are used for classification only and are never stored in the run record.
+- Each failed structured step is paired with its own ordered job-log `Run` group. That group must invoke `actions/upload-artifact` or `actions/download-artifact` and carry its own `FinalizeArtifact` or `ListArtifacts` HTTP 403 or 5xx. A recovered error from another step cannot qualify it. Raw logs are used for classification only and are never stored.
+- Reading each qualifying attempt-1 job log plus the complete, non-expired workflow-run artifact inventory produces a bounded retention receipt containing only the run/attempt, job IDs, and artifact IDs/names.
 - Every failing check in the poll carries the same independently proven provider group. A genuine or unknown sibling, a merge conflict, a different workflow run, or unreadable/malformed evidence suppresses the retry.
 
-The allowance is candidate-wide and spent durably before the provider request. A daemon restart cannot restore it, and a second failed workflow attempt cannot earn a third attempt. While GitHub replaces the old check rollup, the exact first failure receives the same finite publication grace as cancellation reruns; once a new failure appears it follows the ordinary CI failure path. The published branch head is re-read immediately before the rerun, so a moved branch terminates instead of certifying unowned code.
+The durable state is keyed by exact head and base commits, is structurally validated on recovery, and is non-admitting when the database read, decode, or reservation fails. A spent candidate stays spent even when a different workflow group later fails. Any future exact-scope provider dispatch must first re-read both the published feature head and the base tip, then persist the allowance and retention receipt before its request.
+
+GitHub dispatch is intentionally unavailable: `gh run rerun --failed` and job-level reruns include dependent jobs. The attempt jobs API does not expose enough dependency evidence to prove that wider population is authorized, so no provider mutation is made and a proven occurrence is reported for manual resolution rather than sent to the CI code-fix agent. A later implementation must supply an exact failed-jobs-only primitive or a separately approved broader boundary before this setting can become operational.
 
 With no trusted repository value, the operator's [`ci.rerun_infrastructure`](/no-mistakes/reference/global-config/#cirerun_infrastructure) applies, then the built-in default of `0`.
 

@@ -98,6 +98,10 @@ type PR struct {
 	// authoritative once a PR exists and protects resumed CI repair from a
 	// later configuration change.
 	BaseBranch string
+	// BaseSHA is the freshly resolved commit at BaseBranch. Retry admission
+	// requires it because a branch name alone cannot detect that the target
+	// advanced after the first workflow attempt was created.
+	BaseSHA string
 }
 
 // PRContent is the title + body for creating or updating a PR.
@@ -196,6 +200,13 @@ type Check struct {
 	// InfrastructureReason is a bounded, provider-produced classification label,
 	// never raw logs. It is persisted with the first failure for later readback.
 	InfrastructureReason string
+	// InfrastructureHeadSHA and InfrastructureBaseSHA bind the provider proof
+	// to immutable commits. InfrastructureRerunSafe is false when the provider's
+	// retry primitive would widen beyond the proven failed-job population.
+	InfrastructureHeadSHA   string
+	InfrastructureBaseSHA   string
+	InfrastructureRerunSafe bool
+	InfrastructureEvidence  InfrastructureEvidenceReceipt
 }
 
 // Failing reports whether the check is in a failed bucket.
@@ -347,6 +358,26 @@ type InfrastructureFailure struct {
 	Retryable bool
 	Group     string
 	Reason    string
+	HeadSHA   string
+	BaseSHA   string
+	RerunSafe bool
+	Evidence  InfrastructureEvidenceReceipt
+}
+
+// InfrastructureEvidenceReceipt is bounded provider metadata proving which
+// attempt-specific job log was readable and which non-expired artifacts were
+// still retained before a retry decision. It intentionally contains no log
+// text, paths, or credentials.
+type InfrastructureEvidenceReceipt struct {
+	ProviderRunID string                          `json:"provider_run_id"`
+	Attempt       int                             `json:"attempt"`
+	LogJobIDs     []int64                         `json:"log_job_ids"`
+	Artifacts     []InfrastructureArtifactReceipt `json:"artifacts,omitempty"`
+}
+
+type InfrastructureArtifactReceipt struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
 }
 
 // ArtifactInfrastructureFailureDetector classifies artifact-transfer failures

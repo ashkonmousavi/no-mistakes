@@ -39,19 +39,21 @@ const (
 // A feature branch cannot self-declare that value. When checks exist, their
 // actual states are always processed normally - even on a declared no-CI repo.
 type CIStep struct {
-	lastFixedChecks      string                    // sorted check names from last fix attempt, to avoid re-fixing
-	lastFixedCompletedAt map[string]time.Time      // terminally failed check completion times seen before the last fix attempt
-	ciFixAttempts        int                       // number of CI auto-fix attempts made
-	transientReruns      checkRerunBudget          // per-check rerun budget spent on provider-reported transient failures
-	infrastructureReruns infrastructureRerunBudget // candidate-wide budget and first artifact-infrastructure failure
-	pollIntervalOverride time.Duration             // if set, overrides computed poll interval (for testing)
-	waitForNextPoll      func(context.Context, time.Duration) error
-	now                  func() time.Time
+	lastFixedChecks              string                    // sorted check names from last fix attempt, to avoid re-fixing
+	lastFixedCompletedAt         map[string]time.Time      // terminally failed check completion times seen before the last fix attempt
+	ciFixAttempts                int                       // number of CI auto-fix attempts made
+	transientReruns              checkRerunBudget          // per-check rerun budget spent on provider-reported transient failures
+	infrastructureReruns         infrastructureRerunBudget // candidate-wide budget and first artifact-infrastructure failure
+	infrastructureStateAvailable bool                      // true only after the durable infrastructure budget decoded successfully
+	pollIntervalOverride         time.Duration             // if set, overrides computed poll interval (for testing)
+	waitForNextPoll              func(context.Context, time.Duration) error
+	now                          func() time.Time
 	// baseBranchTip resolves the current tip SHA of the upstream default
 	// branch. The bool is false when the SHA is a fallback/unknown value and
 	// must not re-arm the timeout. Overridable for testing; defaults to
 	// fetching the upstream default branch.
 	baseBranchTip func(context.Context) (string, bool)
+	publishedHead func(*pipeline.StepContext) (string, error)
 }
 
 // SetPollIntervalOverride is a test hook; production leaves the override unset.
@@ -421,23 +423,31 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 			return timeoutOutcome()
 		}
 
-		// Re-arm the timeout whenever the base branch advances.
-		if !unlimited {
+		// Resolve the base on every poll, including unlimited monitors. The
+		// immutable tip is part of infrastructure-retry admission; a branch name
+		// cannot prove that the candidate still has the base from attempt 1.
+		pr.BaseSHA = ""
+		if !unlimited || sctx.Config.CI.RerunInfrastructure > 0 {
 			resolveWindow := defaultBaseBranchTipResolveWindow
-			if remaining := timeout - now().Sub(timeoutAnchor); remaining <= 0 {
-				return timeoutOutcome()
-			} else if remaining < resolveWindow {
-				resolveWindow = remaining
+			if !unlimited {
+				if remaining := timeout - now().Sub(timeoutAnchor); remaining <= 0 {
+					return timeoutOutcome()
+				} else if remaining < resolveWindow {
+					resolveWindow = remaining
+				}
 			}
 			tipCtx, cancel := context.WithTimeout(ctx, resolveWindow)
 			tip, resolved := baseBranchTip(tipCtx)
 			cancel()
 			if resolved && tip != "" {
+				pr.BaseSHA = tip
 				if lastBaseTip == "" {
 					lastBaseTip = tip
 				} else if tip != lastBaseTip {
-					sctx.Log(fmt.Sprintf("base branch advanced (%s..%s), re-arming CI monitor timeout", shortSHA(lastBaseTip), shortSHA(tip)))
-					timeoutAnchor = now()
+					if !unlimited {
+						sctx.Log(fmt.Sprintf("base branch advanced (%s..%s), re-arming CI monitor timeout", shortSHA(lastBaseTip), shortSHA(tip)))
+						timeoutAnchor = now()
+					}
 					lastBaseTip = tip
 				}
 			}
@@ -575,6 +585,12 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 				}
 				rerunIssued = issued
 				if !rerunIssued {
+					if unsafe := infrastructureFailuresWithoutExactRerun(checks); len(unsafe) > 0 {
+						clearCIMonitorReady(sctx)
+						return ciFailureOutcome(unsafe, false, "provider retry scope includes work outside the proven failed-job population; infrastructure rerun remains disabled"), nil
+					}
+				}
+				if !rerunIssued {
 					issued, rerunOutcome = s.rerunTransientChecks(sctx, host, pr, checks)
 					if rerunOutcome != nil {
 						clearCIMonitorReady(sctx)
@@ -590,7 +606,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 			var unresolvedCancelled, awaitingRerun []string
 			var awaitingInfrastructure map[string]bool
 			if !rerunIssued {
-				awaitingInfrastructure = s.infrastructureReruns.awaitingFailureKeys(checks, sctx.Run.HeadSHA, pr.BaseBranch)
+				awaitingInfrastructure = s.infrastructureReruns.awaitingFailureKeys(checks, sctx.Run.HeadSHA, pr.BaseSHA)
 				if len(awaitingInfrastructure) > 0 {
 					if err := s.persistRerunBudget(sctx); err != nil {
 						sctx.Log(fmt.Sprintf("warning: could not persist infrastructure rerun rollup grace: %v", err))

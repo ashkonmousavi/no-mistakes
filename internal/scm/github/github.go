@@ -899,10 +899,12 @@ func (h *Host) rerunTargetArgs(check scm.Check) ([]string, bool) {
 	case !ok:
 		return nil, false
 	case check.InfrastructureFailure:
-		// The candidate-wide infrastructure allowance can cover several failed
-		// artifact jobs in this one proven run. GitHub's failed-jobs primitive is
-		// one provider request and cannot widen to successful jobs.
-		return []string{runID, "--failed"}, true
+		// GitHub's failed-jobs primitive also re-runs dependent jobs. The
+		// infrastructure classifier can prove the complete attempt-1 job
+		// population, but the jobs API does not expose a dependency graph that
+		// can prove this request stays inside that failed population. Keep this
+		// route disabled rather than widening the approved failed-jobs-only scope.
+		return nil, false
 	case jobID != "":
 		return []string{"--job", jobID}, true
 	case strings.EqualFold(strings.TrimSpace(check.State), "CANCELLED"):
@@ -1031,6 +1033,60 @@ func (h *Host) fetchRunJobs(ctx context.Context, runID string) ([]githubRunJob, 
 	return payload.Jobs, nil
 }
 
+// fetchRunAttemptJobs reads and validates the complete job population for one
+// immutable workflow attempt. --paginate --slurp preserves page boundaries so
+// total_count can be checked against the union; a missing page, duplicate job,
+// or inconsistent count fails closed instead of authorizing a partial retry.
+func (h *Host) fetchRunAttemptJobs(ctx context.Context, runID string, attempt int) ([]githubRunJob, error) {
+	repo := h.repoSlug()
+	if repo == "" {
+		return nil, errors.New("repository slug is required to read workflow attempt jobs")
+	}
+	if attempt <= 0 {
+		return nil, errors.New("workflow attempt is required to read jobs")
+	}
+	args := []string{"api"}
+	if h.host != "" {
+		args = append(args, "--hostname", h.host)
+	}
+	endpoint := fmt.Sprintf("repos/%s/actions/runs/%s/attempts/%d/jobs", repo, runID, attempt)
+	args = append(args, "--method", "GET", endpoint, "-f", "per_page=100", "--paginate", "--slurp")
+	out, err := h.cmd(ctx, "gh", args...).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("gh api workflow attempt jobs: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	var pages []githubRunJobsResponse
+	if err := json.Unmarshal(out, &pages); err != nil {
+		return nil, fmt.Errorf("parse workflow attempt jobs: %w", err)
+	}
+	if len(pages) == 0 {
+		return nil, errors.New("workflow attempt jobs response contained no pages")
+	}
+	total := pages[0].TotalCount
+	if total < 0 {
+		return nil, errors.New("workflow attempt jobs response has a negative total_count")
+	}
+	jobs := make([]githubRunJob, 0, total)
+	seen := map[int]bool{}
+	for _, page := range pages {
+		if page.TotalCount != total {
+			return nil, errors.New("workflow attempt jobs pages disagree on total_count")
+		}
+		for _, job := range page.Jobs {
+			id := job.databaseID()
+			if id <= 0 || seen[id] {
+				return nil, errors.New("workflow attempt jobs contain a missing or duplicate job id")
+			}
+			seen[id] = true
+			jobs = append(jobs, job)
+		}
+	}
+	if len(jobs) != total {
+		return nil, fmt.Errorf("workflow attempt jobs response is incomplete: got %d of %d jobs", len(jobs), total)
+	}
+	return jobs, nil
+}
+
 // matchRunJob finds the job a check names: by databaseId when the check's link
 // carried one, otherwise by job name. A re-run can renumber jobs, so the name
 // fallback keeps a check matchable when its link named only the run.
@@ -1044,6 +1100,18 @@ func matchRunJob(jobs []githubRunJob, jobID, checkName string) (githubRunJob, bo
 	}
 	for _, job := range jobs {
 		if normalizeRunName(job.Name) == normalizeRunName(checkName) {
+			return job, true
+		}
+	}
+	return githubRunJob{}, false
+}
+
+func matchRunJobExact(jobs []githubRunJob, jobID, checkName string) (githubRunJob, bool) {
+	if jobID == "" {
+		return githubRunJob{}, false
+	}
+	for _, job := range jobs {
+		if strconv.Itoa(job.databaseID()) == jobID && normalizeRunName(job.Name) == normalizeRunName(checkName) {
 			return job, true
 		}
 	}
@@ -1074,7 +1142,7 @@ func jobFailedAtSetup(job githubRunJob) bool {
 // fails closed to an ordinary failure.
 func (h *Host) ArtifactInfrastructureFailures(ctx context.Context, pr *scm.PR, checks []scm.Check) ([]scm.InfrastructureFailure, error) {
 	result := make([]scm.InfrastructureFailure, len(checks))
-	if pr == nil || strings.TrimSpace(pr.Number) == "" || strings.TrimSpace(pr.HeadSHA) == "" || strings.TrimSpace(pr.BaseBranch) == "" {
+	if pr == nil || strings.TrimSpace(pr.Number) == "" || strings.TrimSpace(pr.HeadSHA) == "" || strings.TrimSpace(pr.BaseBranch) == "" || strings.TrimSpace(pr.BaseSHA) == "" {
 		return result, nil
 	}
 	prNumber, err := strconv.Atoi(strings.TrimSpace(pr.Number))
@@ -1082,9 +1150,11 @@ func (h *Host) ArtifactInfrastructureFailures(ctx context.Context, pr *scm.PR, c
 		return result, nil
 	}
 	type cachedRun struct {
-		metadata githubWorkflowRun
-		jobs     []githubRunJob
-		err      error
+		metadata      githubWorkflowRun
+		jobs          []githubRunJob
+		artifacts     []scm.InfrastructureArtifactReceipt
+		artifactsRead bool
+		err           error
 	}
 	cache := map[string]cachedRun{}
 	for i, check := range checks {
@@ -1095,38 +1165,102 @@ func (h *Host) ArtifactInfrastructureFailures(ctx context.Context, pr *scm.PR, c
 		entry, seen := cache[runID]
 		if !seen {
 			entry.metadata, entry.err = h.fetchWorkflowRun(ctx, runID)
-			if entry.err == nil && workflowRunMatchesCandidate(entry.metadata, prNumber, pr.HeadSHA, pr.BaseBranch) {
-				entry.jobs, entry.err = h.fetchRunJobs(ctx, runID)
+			if entry.err == nil && workflowRunMatchesCandidate(entry.metadata, prNumber, pr.HeadSHA, pr.BaseBranch, pr.BaseSHA) {
+				entry.jobs, entry.err = h.fetchRunAttemptJobs(ctx, runID, 1)
 			}
 			cache[runID] = entry
 		}
 		if entry.err != nil {
 			return result, entry.err
 		}
-		if !workflowRunMatchesCandidate(entry.metadata, prNumber, pr.HeadSHA, pr.BaseBranch) {
+		if !workflowRunMatchesCandidate(entry.metadata, prNumber, pr.HeadSHA, pr.BaseBranch, pr.BaseSHA) {
 			continue
 		}
-		job, found := matchRunJob(entry.jobs, jobID, check.Name)
-		if !found || (job.HeadSHA != "" && job.HeadSHA != strings.TrimSpace(pr.HeadSHA)) {
+		job, found := matchRunJobExact(entry.jobs, jobID, check.Name)
+		if !found || strings.TrimSpace(job.HeadSHA) != strings.TrimSpace(pr.HeadSHA) {
 			continue
 		}
-		if !jobHasOnlyArtifactInfrastructureFailure(job) {
+		if !h.runAttemptPopulationMatchesChecks(entry.jobs, checks, runID, pr.HeadSHA) || !jobHasOnlyArtifactInfrastructureFailure(job) {
 			continue
 		}
 		logs, err := h.fetchWorkflowJobLogs(ctx, job.databaseID())
 		if err != nil {
 			return result, err
 		}
-		if !logsProveArtifactInfrastructureFailure(logs) {
+		if !logsProveArtifactInfrastructureFailure(job, logs) {
 			continue
+		}
+		if !entry.artifactsRead {
+			entry.artifacts, entry.err = h.fetchRunArtifacts(ctx, runID)
+			entry.artifactsRead = true
+			cache[runID] = entry
+		}
+		if entry.err != nil {
+			return result, entry.err
 		}
 		result[i] = scm.InfrastructureFailure{
 			Retryable: true,
 			Group:     "github-actions-run:" + runID,
 			Reason:    "artifact-transfer infrastructure failed after repository steps passed",
+			HeadSHA:   strings.TrimSpace(pr.HeadSHA),
+			BaseSHA:   strings.TrimSpace(pr.BaseSHA),
+			// GitHub's failed-job rerun also includes dependents, which the
+			// attempt jobs response cannot prove are inside the authorized set.
+			RerunSafe: false,
+			Evidence: scm.InfrastructureEvidenceReceipt{
+				ProviderRunID: runID,
+				Attempt:       1,
+				LogJobIDs:     []int64{int64(job.databaseID())},
+				Artifacts:     append([]scm.InfrastructureArtifactReceipt(nil), entry.artifacts...),
+			},
 		}
 	}
 	return result, nil
+}
+
+func (h *Host) fetchRunArtifacts(ctx context.Context, runID string) ([]scm.InfrastructureArtifactReceipt, error) {
+	repo := h.repoSlug()
+	if repo == "" {
+		return nil, errors.New("repository slug is required to read workflow artifacts")
+	}
+	args := []string{"api"}
+	if h.host != "" {
+		args = append(args, "--hostname", h.host)
+	}
+	args = append(args, "--method", "GET", "repos/"+repo+"/actions/runs/"+runID+"/artifacts", "-f", "per_page=100", "--paginate", "--slurp")
+	out, err := h.cmd(ctx, "gh", args...).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("gh api workflow artifacts: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	var pages []githubRunArtifactsResponse
+	if err := json.Unmarshal(out, &pages); err != nil {
+		return nil, fmt.Errorf("parse workflow artifacts: %w", err)
+	}
+	if len(pages) == 0 {
+		return nil, errors.New("workflow artifacts response contained no pages")
+	}
+	total := pages[0].TotalCount
+	if total < 0 {
+		return nil, errors.New("workflow artifacts response has a negative total_count")
+	}
+	artifacts := make([]scm.InfrastructureArtifactReceipt, 0, total)
+	seen := map[int64]bool{}
+	for _, page := range pages {
+		if page.TotalCount != total {
+			return nil, errors.New("workflow artifact pages disagree on total_count")
+		}
+		for _, artifact := range page.Artifacts {
+			if artifact.ID <= 0 || seen[artifact.ID] || strings.TrimSpace(artifact.Name) == "" || artifact.Expired {
+				return nil, errors.New("workflow artifacts contain missing, duplicate, or expired evidence")
+			}
+			seen[artifact.ID] = true
+			artifacts = append(artifacts, scm.InfrastructureArtifactReceipt{ID: artifact.ID, Name: strings.TrimSpace(artifact.Name)})
+		}
+	}
+	if len(artifacts) != total {
+		return nil, fmt.Errorf("workflow artifacts response is incomplete: got %d of %d artifacts", len(artifacts), total)
+	}
+	return artifacts, nil
 }
 
 func (h *Host) fetchWorkflowRun(ctx context.Context, runID string) (githubWorkflowRun, error) {
@@ -1167,12 +1301,12 @@ func (h *Host) fetchWorkflowJobLogs(ctx context.Context, jobID int) (string, err
 	return string(out), nil
 }
 
-func workflowRunMatchesCandidate(run githubWorkflowRun, prNumber int, headSHA, baseBranch string) bool {
+func workflowRunMatchesCandidate(run githubWorkflowRun, prNumber int, headSHA, baseBranch, baseSHA string) bool {
 	if run.RunAttempt != 1 || strings.TrimSpace(run.HeadSHA) != strings.TrimSpace(headSHA) {
 		return false
 	}
 	for _, candidate := range run.PullRequests {
-		if candidate.Number == prNumber && strings.TrimSpace(candidate.Head.SHA) == strings.TrimSpace(headSHA) && strings.TrimSpace(candidate.Base.Ref) == strings.TrimSpace(baseBranch) {
+		if candidate.Number == prNumber && strings.TrimSpace(candidate.Head.SHA) == strings.TrimSpace(headSHA) && strings.TrimSpace(candidate.Base.Ref) == strings.TrimSpace(baseBranch) && strings.TrimSpace(candidate.Base.SHA) == strings.TrimSpace(baseSHA) {
 			return true
 		}
 	}
@@ -1185,13 +1319,17 @@ func jobHasOnlyArtifactInfrastructureFailure(job githubRunJob) bool {
 	}
 	failures := 0
 	for _, step := range job.Steps {
+		name := strings.ToLower(strings.TrimSpace(step.Name))
+		if name == "set up job" || name == "complete job" || strings.HasPrefix(name, "post ") {
+			if strings.EqualFold(strings.TrimSpace(step.Conclusion), "success") {
+				continue
+			}
+			return false
+		}
 		switch strings.ToUpper(strings.TrimSpace(step.Conclusion)) {
 		case "SUCCESS":
 			continue
 		case "FAILURE", "FAILED", "ERROR":
-			if !artifactTransferStepName(step.Name) {
-				return false
-			}
 			failures++
 		default:
 			// Skipped, cancelled, timed out, missing, and future states are not
@@ -1202,35 +1340,101 @@ func jobHasOnlyArtifactInfrastructureFailure(job githubRunJob) bool {
 	return failures > 0
 }
 
-func artifactTransferStepName(name string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(name))
-	return strings.Contains(normalized, "actions/upload-artifact") ||
-		strings.Contains(normalized, "actions/download-artifact") ||
-		(strings.Contains(normalized, "artifact") && (strings.Contains(normalized, "upload") || strings.Contains(normalized, "download")))
-}
-
-func logsProveArtifactInfrastructureFailure(logs string) bool {
-	normalized := strings.ToLower(logs)
-	if !strings.Contains(normalized, "actions/upload-artifact@") && !strings.Contains(normalized, "actions/download-artifact@") {
-		return false
-	}
-	for _, operation := range []string{"finalizeartifact", "listartifacts"} {
-		for offset := 0; ; {
-			idx := strings.Index(normalized[offset:], operation)
-			if idx < 0 {
-				break
+func (h *Host) runAttemptPopulationMatchesChecks(jobs []githubRunJob, checks []scm.Check, runID, headSHA string) bool {
+	for _, job := range jobs {
+		if strings.TrimSpace(job.HeadSHA) != strings.TrimSpace(headSHA) || !strings.EqualFold(strings.TrimSpace(job.Status), "completed") {
+			return false
+		}
+		switch strings.ToLower(strings.TrimSpace(job.Conclusion)) {
+		case "success":
+			continue
+		case "failure":
+			matched := false
+			for _, check := range checks {
+				candidateRun, candidateJob, ok := h.actionsRerunTarget(check.Link)
+				if ok && candidateRun == runID && candidateJob == strconv.Itoa(job.databaseID()) && normalizeRunName(check.Name) == normalizeRunName(job.Name) && check.Failing() && strings.EqualFold(strings.TrimSpace(check.State), "FAILURE") {
+					matched = true
+					break
+				}
 			}
-			idx += offset
-			start := max(0, idx-160)
-			end := min(len(normalized), idx+len(operation)+160)
-			window := normalized[start:end]
-			if containsArtifactHTTPFailure(window) {
-				return true
+			if !matched {
+				return false
 			}
-			offset = idx + len(operation)
+		default:
+			return false
 		}
 	}
-	return false
+	return len(jobs) > 0
+}
+
+type actionLogSegment struct {
+	action string
+	text   string
+}
+
+func actionLogSegments(logs string) []actionLogSegment {
+	const marker = "##[group]Run "
+	var segments []actionLogSegment
+	for remaining := logs; ; {
+		start := strings.Index(remaining, marker)
+		if start < 0 {
+			break
+		}
+		remaining = remaining[start+len(marker):]
+		lineEnd := strings.IndexByte(remaining, '\n')
+		if lineEnd < 0 {
+			lineEnd = len(remaining)
+		}
+		header := strings.TrimSpace(remaining[:lineEnd])
+		next := strings.Index(remaining[lineEnd:], marker)
+		segmentEnd := len(remaining)
+		if next >= 0 {
+			segmentEnd = lineEnd + next
+		}
+		segments = append(segments, actionLogSegment{action: strings.ToLower(header), text: strings.ToLower(remaining[:segmentEnd])})
+		remaining = remaining[segmentEnd:]
+	}
+	return segments
+}
+
+func logsProveArtifactInfrastructureFailure(job githubRunJob, logs string) bool {
+	segments := actionLogSegments(logs)
+	configured := make([]githubJobStep, 0, len(job.Steps))
+	for _, step := range job.Steps {
+		name := strings.ToLower(strings.TrimSpace(step.Name))
+		if name == "set up job" || name == "complete job" || strings.HasPrefix(name, "post ") {
+			continue
+		}
+		configured = append(configured, step)
+	}
+	if len(configured) == 0 || len(segments) != len(configured) {
+		return false
+	}
+	failures := 0
+	for i, step := range configured {
+		conclusion := strings.ToUpper(strings.TrimSpace(step.Conclusion))
+		if conclusion == "SUCCESS" {
+			continue
+		}
+		if conclusion != "FAILURE" && conclusion != "FAILED" && conclusion != "ERROR" {
+			return false
+		}
+		action := segments[i].action
+		operation := ""
+		switch {
+		case strings.HasPrefix(action, "actions/upload-artifact@"):
+			operation = "finalizeartifact"
+		case strings.HasPrefix(action, "actions/download-artifact@"):
+			operation = "listartifacts"
+		default:
+			return false
+		}
+		if !strings.Contains(segments[i].text, operation) || !containsArtifactHTTPFailure(segments[i].text) {
+			return false
+		}
+		failures++
+	}
+	return failures > 0
 }
 
 func containsArtifactHTTPFailure(text string) bool {
@@ -1344,7 +1548,17 @@ type githubRunView struct {
 }
 
 type githubRunJobsResponse struct {
-	Jobs []githubRunJob `json:"jobs"`
+	TotalCount int            `json:"total_count"`
+	Jobs       []githubRunJob `json:"jobs"`
+}
+
+type githubRunArtifactsResponse struct {
+	TotalCount int `json:"total_count"`
+	Artifacts  []struct {
+		ID      int64  `json:"id"`
+		Name    string `json:"name"`
+		Expired bool   `json:"expired"`
+	} `json:"artifacts"`
 }
 
 type githubWorkflowRun struct {
@@ -1358,6 +1572,7 @@ type githubWorkflowRun struct {
 		} `json:"head"`
 		Base struct {
 			Ref string `json:"ref"`
+			SHA string `json:"sha"`
 		} `json:"base"`
 	} `json:"pull_requests"`
 }

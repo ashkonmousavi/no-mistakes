@@ -138,12 +138,14 @@ type persistedRollupState struct {
 }
 
 type infrastructureFailureRecord struct {
-	Name        string    `json:"name"`
-	Link        string    `json:"link,omitempty"`
-	Reason      string    `json:"reason"`
-	CompletedAt time.Time `json:"completed_at,omitempty"`
-	HeadSHA     string    `json:"head_sha"`
-	BaseBranch  string    `json:"base_branch"`
+	Name        string                            `json:"name"`
+	Link        string                            `json:"link,omitempty"`
+	Reason      string                            `json:"reason"`
+	CompletedAt time.Time                         `json:"completed_at,omitempty"`
+	HeadSHA     string                            `json:"head_sha"`
+	BaseBranch  string                            `json:"base_branch"`
+	BaseSHA     string                            `json:"base_sha"`
+	Evidence    scm.InfrastructureEvidenceReceipt `json:"evidence"`
 }
 
 type infrastructureFailureObservation struct {
@@ -172,22 +174,22 @@ type persistedInfrastructureRerunBudget struct {
 	Infrastructure map[string]infrastructureCandidateRerun `json:"infrastructure,omitempty"`
 }
 
-func infrastructureCandidateKey(headSHA, baseBranch string) string {
-	return strings.TrimSpace(headSHA) + "\x00" + strings.TrimSpace(baseBranch)
+func infrastructureCandidateKey(headSHA, baseSHA string) string {
+	return strings.TrimSpace(headSHA) + "\x00" + strings.TrimSpace(baseSHA)
 }
 
-func (b *infrastructureRerunBudget) used(headSHA, baseBranch string) int {
+func (b *infrastructureRerunBudget) used(headSHA, baseSHA string) int {
 	if b == nil {
 		return 0
 	}
-	return b.Candidates[infrastructureCandidateKey(headSHA, baseBranch)].Used
+	return b.Candidates[infrastructureCandidateKey(headSHA, baseSHA)].Used
 }
 
-func (b *infrastructureRerunBudget) spend(check scm.Check, checks []scm.Check, headSHA, baseBranch string) int {
+func (b *infrastructureRerunBudget) spend(check scm.Check, checks []scm.Check, headSHA, baseBranch, baseSHA string) int {
 	if b.Candidates == nil {
 		b.Candidates = map[string]infrastructureCandidateRerun{}
 	}
-	key := infrastructureCandidateKey(headSHA, baseBranch)
+	key := infrastructureCandidateKey(headSHA, baseSHA)
 	state := b.Candidates[key]
 	state.Used++
 	state.Group = check.InfrastructureGroup
@@ -199,6 +201,8 @@ func (b *infrastructureRerunBudget) spend(check scm.Check, checks []scm.Check, h
 			CompletedAt: check.CompletedAt,
 			HeadSHA:     strings.TrimSpace(headSHA),
 			BaseBranch:  strings.TrimSpace(baseBranch),
+			BaseSHA:     strings.TrimSpace(baseSHA),
+			Evidence:    check.InfrastructureEvidence,
 		}
 	}
 	state.Observed = nil
@@ -212,8 +216,8 @@ func (b *infrastructureRerunBudget) spend(check scm.Check, checks []scm.Check, h
 	return state.Used
 }
 
-func (b *infrastructureRerunBudget) firstFailure(headSHA, baseBranch string) (infrastructureFailureRecord, bool) {
-	state, ok := b.Candidates[infrastructureCandidateKey(headSHA, baseBranch)]
+func (b *infrastructureRerunBudget) firstFailure(headSHA, baseSHA string) (infrastructureFailureRecord, bool) {
+	state, ok := b.Candidates[infrastructureCandidateKey(headSHA, baseSHA)]
 	return state.FirstFailure, ok && state.FirstFailure.Name != ""
 }
 
@@ -240,6 +244,44 @@ func (b *infrastructureRerunBudget) unmarshal(encoded string) error {
 	if b.Candidates == nil {
 		b.Candidates = map[string]infrastructureCandidateRerun{}
 	}
+	for key, state := range b.Candidates {
+		if err := validateInfrastructureCandidate(key, state); err != nil {
+			return fmt.Errorf("unmarshal infrastructure rerun budget: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateInfrastructureCandidate(key string, state infrastructureCandidateRerun) error {
+	first := state.FirstFailure
+	nonEmpty := []string{state.Group, first.Name, first.Link, first.Reason, first.HeadSHA, first.BaseBranch, first.BaseSHA, first.Evidence.ProviderRunID}
+	for _, value := range nonEmpty {
+		if strings.TrimSpace(value) == "" || strings.ContainsRune(value, '\x00') {
+			return fmt.Errorf("invalid candidate %q", key)
+		}
+	}
+	if key != infrastructureCandidateKey(first.HeadSHA, first.BaseSHA) || state.Used != 1 || first.Evidence.Attempt != 1 || len(first.Evidence.LogJobIDs) == 0 || state.GraceRemaining < 0 || state.GraceRemaining > rerunRollupGracePolls || len(state.Observed) == 0 {
+		return fmt.Errorf("invalid candidate %q", key)
+	}
+	seenJobs := map[int64]bool{}
+	for _, jobID := range first.Evidence.LogJobIDs {
+		if jobID <= 0 || seenJobs[jobID] {
+			return fmt.Errorf("invalid evidence job for candidate %q", key)
+		}
+		seenJobs[jobID] = true
+	}
+	seenArtifacts := map[int64]bool{}
+	for _, artifact := range first.Evidence.Artifacts {
+		if artifact.ID <= 0 || seenArtifacts[artifact.ID] || strings.TrimSpace(artifact.Name) == "" || strings.ContainsRune(artifact.Name, '\x00') {
+			return fmt.Errorf("invalid artifact receipt for candidate %q", key)
+		}
+		seenArtifacts[artifact.ID] = true
+	}
+	for _, observed := range state.Observed {
+		if strings.TrimSpace(observed.Name) == "" || strings.TrimSpace(observed.Link) == "" || strings.ContainsRune(observed.Name, '\x00') || strings.ContainsRune(observed.Link, '\x00') {
+			return fmt.Errorf("invalid observation for candidate %q", key)
+		}
+	}
 	return nil
 }
 
@@ -247,8 +289,8 @@ func (b *infrastructureRerunBudget) unmarshal(encoded string) error {
 // provider still publishes the pre-rerun rollup. A changed completion/link is a
 // new attempt and leaves this grace immediately; missing observations receive
 // the same finite grace as cancellation reruns.
-func (b *infrastructureRerunBudget) awaitingFailureKeys(checks []scm.Check, headSHA, baseBranch string) map[string]bool {
-	key := infrastructureCandidateKey(headSHA, baseBranch)
+func (b *infrastructureRerunBudget) awaitingFailureKeys(checks []scm.Check, headSHA, baseSHA string) map[string]bool {
+	key := infrastructureCandidateKey(headSHA, baseSHA)
 	state, ok := b.Candidates[key]
 	if !ok || state.GraceRemaining <= 0 || len(state.Observed) == 0 {
 		return nil
@@ -610,18 +652,18 @@ func transientRerunCandidates(checks []scm.Check, budget *checkRerunBudget, limi
 // proven infrastructure class and the same provider group; a genuine, unknown,
 // cancelled, timed-out, or unrelated failure blocks the retry rather than being
 // masked by it.
-func infrastructureRerunCandidates(checks []scm.Check, budget *infrastructureRerunBudget, limit int, headSHA, baseBranch string) []scm.Check {
-	if limit <= 0 || budget.used(headSHA, baseBranch) >= limit {
+func infrastructureRerunCandidates(checks []scm.Check, budget *infrastructureRerunBudget, limit int, headSHA, baseSHA string) []scm.Check {
+	if limit <= 0 || strings.TrimSpace(headSHA) == "" || strings.TrimSpace(baseSHA) == "" || budget.used(headSHA, baseSHA) >= limit {
 		return nil
 	}
 	var candidate *scm.Check
 	group := ""
 	for i := range checks {
 		check := &checks[i]
-		if !checkFailedTerminally(*check) {
+		if check.Bucket == scm.CheckBucketPass {
 			continue
 		}
-		if classifyCheckFailure(*check) != classInfrastructure || strings.TrimSpace(check.InfrastructureGroup) == "" {
+		if !checkFailedTerminally(*check) || classifyCheckFailure(*check) != classInfrastructure || strings.TrimSpace(check.InfrastructureGroup) == "" || !check.InfrastructureRerunSafe || check.InfrastructureHeadSHA != strings.TrimSpace(headSHA) || check.InfrastructureBaseSHA != strings.TrimSpace(baseSHA) {
 			return nil
 		}
 		if group == "" {
@@ -637,6 +679,17 @@ func infrastructureRerunCandidates(checks []scm.Check, budget *infrastructureRer
 		return nil
 	}
 	return []scm.Check{*candidate}
+}
+
+func infrastructureFailuresWithoutExactRerun(checks []scm.Check) []string {
+	var names []string
+	for _, check := range checks {
+		if checkFailedTerminally(check) && check.InfrastructureFailure && !check.InfrastructureRerunSafe {
+			names = append(names, check.Name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // mergeCheckNames appends the names in extra that base does not already carry.
@@ -673,10 +726,11 @@ func mergeCheckNames(base, extra []string) []string {
 // Every failure path here falls back to the behavior this policy replaces: no
 // rerun, and the failure escalates exactly as it would without it.
 // loadRerunBudget restores the durable rerun budget for this run. A run that
-// never spent one, or a database that cannot be read, leaves the in-memory
-// budget as it is: the failure direction is a fresh budget, which the
-// reservation write below then re-establishes.
+// never spent one restores an empty but available budget. An unreadable or
+// invalid infrastructure section is non-admitting; otherwise recovery could
+// turn a previously spent candidate into a fresh allowance.
 func (s *CIStep) loadRerunBudget(sctx *pipeline.StepContext) {
+	s.infrastructureStateAvailable = false
 	if sctx.DB == nil || sctx.Run == nil {
 		return
 	}
@@ -690,7 +744,9 @@ func (s *CIStep) loadRerunBudget(sctx *pipeline.StepContext) {
 	}
 	if err := s.infrastructureReruns.unmarshal(encoded); err != nil {
 		sctx.Log(fmt.Sprintf("warning: could not restore the persisted infrastructure rerun budget: %v", err))
+		return
 	}
+	s.infrastructureStateAvailable = true
 }
 
 // persistRerunBudget writes the rerun budget so a recovered run resumes with
@@ -805,14 +861,18 @@ func (s *CIStep) rerunInfrastructureChecks(sctx *pipeline.StepContext, host scm.
 		return false, nil
 	}
 	rerunner, ok := host.(scm.CheckRerunner)
-	if !ok {
+	if !ok || !s.infrastructureStateAvailable || pr == nil || strings.TrimSpace(pr.BaseSHA) == "" {
 		return false, nil
 	}
-	candidates := infrastructureRerunCandidates(checks, &s.infrastructureReruns, limit, sctx.Run.HeadSHA, pr.BaseBranch)
+	candidates := infrastructureRerunCandidates(checks, &s.infrastructureReruns, limit, sctx.Run.HeadSHA, pr.BaseSHA)
 	if len(candidates) == 0 {
 		return false, nil
 	}
-	published, err := publishedBranchHead(sctx)
+	publishedHead := publishedBranchHead
+	if s.publishedHead != nil {
+		publishedHead = s.publishedHead
+	}
+	published, err := publishedHead(sctx)
 	if err != nil {
 		sctx.Log(fmt.Sprintf("warning: could not verify the published branch head before re-running infrastructure failure: %v", err))
 		return false, nil
@@ -821,8 +881,17 @@ func (s *CIStep) rerunInfrastructureChecks(sctx *pipeline.StepContext, host scm.
 		sctx.Log(fmt.Sprintf("published branch head moved (expected %s, observed %s); not re-running infrastructure failure", shortSHA(sctx.Run.HeadSHA), shortSHA(published)))
 		return false, ciRerunHeadMismatchOutcome(sctx.Run.HeadSHA, published)
 	}
+	baseTip, resolved := s.currentBaseBranchTip(sctx, pr.BaseBranch)
+	if !resolved || strings.TrimSpace(baseTip) == "" {
+		sctx.Log("warning: could not verify the published base commit before re-running infrastructure failure")
+		return false, nil
+	}
 	check := candidates[0]
-	used := s.infrastructureReruns.spend(check, checks, sctx.Run.HeadSHA, pr.BaseBranch)
+	if baseTip != check.InfrastructureBaseSHA || baseTip != pr.BaseSHA {
+		sctx.Log(fmt.Sprintf("published base branch moved (expected %s, observed %s); not re-running infrastructure failure", shortSHA(check.InfrastructureBaseSHA), shortSHA(baseTip)))
+		return false, nil
+	}
+	used := s.infrastructureReruns.spend(check, checks, sctx.Run.HeadSHA, pr.BaseBranch, pr.BaseSHA)
 	if err := s.persistRerunBudget(sctx); err != nil {
 		sctx.Log(fmt.Sprintf("warning: could not reserve infrastructure rerun budget for %s: %v", check.Name, err))
 		return false, nil
@@ -833,6 +902,17 @@ func (s *CIStep) rerunInfrastructureChecks(sctx *pipeline.StepContext, host scm.
 	}
 	sctx.Log(fmt.Sprintf("re-running CI check %s (%d/%d): %s", check.Name, used, limit, check.InfrastructureReason))
 	return true, nil
+}
+
+func (s *CIStep) currentBaseBranchTip(sctx *pipeline.StepContext, baseBranch string) (string, bool) {
+	ctx, cancel := context.WithTimeout(sctx.Ctx, defaultBaseBranchTipResolveWindow)
+	defer cancel()
+	if s.baseBranchTip != nil {
+		return s.baseBranchTip(ctx)
+	}
+	bounded := *sctx
+	bounded.Ctx = ctx
+	return resolveRunDefaultBranchTip(ctx, &bounded, sctx.Run.BaseSHA, baseBranch)
 }
 
 // publishedBranchHead returns the commit the run's branch points at on the push
@@ -942,35 +1022,34 @@ func markArtifactInfrastructureFailures(sctx *pipeline.StepContext, host scm.Hos
 	if !ok {
 		return
 	}
-	var failedIdx []int
+	hasFailure := false
 	for i := range checks {
-		if checks[i].Failing() {
-			failedIdx = append(failedIdx, i)
-		}
+		hasFailure = hasFailure || checks[i].Failing()
 	}
-	if len(failedIdx) == 0 {
+	if !hasFailure {
 		return
 	}
-	failed := make([]scm.Check, len(failedIdx))
-	for i, idx := range failedIdx {
-		failed[i] = checks[idx]
-	}
-	classified, err := detector.ArtifactInfrastructureFailures(sctx.Ctx, pr, failed)
+	classified, err := detector.ArtifactInfrastructureFailures(sctx.Ctx, pr, checks)
 	if err != nil {
 		sctx.Log(fmt.Sprintf("warning: could not classify artifact infrastructure failures: %v", err))
 		return
 	}
-	if len(classified) != len(failed) {
-		sctx.Log(fmt.Sprintf("warning: artifact infrastructure classifier returned %d results for %d checks; ignoring", len(classified), len(failed)))
+	if len(classified) != len(checks) {
+		sctx.Log(fmt.Sprintf("warning: artifact infrastructure classifier returned %d results for %d checks; ignoring", len(classified), len(checks)))
 		return
 	}
-	for i, idx := range failedIdx {
+	for idx := range checks {
+		i := idx
 		if !classified[i].Retryable || strings.TrimSpace(classified[i].Group) == "" {
 			continue
 		}
 		checks[idx].InfrastructureFailure = true
 		checks[idx].InfrastructureGroup = classified[i].Group
 		checks[idx].InfrastructureReason = classified[i].Reason
+		checks[idx].InfrastructureHeadSHA = classified[i].HeadSHA
+		checks[idx].InfrastructureBaseSHA = classified[i].BaseSHA
+		checks[idx].InfrastructureRerunSafe = classified[i].RerunSafe
+		checks[idx].InfrastructureEvidence = classified[i].Evidence
 	}
 }
 
