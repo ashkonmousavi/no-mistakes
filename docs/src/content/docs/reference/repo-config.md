@@ -478,7 +478,7 @@ Reruns are skipped when:
 
 ### ci.rerun_infrastructure
 
-Reserved candidate-wide budget for an independently proven artifact-transfer infrastructure failure. GitHub classification is implemented, but dispatch remains disabled because GitHub's retry primitives also run dependent jobs and therefore exceed the approved failed-jobs-only boundary.
+Candidate-wide budget for an independently proven artifact-transfer infrastructure failure family. GitHub reruns the initiating failed jobs and their dependents while reusing successful producers; this fork dispatches only when the exact XAU workflow and its in-workflow retry verifier prove that complete shape.
 
 | | |
 |---|---|
@@ -487,20 +487,22 @@ Reserved candidate-wide budget for an independently proven artifact-transfer inf
 | Range | `0` to `1`; values outside it are clamped |
 | Trust | Read only from the trusted default branch |
 
-This budget is separate from `ci.rerun_transient`: enabling cancellation retries does not enable this classifier, and infrastructure classification never spends a cancellation allowance. The default remains `0`; setting `1` permits the extra read-only classification calls but does not issue a GitHub rerun.
+This budget is separate from `ci.rerun_transient`: enabling cancellation retries does not enable this classifier, and infrastructure classification never spends a cancellation allowance. The default remains `0`. Setting `1` permits the extra read-only classification calls and permits one GitHub rerun only after every dispatch condition below is proven.
 
 With a value of `1`, a failed GitHub Actions check qualifies only when all of these are proven:
 
 - The workflow run is its first attempt and belongs to the same pull request, exact head SHA, current forge base branch, and freshly resolved base SHA that the CI step is certifying.
-- The attempt-specific jobs endpoint is fully paginated and its page counts, complete job population, exact check/job IDs, head SHA, terminal status, and conclusions agree. Unknown, skipped, pending, or unrepresented siblings refuse classification.
-- Structured workflow-job data reports every non-artifact step successful. The only failed step or steps are artifact upload/download steps; skipped, cancelled, timed-out, missing, unknown, test, and lint outcomes fail closed.
-- Each failed structured step is paired with its own ordered job-log `Run` group. That group must invoke `actions/upload-artifact` or `actions/download-artifact` and carry its own `FinalizeArtifact` or `ListArtifacts` HTTP 403 or 5xx. A recovered error from another step cannot qualify it. Raw logs are used for classification only and are never stored.
-- Reading each qualifying attempt-1 job log plus the complete, non-expired workflow-run artifact inventory produces a bounded retention receipt containing only the run/attempt, job IDs, and artifact IDs/names.
+- The attempt-specific jobs endpoint is fully paginated and its page counts, complete job population, exact check/job IDs, head SHA, terminal status, and conclusions agree. The joined XAU population is exact: five browser journey cells (`chromium`, `firefox`, and `webkit` desktop plus `chromium` and `webkit` touch390), four repository shards, build, checks, fan-in, retry guard, and reuse lookup. Missing, duplicate, wrong-engine, pending, or unrepresented members refuse.
+- The first failed work in each initiating job is a pinned artifact upload/download operation. Each such step is paired with its own ordered job-log `Run` group and carries its own terminal `FinalizeArtifact` or `ListArtifacts` HTTP 403/5xx. A recovered error from another step cannot qualify it.
+- Required work skipped after the initiating service error, and only the strict no-files upload consequence caused by that skipped work, is recorded as dependent work that must pass on recovery. An executed test/lint failure, cancellation, timeout, unknown state, or any other failed step refuses the family. A failed `repository` fan-in is admitted only as a dependent of a classified upstream failure.
+- GitHub's failed-jobs rerun may not include a job that already succeeded. Skipped jobs must be downstream of an initiating failure, except for exactly one nondependent `pull_request`-only omission: the push-only `look for a proving pull request with the same pushed tree` job.
+- Every non-skipped job must have passed `Admit only the original run or one verified infrastructure retry`. Both `.github/workflows/xau-ci.yml` and `scripts/ci_check_infrastructure_retry.py` must already exist with identical blob identities on the trusted base and candidate, so a contributor branch cannot self-authorize the rerun.
+- Reading every failed attempt-1 job log plus the complete non-expired artifact inventory produces a bounded receipt containing the run/attempt, log job IDs, dependent job/step obligations, and artifact IDs/names/digests/run/head provenance. Successful producer artifacts are reused; raw logs are never stored.
 - Every failing check in the poll carries the same independently proven provider group. A genuine or unknown sibling, a merge conflict, a different workflow run, or unreadable/malformed evidence suppresses the retry.
 
-The durable state is keyed by exact head and base commits, is structurally validated on recovery, and is non-admitting when the database read, decode, or reservation fails. A spent candidate stays spent even when a different workflow group later fails. Any future exact-scope provider dispatch must first re-read both the published feature head and the base tip, then persist the allowance and retention receipt before its request.
+The durable state is keyed by exact head and base commits, is structurally validated on recovery, and is non-admitting when the database read, decode, or reservation fails. A spent candidate stays spent even when a different workflow group later fails. Dispatch first re-reads both the published feature head and base tip, persists the allowance and receipt, then issues exactly one `gh run rerun RUN_ID --failed` request.
 
-GitHub dispatch is intentionally unavailable: `gh run rerun --failed` and job-level reruns include dependent jobs. The attempt jobs API does not expose enough dependency evidence to prove that wider population is authorized, so no provider mutation is made and a proven occurrence is reported for manual resolution rather than sent to the CI code-fix agent. A later implementation must supply an exact failed-jobs-only primitive or a separately approved broader boundary before this setting can become operational.
+The route remains non-dispatching until the joined XAU workflow/verifier is on the trusted base and the runtime containing this contract is installed. All non-XAU workflows, changed retry-control files, incomplete provenance, or unmatched topologies remain classified only for an explicit failure rather than sent to the CI code-fix agent.
 
 With no trusted repository value, the operator's [`ci.rerun_infrastructure`](/no-mistakes/reference/global-config/#cirerun_infrastructure) applies, then the built-in default of `0`.
 

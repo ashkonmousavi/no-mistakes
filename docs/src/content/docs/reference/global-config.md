@@ -618,7 +618,7 @@ The per-repo [`ci.rerun_transient`](/no-mistakes/reference/repo-config/#cirerun_
 
 ### ci.rerun_infrastructure
 
-Reserved candidate-wide allowance for the artifact-infrastructure classifier described by the [repository setting](/no-mistakes/reference/repo-config/#cirerun_infrastructure). It is independent of `ci.rerun_transient`. GitHub dispatch remains disabled because its retry primitives include dependent jobs beyond the approved failed-job set.
+Candidate-wide allowance for the artifact-infrastructure classifier described by the [repository setting](/no-mistakes/reference/repo-config/#cirerun_infrastructure). It is independent of `ci.rerun_transient`. GitHub dispatch is available only for the exact joined XAU dependency-family contract described there; every other topology remains non-dispatching.
 
 | | |
 |---|---|

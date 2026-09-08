@@ -1252,28 +1252,38 @@ func TestRerunCheckTargetsJobFromCheckLink(t *testing.T) {
 	}
 }
 
-// One infrastructure allowance covers every failed artifact job in the
-// provider run. Targeting only the representative job would leave same-group
-// failures untouched while the pipeline temporarily suppresses their old
-// rollup, so this class must use GitHub's failed-jobs rerun primitive once.
-func TestRerunCheck_ArtifactInfrastructureRefusesProviderDependentJobWidening(t *testing.T) {
+// One infrastructure allowance covers the classified failed jobs and their
+// provider-rerun dependents. The safe bit is issued only by the joined topology
+// proof; without it no provider mutation occurs.
+func TestRerunCheck_ArtifactInfrastructureRequiresJoinedDependencyProof(t *testing.T) {
 	t.Parallel()
 
-	var recorded [][]string
-	host := New(recordingCmdFactory("", &recorded), nil, "", "test/repo")
-	check := scm.Check{
-		Name:                  "browser",
-		Bucket:                scm.CheckBucketFail,
-		State:                 "FAILURE",
-		Link:                  "https://github.com/test/repo/actions/runs/900/job/901",
-		InfrastructureFailure: true,
-		InfrastructureGroup:   "github-actions-run:900",
-	}
-	if err := host.RerunCheck(context.Background(), &scm.PR{Number: "123"}, check); err == nil {
-		t.Fatal("infrastructure rerun widened to GitHub's failed jobs and dependents")
-	}
-	if len(recorded) != 0 {
-		t.Fatalf("provider invoked despite disabled infrastructure route: %v", recorded)
+	for _, safe := range []bool{false, true} {
+		var recorded [][]string
+		host := New(recordingCmdFactory("", &recorded), nil, "", "test/repo")
+		check := scm.Check{
+			Name:                    "browser",
+			Bucket:                  scm.CheckBucketFail,
+			State:                   "FAILURE",
+			Link:                    "https://github.com/test/repo/actions/runs/900/job/901",
+			InfrastructureFailure:   true,
+			InfrastructureGroup:     "github-actions-run:900",
+			InfrastructureRerunSafe: safe,
+		}
+		err := host.RerunCheck(context.Background(), &scm.PR{Number: "123"}, check)
+		if !safe {
+			if err == nil || len(recorded) != 0 {
+				t.Fatalf("unproved dependency family reached provider: err=%v calls=%v", err, recorded)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("joined dependency family rerun failed: %v", err)
+		}
+		want := []string{"gh", "run", "rerun", "900", "--failed", "--repo", "test/repo"}
+		if len(recorded) != 1 || strings.Join(recorded[0], " ") != strings.Join(want, " ") {
+			t.Fatalf("rerun argv = %v, want %v", recorded, want)
+		}
 	}
 }
 
@@ -1460,6 +1470,360 @@ const (
 	downloadArtifact403Record = "##[error]Unable to download artifact(s): Failed to ListArtifacts: Received non-retryable error: Failed request: (403) Forbidden"
 	downloadArtifact503Record = "##[error]Unable to download artifact(s): Failed to ListArtifacts: Failed to make request after 5 attempts: Failed request: (503) Service Unavailable"
 )
+
+func observedShardThreeFailure() githubRunJob {
+	return githubRunJob{
+		ID: 102144122733, HeadSHA: "head-1", Name: "repository shard 3 of 4", Status: "completed", Conclusion: "failure",
+		Steps: []githubJobStep{
+			{Name: "Set up job", Number: 1, Conclusion: "success"},
+			{Name: "Set up runner", Number: 2, Conclusion: "success"},
+			{Name: "Check out exact event head", Number: 3, Conclusion: "success"},
+			{Name: "Set up Python 3.14.7", Number: 4, Conclusion: "success"},
+			{Name: "Set up Node 20.19.0", Number: 5, Conclusion: "success"},
+			{Name: "Install pinned repository tools", Number: 6, Conclusion: "success"},
+			{Name: "Verify immutable event head", Number: 7, Conclusion: "success"},
+			{Name: "Download the sealed Dashboard V2 distribution", Number: 8, Conclusion: "failure"},
+			{Name: "Verify the downloaded distribution before any test runs", Number: 9, Conclusion: "skipped"},
+			{Name: "Prepare candidate-bound browser evidence", Number: 10, Conclusion: "skipped"},
+			{Name: "Run this shard of the battery and classify routine skips", Number: 11, Conclusion: "skipped"},
+			{Name: "Upload retained shard browser evidence", Number: 12, Conclusion: "failure"},
+			{Name: "Upload this shard's manifest and log", Number: 13, Conclusion: "skipped"},
+			{Name: "Print verify log tail on failure", Number: 14, Conclusion: "success"},
+			{Name: "Upload verify log artifact on failure", Number: 15, Conclusion: "success"},
+			{Name: "Prove checkout cleanliness", Number: 16, Conclusion: "skipped"},
+			{Name: "Post Set up Node 20.19.0", Number: 29, Conclusion: "skipped"},
+			{Name: "Post Set up Python 3.14.7", Number: 30, Conclusion: "skipped"},
+			{Name: "Post Check out exact event head", Number: 31, Conclusion: "success"},
+			{Name: "Complete runner", Number: 32, Conclusion: "success"},
+			{Name: "Complete job", Number: 33, Conclusion: "success"},
+		},
+	}
+}
+
+func observedShardThreeLogs() string {
+	return strings.Join([]string{
+		"##[group]Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+		"##[group]Run actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+		"##[group]Run actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+		"##[group]Run install pinned repository tools",
+		"##[group]Run verify immutable event head",
+		"##[group]Run actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+		downloadArtifact403Record,
+		"##[group]Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+		"##[error]No files were found with the provided path: /tmp/evidence. No artifacts will be uploaded.",
+		"##[group]Run print verify log tail",
+		"##[group]Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+	}, "\n") + "\n"
+}
+
+// Run 34250655836 / job 102144122733 is the captured acceptance case for a
+// mid-job ListArtifacts outage. Its later required steps are retry dependents,
+// not evidence that a product test failed; they must run successfully when the
+// same failed job is recovered.
+func TestArtifactFailureDisposition_ObservedDownloadFailureMarksLaterRequiredStepsAsDependents(t *testing.T) {
+	t.Parallel()
+
+	disposition, ok := artifactFailureDisposition(observedShardThreeFailure(), observedShardThreeLogs())
+	if !ok || !disposition.Initiating {
+		t.Fatalf("observed job disposition = %+v, %v; want initiating infrastructure failure", disposition, ok)
+	}
+	want := []string{
+		"Verify the downloaded distribution before any test runs",
+		"Prepare candidate-bound browser evidence",
+		"Run this shard of the battery and classify routine skips",
+		"Upload retained shard browser evidence",
+		"Upload this shard's manifest and log",
+		"Prove checkout cleanliness",
+	}
+	if len(disposition.DependentSteps) != len(want) {
+		t.Fatalf("dependent steps = %+v, want %v", disposition.DependentSteps, want)
+	}
+	for i := range want {
+		if disposition.DependentSteps[i].Name != want[i] {
+			t.Fatalf("dependent step %d = %+v, want %q", i, disposition.DependentSteps[i], want[i])
+		}
+	}
+}
+
+func TestArtifactFailureDisposition_RealTestFailureAfterInitiatingErrorRefuses(t *testing.T) {
+	t.Parallel()
+
+	job := observedShardThreeFailure()
+	for i := range job.Steps {
+		if job.Steps[i].Name == "Run this shard of the battery and classify routine skips" {
+			job.Steps[i].Conclusion = "failure"
+		}
+	}
+	if got, ok := artifactFailureDisposition(job, observedShardThreeLogs()); ok {
+		t.Fatalf("real test failure admitted after artifact error: %+v", got)
+	}
+}
+
+func joinedXAUJobPopulation() []githubRunJob {
+	names := []string{
+		"verify original run or bounded infrastructure retry",
+		"build and seal the Dashboard V2 distribution",
+		"journey smoke (chromium / desktop)",
+		"journey smoke (firefox / desktop)",
+		"journey smoke (webkit / desktop)",
+		"journey smoke (chromium / touch390)",
+		"journey smoke (webkit / touch390)",
+		"look for a proving pull request with the same pushed tree",
+		"repository shard 1 of 4",
+		"repository shard 2 of 4",
+		"repository shard 3 of 4",
+		"repository shard 4 of 4",
+		"repository checks",
+		"repository",
+	}
+	jobs := make([]githubRunJob, len(names))
+	for i, name := range names {
+		jobs[i] = githubRunJob{ID: i + 1, HeadSHA: "head-1", Name: name, Status: "completed", Conclusion: "success", Steps: []githubJobStep{{Name: boundedInfrastructureRetryStep, Number: 2, Conclusion: "success"}}}
+	}
+	jobs[7].Conclusion = "skipped"
+	jobs[7].Steps = nil
+	return jobs
+}
+
+// PR 417 at 887f65f06 owns five distinct browser cells. The fork must admit
+// exactly that population and the one event-bound PR reuse-check omission;
+// missing, duplicated, or substituted browser cells fail closed.
+func TestJoinedXAUArtifactRetryTopology_AcceptsFiveCellsAndRejectsPopulationDrift(t *testing.T) {
+	t.Parallel()
+
+	valid := joinedXAUJobPopulation()
+	if !joinedXAUArtifactRetryTopology("pull_request", valid) {
+		t.Fatal("complete five-cell PR topology was rejected")
+	}
+	for name, mutate := range map[string]func([]githubRunJob) []githubRunJob{
+		"missing cell": func(jobs []githubRunJob) []githubRunJob { return jobs[:len(jobs)-1] },
+		"duplicate cell": func(jobs []githubRunJob) []githubRunJob {
+			jobs[3].Name = jobs[2].Name
+			return jobs
+		},
+		"wrong engine": func(jobs []githubRunJob) []githubRunJob {
+			jobs[4].Name = "journey smoke (edge / desktop)"
+			return jobs
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			jobs := append([]githubRunJob(nil), valid...)
+			if joinedXAUArtifactRetryTopology("pull_request", mutate(jobs)) {
+				t.Fatalf("%s topology drift was admitted", name)
+			}
+		})
+	}
+	if joinedXAUArtifactRetryTopology("push", valid) {
+		t.Fatal("PR-only reuse-check omission was admitted on push")
+	}
+	push := append([]githubRunJob(nil), valid...)
+	push[7].Conclusion = "success"
+	push[7].Steps = []githubJobStep{{Name: boundedInfrastructureRetryStep, Number: 2, Conclusion: "success"}}
+	if !joinedXAUArtifactRetryTopology("push", push) {
+		t.Fatal("complete push topology with an executed reuse check was rejected")
+	}
+	if joinedXAUArtifactRetryTopology("schedule", push) {
+		t.Fatal("an unsupported event was admitted by the joined topology")
+	}
+}
+
+func TestJoinedXAURetryDependentNames_BuildFailureSelectsEveryNonSuccessfulConsumer(t *testing.T) {
+	t.Parallel()
+
+	dependents := joinedXAURetryDependentNames(map[string]bool{"build and seal the Dashboard V2 distribution": true})
+	want := []string{
+		"journey smoke (chromium / desktop)", "journey smoke (firefox / desktop)", "journey smoke (webkit / desktop)",
+		"journey smoke (chromium / touch390)", "journey smoke (webkit / touch390)",
+		"repository shard 1 of 4", "repository shard 2 of 4", "repository shard 3 of 4", "repository shard 4 of 4", "repository",
+	}
+	if len(dependents) != len(want) {
+		t.Fatalf("build dependents = %v, want %v", dependents, want)
+	}
+	for _, name := range want {
+		if !dependents[name] {
+			t.Fatalf("build dependency closure omitted %q: %v", name, dependents)
+		}
+	}
+	if dependents["repository checks"] || dependents[joinedXAUPROnlyOmittedJob] {
+		t.Fatalf("independent successful producer entered retry closure: %v", dependents)
+	}
+}
+
+// GitHub's failed-job rerun expands through the workflow graph. When the
+// successful producer guard is followed by an initiating build upload outage,
+// every skipped consumer is part of that same bounded recovery family while
+// the independent repository-check producer remains untouched.
+func TestArtifactInfrastructureFailures_BuildOutageMarksEverySkippedConsumerAsDependent(t *testing.T) {
+	t.Parallel()
+
+	jobs := joinedXAUJobPopulation()
+	jobs[1] = githubRunJob{ID: 2, HeadSHA: "head-1", Name: "build and seal the Dashboard V2 distribution", Status: "completed", Conclusion: "failure", Steps: []githubJobStep{
+		{Name: boundedInfrastructureRetryStep, Number: 2, Conclusion: "success"},
+		{Name: "Upload the sealed distribution", Number: 3, Conclusion: "failure"},
+	}}
+	for _, index := range []int{2, 3, 4, 5, 6, 8, 9, 10, 11, 13} {
+		jobs[index].Conclusion = "skipped"
+		jobs[index].Steps = nil
+	}
+	jobsJSON, err := json.Marshal(jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := make([]scm.Check, len(jobs))
+	for i, job := range jobs {
+		bucket, state := scm.CheckBucketPass, "SUCCESS"
+		switch job.Conclusion {
+		case "failure":
+			bucket, state = scm.CheckBucketFail, "FAILURE"
+		case "skipped":
+			bucket, state = scm.CheckBucketSkip, "SKIPPED"
+		}
+		checks[i] = scm.Check{Name: job.Name, Bucket: bucket, State: state, Link: fmt.Sprintf("https://github.com/test/repo/actions/runs/1/job/%d", job.ID)}
+	}
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh api --method GET repos/test/repo/actions/runs/1":                                                    {stdout: `{"id":1,"event":"pull_request","head_sha":"head-1","run_attempt":1,"pull_requests":[{"number":42,"head":{"sha":"head-1"},"base":{"ref":"main","sha":"base-1"}}]}`},
+		"gh api --method GET repos/test/repo/actions/runs/1/attempts/1/jobs -f per_page=100 --paginate --slurp": {stdout: `[{"total_count":14,"jobs":` + string(jobsJSON) + `}]`},
+		"gh api --method GET repos/test/repo/actions/jobs/2/logs":                                               {stdout: "##[group]Run retry guard\n##[group]Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02\n" + uploadArtifact503Record + "\n"},
+		"gh api --method GET repos/test/repo/actions/runs/1/artifacts -f per_page=100 --paginate --slurp":       {stdout: `[{"total_count":0,"artifacts":[]}]`},
+		"gh api --method GET repos/test/repo/contents/.github/workflows/xau-ci.yml -f ref=base-1":               {stdout: `{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"file"}`},
+		"gh api --method GET repos/test/repo/contents/.github/workflows/xau-ci.yml -f ref=head-1":               {stdout: `{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"file"}`},
+		"gh api --method GET repos/test/repo/contents/scripts/ci_check_infrastructure_retry.py -f ref=base-1":   {stdout: `{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","type":"file"}`},
+		"gh api --method GET repos/test/repo/contents/scripts/ci_check_infrastructure_retry.py -f ref=head-1":   {stdout: `{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","type":"file"}`},
+	}), nil, "", "test/repo")
+
+	got, err := host.ArtifactInfrastructureFailures(context.Background(), &scm.PR{Number: "42", HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, checks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got[1].Retryable || !got[1].RerunSafe {
+		t.Fatalf("initiating build disposition = %+v, want safe retry", got[1])
+	}
+	for _, index := range []int{2, 3, 4, 5, 6, 8, 9, 10, 11, 13} {
+		if !got[index].RerunDependent || !got[index].RerunSafe || got[index].Group != got[1].Group {
+			t.Fatalf("dependent %q disposition = %+v, want same safe group as build", checks[index].Name, got[index])
+		}
+	}
+	if !got[7].RerunOmission || got[12].Group != "" {
+		t.Fatalf("event omission or independent producer misclassified: omission=%+v repository_checks=%+v", got[7], got[12])
+	}
+}
+
+// The joined contract classifies the two initiating shard failures and the
+// always-running repository fan-in as one retry set. GitHub then reruns those
+// failed jobs and their dependents; successful producers remain untouched and
+// their attempt-one artifacts carry immutable provenance into the receipt.
+func TestArtifactInfrastructureFailures_JoinedFiveCellDependencyFamilyIsOneSafeGroup(t *testing.T) {
+	t.Parallel()
+
+	jobs := joinedXAUJobPopulation()
+	failedShard := func(name string, id int) githubRunJob {
+		return githubRunJob{ID: id, HeadSHA: "head-1", Name: name, Status: "completed", Conclusion: "failure", Steps: []githubJobStep{
+			{Name: boundedInfrastructureRetryStep, Number: 2, Conclusion: "success"},
+			{Name: "Install pinned repository tools", Number: 3, Conclusion: "success"},
+			{Name: "Download the sealed Dashboard V2 distribution", Number: 4, Conclusion: "failure"},
+			{Name: "Verify the downloaded distribution before any test runs", Number: 5, Conclusion: "skipped"},
+			{Name: "Run this shard of the battery and classify routine skips", Number: 6, Conclusion: "skipped"},
+			{Name: "Upload retained shard browser evidence", Number: 7, Conclusion: "failure"},
+			{Name: "Upload this shard's manifest and log", Number: 8, Conclusion: "skipped"},
+		}}
+	}
+	jobs[10] = failedShard("repository shard 3 of 4", 11)
+	jobs[11] = failedShard("repository shard 4 of 4", 12)
+	jobs[13] = githubRunJob{ID: 14, HeadSHA: "head-1", Name: "repository", Status: "completed", Conclusion: "failure", Steps: []githubJobStep{
+		{Name: boundedInfrastructureRetryStep, Number: 2, Conclusion: "success"},
+		{Name: "Download every shard's manifest and log", Number: 3, Conclusion: "success"},
+		{Name: "Prove every shard ran and together covered the battery", Number: 4, Conclusion: "failure"},
+		{Name: "Upload full-lane proof artifact", Number: 5, Conclusion: "skipped"},
+	}}
+	jobsJSON, err := json.Marshal(jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := make([]scm.Check, len(jobs))
+	for i, job := range jobs {
+		bucket := scm.CheckBucketPass
+		state := "SUCCESS"
+		switch job.Conclusion {
+		case "failure":
+			bucket, state = scm.CheckBucketFail, "FAILURE"
+		case "skipped":
+			bucket, state = scm.CheckBucketSkip, "SKIPPED"
+		}
+		checks[i] = scm.Check{Name: job.Name, Bucket: bucket, State: state, Link: fmt.Sprintf("https://github.com/test/repo/actions/runs/1/job/%d", job.ID)}
+	}
+	shardLogs := strings.Join([]string{
+		"##[group]Run retry guard",
+		"##[group]Run install tools",
+		"##[group]Run actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+		downloadArtifact403Record,
+		"##[group]Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+		"##[error]No files were found with the provided path: /tmp/evidence. No artifacts will be uploaded.",
+	}, "\n") + "\n"
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh api --method GET repos/test/repo/actions/runs/1":                                                    {stdout: `{"id":1,"event":"pull_request","head_sha":"head-1","run_attempt":1,"pull_requests":[{"number":42,"head":{"sha":"head-1"},"base":{"ref":"main","sha":"base-1"}}]}`},
+		"gh api --method GET repos/test/repo/actions/runs/1/attempts/1/jobs -f per_page=100 --paginate --slurp": {stdout: `[{"total_count":14,"jobs":` + string(jobsJSON) + `}]`},
+		"gh api --method GET repos/test/repo/actions/jobs/11/logs":                                              {stdout: shardLogs},
+		"gh api --method GET repos/test/repo/actions/jobs/12/logs":                                              {stdout: shardLogs},
+		"gh api --method GET repos/test/repo/actions/jobs/14/logs":                                              {stdout: "##[group]Run retry guard\n##[group]Run actions/download-artifact@v4\n##[group]Run fan-in proof\n"},
+		"gh api --method GET repos/test/repo/actions/runs/1/artifacts -f per_page=100 --paginate --slurp":       {stdout: `[{"total_count":1,"artifacts":[{"id":91,"name":"dashboard-v2-dist-1","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expired":false,"workflow_run":{"id":1,"head_sha":"head-1"}}]}]`},
+		"gh api --method GET repos/test/repo/contents/.github/workflows/xau-ci.yml -f ref=base-1":               {stdout: `{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"file"}`},
+		"gh api --method GET repos/test/repo/contents/.github/workflows/xau-ci.yml -f ref=head-1":               {stdout: `{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"file"}`},
+		"gh api --method GET repos/test/repo/contents/scripts/ci_check_infrastructure_retry.py -f ref=base-1":   {stdout: `{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","type":"file"}`},
+		"gh api --method GET repos/test/repo/contents/scripts/ci_check_infrastructure_retry.py -f ref=head-1":   {stdout: `{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","type":"file"}`},
+	}), nil, "", "test/repo")
+
+	got, err := host.ArtifactInfrastructureFailures(context.Background(), &scm.PR{Number: "42", HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, checks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, index := range []int{10, 11, 13} {
+		if !got[index].Retryable || !got[index].RerunSafe || got[index].Group != "github-actions-run:1" {
+			t.Fatalf("failure %q disposition = %+v, want one safe group", checks[index].Name, got[index])
+		}
+	}
+	if !got[7].RerunOmission || got[7].Group != "github-actions-run:1" {
+		t.Fatalf("PR-only reuse omission = %+v, want group-bound omission", got[7])
+	}
+	receipt := got[10].Evidence
+	if len(receipt.LogJobIDs) != 3 || len(receipt.DependentJobs) != 1 || receipt.DependentJobs[0] != 14 || len(receipt.DependentSteps) != 10 {
+		t.Fatalf("dependency-family receipt = %+v", receipt)
+	}
+	if len(receipt.Artifacts) != 1 || receipt.Artifacts[0].Digest == "" || receipt.Artifacts[0].ProviderRunID != 1 || receipt.Artifacts[0].HeadSHA != "head-1" {
+		t.Fatalf("producer provenance receipt = %+v", receipt.Artifacts)
+	}
+}
+
+func TestXAURetryRuleLanded_RequiresIdenticalTrustedWorkflowAndVerifier(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		workflow string
+		verifier string
+		want     bool
+	}{
+		"identical landed rule":         {workflow: strings.Repeat("a", 40), verifier: strings.Repeat("b", 40), want: true},
+		"workflow changed on candidate": {workflow: strings.Repeat("c", 40), verifier: strings.Repeat("b", 40)},
+		"verifier changed on candidate": {workflow: strings.Repeat("a", 40), verifier: strings.Repeat("d", 40)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			baseWorkflow := strings.Repeat("a", 40)
+			baseVerifier := strings.Repeat("b", 40)
+			host := New(githubTestCmdFactory(map[string]githubTestResponse{
+				"gh api --method GET repos/test/repo/contents/.github/workflows/xau-ci.yml -f ref=base":             {stdout: fmt.Sprintf(`{"sha":%q,"type":"file"}`, baseWorkflow)},
+				"gh api --method GET repos/test/repo/contents/.github/workflows/xau-ci.yml -f ref=head":             {stdout: fmt.Sprintf(`{"sha":%q,"type":"file"}`, tc.workflow)},
+				"gh api --method GET repos/test/repo/contents/scripts/ci_check_infrastructure_retry.py -f ref=base": {stdout: fmt.Sprintf(`{"sha":%q,"type":"file"}`, baseVerifier)},
+				"gh api --method GET repos/test/repo/contents/scripts/ci_check_infrastructure_retry.py -f ref=head": {stdout: fmt.Sprintf(`{"sha":%q,"type":"file"}`, tc.verifier)},
+			}), nil, "", "test/repo")
+			got, err := host.xauRetryRuleLanded(context.Background(), "base", "head")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("xauRetryRuleLanded() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
 
 // An artifact action may fail after every repository-owned step passed. The
 // classifier must bind that narrow exception to the exact PR/head/base and the

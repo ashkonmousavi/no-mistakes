@@ -188,10 +188,10 @@ type Check struct {
 	// it can never be true for a genuine test or lint failure, whose job cleared
 	// setup and failed a later step.
 	PreRunFailure bool
-	// InfrastructureFailure marks a failed check whose provider proved that all
-	// repository-owned steps succeeded and only artifact-transfer infrastructure
-	// failed on the exact PR head/base candidate. It is distinct from
-	// PreRunFailure/cancellation so it can consume its own bounded budget.
+	// InfrastructureFailure marks a failed check in a provider-proven family
+	// initiated by artifact-transfer infrastructure on the exact PR head/base
+	// candidate. Required work after that error is retained as an explicit
+	// recovery dependency; a real test/lint failure refuses the whole family.
 	InfrastructureFailure bool
 	// InfrastructureGroup is the provider's opaque identity for the work one
 	// rerun request targets (for GitHub Actions, the workflow run). It prevents
@@ -206,7 +206,14 @@ type Check struct {
 	InfrastructureHeadSHA   string
 	InfrastructureBaseSHA   string
 	InfrastructureRerunSafe bool
-	InfrastructureEvidence  InfrastructureEvidenceReceipt
+	// InfrastructureRerunOmission marks the one provider job whose skipped
+	// conclusion is an event-bound member of an otherwise proven retry group.
+	// It never changes the check's visible skipped state.
+	InfrastructureRerunOmission bool
+	// InfrastructureRerunDependent marks a skipped job that the provider will
+	// execute because it is downstream of a classified initiating failure.
+	InfrastructureRerunDependent bool
+	InfrastructureEvidence       InfrastructureEvidenceReceipt
 }
 
 // Failing reports whether the check is in a failed bucket.
@@ -372,13 +379,15 @@ type PreRunFailureDetector interface {
 // provider's failure evidence satisfy the backend's narrow infrastructure
 // policy. Group identifies checks covered by one provider rerun request.
 type InfrastructureFailure struct {
-	Retryable bool
-	Group     string
-	Reason    string
-	HeadSHA   string
-	BaseSHA   string
-	RerunSafe bool
-	Evidence  InfrastructureEvidenceReceipt
+	Retryable      bool
+	RerunOmission  bool
+	RerunDependent bool
+	Group          string
+	Reason         string
+	HeadSHA        string
+	BaseSHA        string
+	RerunSafe      bool
+	Evidence       InfrastructureEvidenceReceipt
 }
 
 // InfrastructureEvidenceReceipt is bounded provider metadata proving which
@@ -386,15 +395,29 @@ type InfrastructureFailure struct {
 // still retained before a retry decision. It intentionally contains no log
 // text, paths, or credentials.
 type InfrastructureEvidenceReceipt struct {
-	ProviderRunID string                          `json:"provider_run_id"`
-	Attempt       int                             `json:"attempt"`
-	LogJobIDs     []int64                         `json:"log_job_ids"`
-	Artifacts     []InfrastructureArtifactReceipt `json:"artifacts,omitempty"`
+	ProviderRunID  string                          `json:"provider_run_id"`
+	Attempt        int                             `json:"attempt"`
+	LogJobIDs      []int64                         `json:"log_job_ids"`
+	DependentJobs  []int64                         `json:"dependent_job_ids,omitempty"`
+	DependentSteps []InfrastructureStepReceipt     `json:"dependent_steps,omitempty"`
+	Artifacts      []InfrastructureArtifactReceipt `json:"artifacts,omitempty"`
+}
+
+// InfrastructureStepReceipt names work skipped or consequentially failed only
+// after a classified provider failure. The recovered job must reach a green
+// conclusion, making each required step an explicit recovery obligation.
+type InfrastructureStepReceipt struct {
+	JobID  int64  `json:"job_id"`
+	Number int    `json:"number"`
+	Name   string `json:"name"`
 }
 
 type InfrastructureArtifactReceipt struct {
-	ID   int64  `json:"id"`
-	Name string `json:"name"`
+	ID            int64  `json:"id"`
+	Name          string `json:"name"`
+	Digest        string `json:"digest,omitempty"`
+	ProviderRunID int64  `json:"provider_run_id,omitempty"`
+	HeadSHA       string `json:"head_sha,omitempty"`
 }
 
 // ArtifactInfrastructureFailureDetector classifies artifact-transfer failures

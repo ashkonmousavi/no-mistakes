@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -270,10 +271,46 @@ func validateInfrastructureCandidate(key string, state infrastructureCandidateRe
 		}
 		seenJobs[jobID] = true
 	}
+	knownJobs := make(map[int64]bool, len(seenJobs)+len(first.Evidence.DependentJobs))
+	for jobID := range seenJobs {
+		knownJobs[jobID] = true
+	}
+	seenDependentJobs := map[int64]bool{}
+	for _, jobID := range first.Evidence.DependentJobs {
+		if jobID <= 0 || seenDependentJobs[jobID] {
+			return fmt.Errorf("invalid dependent job for candidate %q", key)
+		}
+		seenDependentJobs[jobID] = true
+		knownJobs[jobID] = true
+	}
+	seenDependentSteps := map[string]bool{}
+	for _, step := range first.Evidence.DependentSteps {
+		name := strings.TrimSpace(step.Name)
+		stepKey := fmt.Sprintf("%d\x00%d\x00%s", step.JobID, step.Number, name)
+		if step.JobID <= 0 || step.Number <= 0 || !knownJobs[step.JobID] || name == "" || strings.ContainsRune(name, '\x00') || seenDependentSteps[stepKey] {
+			return fmt.Errorf("invalid dependent step for candidate %q", key)
+		}
+		seenDependentSteps[stepKey] = true
+	}
 	seenArtifacts := map[int64]bool{}
 	for _, artifact := range first.Evidence.Artifacts {
 		if artifact.ID <= 0 || seenArtifacts[artifact.ID] || strings.TrimSpace(artifact.Name) == "" || strings.ContainsRune(artifact.Name, '\x00') {
 			return fmt.Errorf("invalid artifact receipt for candidate %q", key)
+		}
+		provenanceFields := 0
+		for _, value := range []string{artifact.Digest, artifact.HeadSHA} {
+			if strings.TrimSpace(value) != "" {
+				provenanceFields++
+			}
+		}
+		if artifact.ProviderRunID != 0 {
+			provenanceFields++
+		}
+		if provenanceFields != 0 {
+			runID, err := strconv.ParseInt(first.Evidence.ProviderRunID, 10, 64)
+			if provenanceFields != 3 || err != nil || artifact.ProviderRunID != runID || strings.TrimSpace(artifact.HeadSHA) != first.HeadSHA || !validInfrastructureDigest(artifact.Digest) {
+				return fmt.Errorf("invalid artifact provenance for candidate %q", key)
+			}
 		}
 		seenArtifacts[artifact.ID] = true
 	}
@@ -283,6 +320,21 @@ func validateInfrastructureCandidate(key string, state infrastructureCandidateRe
 		}
 	}
 	return nil
+}
+
+func validInfrastructureDigest(digest string) bool {
+	const prefix = "sha256:"
+	if !strings.HasPrefix(digest, prefix) || len(digest) != len(prefix)+64 {
+		return false
+	}
+	for _, r := range digest[len(prefix):] {
+		if r < '0' || r > '9' {
+			if r < 'a' || r > 'f' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // awaitingFailureKeys returns the original failed observations while the
@@ -663,16 +715,24 @@ func infrastructureRerunCandidates(checks []scm.Check, budget *infrastructureRer
 		if check.Bucket == scm.CheckBucketPass {
 			continue
 		}
+		if check.Bucket == scm.CheckBucketSkip && (check.InfrastructureRerunOmission || check.InfrastructureRerunDependent) && strings.TrimSpace(check.InfrastructureGroup) != "" && check.InfrastructureRerunSafe && check.InfrastructureHeadSHA == strings.TrimSpace(headSHA) && check.InfrastructureBaseSHA == strings.TrimSpace(baseSHA) {
+			if group == "" {
+				group = check.InfrastructureGroup
+			} else if check.InfrastructureGroup != group {
+				return nil
+			}
+			continue
+		}
 		if !checkFailedTerminally(*check) || classifyCheckFailure(*check) != classInfrastructure || strings.TrimSpace(check.InfrastructureGroup) == "" || !check.InfrastructureRerunSafe || check.InfrastructureHeadSHA != strings.TrimSpace(headSHA) || check.InfrastructureBaseSHA != strings.TrimSpace(baseSHA) {
 			return nil
 		}
 		if group == "" {
 			group = check.InfrastructureGroup
-			candidate = check
-			continue
-		}
-		if check.InfrastructureGroup != group {
+		} else if check.InfrastructureGroup != group {
 			return nil
+		}
+		if candidate == nil {
+			candidate = check
 		}
 	}
 	if candidate == nil {
@@ -1080,7 +1140,28 @@ func markArtifactInfrastructureFailures(sctx *pipeline.StepContext, host scm.Hos
 	}
 	for idx := range checks {
 		i := idx
-		if !classified[i].Retryable || strings.TrimSpace(classified[i].Group) == "" {
+		if strings.TrimSpace(classified[i].Group) == "" {
+			continue
+		}
+		if classified[i].RerunOmission {
+			checks[idx].InfrastructureGroup = classified[i].Group
+			checks[idx].InfrastructureHeadSHA = classified[i].HeadSHA
+			checks[idx].InfrastructureBaseSHA = classified[i].BaseSHA
+			checks[idx].InfrastructureRerunSafe = classified[i].RerunSafe
+			checks[idx].InfrastructureRerunOmission = true
+			checks[idx].InfrastructureEvidence = classified[i].Evidence
+			continue
+		}
+		if classified[i].RerunDependent {
+			checks[idx].InfrastructureGroup = classified[i].Group
+			checks[idx].InfrastructureHeadSHA = classified[i].HeadSHA
+			checks[idx].InfrastructureBaseSHA = classified[i].BaseSHA
+			checks[idx].InfrastructureRerunSafe = classified[i].RerunSafe
+			checks[idx].InfrastructureRerunDependent = true
+			checks[idx].InfrastructureEvidence = classified[i].Evidence
+			continue
+		}
+		if !classified[i].Retryable {
 			continue
 		}
 		checks[idx].InfrastructureFailure = true

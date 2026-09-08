@@ -524,9 +524,10 @@ type CI struct {
 	// escalating every failure on sight.
 	RerunTransient int
 	// RerunInfrastructure is a candidate-wide allowance for a provider-proven
-	// artifact-transfer infrastructure failure after every repository-owned step
-	// succeeded. It is separate from cancellation/pre-run retries, defaults off,
-	// and is capped at one.
+	// artifact-transfer infrastructure failure family. Required work skipped or
+	// consequentially failed after the initiating error must pass on recovery.
+	// It is separate from cancellation/pre-run retries, defaults off, and is
+	// capped at one.
 	RerunInfrastructure int
 	// RevalidateRepairs selects what happens after the CI step's fix agent
 	// produces a real repair commit.

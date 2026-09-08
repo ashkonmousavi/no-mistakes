@@ -754,6 +754,19 @@ func TestInfrastructureRerunCandidates_OnePerCandidateAndGenuineSiblingBlocks(t 
 	if got := infrastructureRerunCandidates([]scm.Check{infra, genuine}, &infrastructureRerunBudget{}, 1, "head-1", "base-1"); len(got) != 0 {
 		t.Fatalf("genuine sibling was masked by infrastructure retry: %+v", got)
 	}
+	omission := scm.Check{Name: "look for a proving pull request with the same pushed tree", Bucket: scm.CheckBucketSkip, State: "SKIPPED", InfrastructureGroup: "run:1", InfrastructureHeadSHA: "head-1", InfrastructureBaseSHA: "base-1", InfrastructureRerunSafe: true, InfrastructureRerunOmission: true}
+	if got := infrastructureRerunCandidates([]scm.Check{infra, omission}, &infrastructureRerunBudget{}, 1, "head-1", "base-1"); len(got) != 1 {
+		t.Fatalf("group-bound PR-only omission blocked the joined retry family: %+v", got)
+	}
+	dependent := scm.Check{Name: "repository", Bucket: scm.CheckBucketSkip, State: "SKIPPED", InfrastructureGroup: "run:1", InfrastructureHeadSHA: "head-1", InfrastructureBaseSHA: "base-1", InfrastructureRerunSafe: true, InfrastructureRerunDependent: true}
+	if got := infrastructureRerunCandidates([]scm.Check{infra, omission, dependent}, &infrastructureRerunBudget{}, 1, "head-1", "base-1"); len(got) != 1 {
+		t.Fatalf("group-bound skipped dependent blocked the joined retry family: %+v", got)
+	}
+	wrongGroup := omission
+	wrongGroup.InfrastructureGroup = "run:2"
+	if got := infrastructureRerunCandidates([]scm.Check{infra, wrongGroup}, &infrastructureRerunBudget{}, 1, "head-1", "base-1"); len(got) != 0 {
+		t.Fatalf("cross-group omission was admitted: %+v", got)
+	}
 	for name, outside := range map[string]scm.Check{
 		"cancelled": {Name: "browser", Bucket: scm.CheckBucketCancel, State: "CANCELLED"},
 		"timed out": {Name: "browser", Bucket: scm.CheckBucketFail, State: "TIMED_OUT"},
@@ -785,7 +798,11 @@ func TestInfrastructureRerunBudget_RestartRetainsFirstFailureAndSpentAttempt(t *
 	t.Parallel()
 
 	failedAt := time.Date(2026, 9, 8, 16, 0, 0, 0, time.UTC)
-	check := scm.Check{Name: "browser", Bucket: scm.CheckBucketFail, State: "FAILURE", CompletedAt: failedAt, Link: "job-1", InfrastructureFailure: true, InfrastructureGroup: "run:1", InfrastructureReason: "FinalizeArtifact HTTP 503", InfrastructureHeadSHA: "head-1", InfrastructureBaseSHA: "base-1", InfrastructureRerunSafe: true, InfrastructureEvidence: scm.InfrastructureEvidenceReceipt{ProviderRunID: "1", Attempt: 1, LogJobIDs: []int64{2}}}
+	check := scm.Check{Name: "browser", Bucket: scm.CheckBucketFail, State: "FAILURE", CompletedAt: failedAt, Link: "job-1", InfrastructureFailure: true, InfrastructureGroup: "run:1", InfrastructureReason: "FinalizeArtifact HTTP 503", InfrastructureHeadSHA: "head-1", InfrastructureBaseSHA: "base-1", InfrastructureRerunSafe: true, InfrastructureEvidence: scm.InfrastructureEvidenceReceipt{
+		ProviderRunID: "1", Attempt: 1, LogJobIDs: []int64{2, 3}, DependentJobs: []int64{3, 4},
+		DependentSteps: []scm.InfrastructureStepReceipt{{JobID: 2, Number: 7, Name: "Run tests"}, {JobID: 3, Number: 4, Name: "Prove fan-in"}},
+		Artifacts:      []scm.InfrastructureArtifactReceipt{{ID: 91, Name: "bundle-a1", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ProviderRunID: 1, HeadSHA: "head-1"}},
+	}}
 	original := &infrastructureRerunBudget{}
 	original.spend(check, []scm.Check{check}, "head-1", "main", "base-1")
 	encoded, err := original.marshal()
@@ -803,7 +820,7 @@ func TestInfrastructureRerunBudget_RestartRetainsFirstFailureAndSpentAttempt(t *
 	if record.Name != check.Name || record.Link != check.Link || record.Reason != check.InfrastructureReason || record.CompletedAt != failedAt || record.HeadSHA != "head-1" || record.BaseBranch != "main" || record.BaseSHA != "base-1" {
 		t.Fatalf("recovered first failure = %+v, want original evidence", record)
 	}
-	if record.Evidence.ProviderRunID != "1" || record.Evidence.Attempt != 1 || len(record.Evidence.LogJobIDs) != 1 || record.Evidence.LogJobIDs[0] != 2 {
+	if record.Evidence.ProviderRunID != "1" || record.Evidence.Attempt != 1 || len(record.Evidence.LogJobIDs) != 2 || len(record.Evidence.DependentJobs) != 2 || len(record.Evidence.DependentSteps) != 2 || len(record.Evidence.Artifacts) != 1 || record.Evidence.Artifacts[0].Digest == "" {
 		t.Fatalf("recovered retention receipt = %+v", record.Evidence)
 	}
 	if got := infrastructureRerunCandidates([]scm.Check{check}, recovered, 1, "head-1", "base-1"); len(got) != 0 {
