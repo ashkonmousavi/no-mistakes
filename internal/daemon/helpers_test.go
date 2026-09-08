@@ -382,6 +382,40 @@ exit 1
 	return dir, logPath
 }
 
+// writeMockGHNoPR puts a gh on PATH that authenticates and reports that the
+// branch has no open pull request.
+//
+// Every push now writes a pipeline attestation for the head it is about to
+// publish, which asks the forge whether a PR exists (see the Pre-Push Pipeline
+// Attestation contract). Without a stub, that lookup leaves the test process:
+// on a developer machine with an authenticated gh it reaches github.com and
+// fails against the placeholder test/repo slug, so a push-behaviour test would
+// pass or fail depending on whose machine ran it. An empty PR list is the
+// honest answer for a repository this test never opened a PR on.
+func writeMockGHNoPR(t *testing.T, dir string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(dir, "gh.bat")
+		script := "@echo off\r\necho %* | findstr /C:\"auth status\" >nul && exit /b 0\r\necho %* | findstr /C:\"pr list\" >nul && (echo []& exit /b 0)\r\nexit /b 1\r\n"
+		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	path := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+case "$*" in
+  "auth status"*) exit 0 ;;
+  "pr list"*) printf '%s\n' '[]'; exit 0 ;;
+esac
+exit 1
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func shellQuoteForTest(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
@@ -414,9 +448,11 @@ func waitForRunTerminalState(t *testing.T, d *db.DB, runID string) *db.Run {
 	if runtime.GOOS == "windows" {
 		// Git-backed daemon runs routinely take about 10x longer on Windows,
 		// especially while the git-heavy CI shard runs several packages at once.
-		// Keep the assertion bounded without treating normal process-spawn load as
-		// a pipeline failure.
-		timeout = time.Minute
+		// A 1-minute cap left too little margin under that load (observed:
+		// sibling subtests finishing at ~48s, then timing out at ~60s), so
+		// this is bounded generously without treating normal process-spawn
+		// load as a pipeline failure.
+		timeout = 3 * time.Minute
 	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

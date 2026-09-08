@@ -91,6 +91,35 @@ func TestBodyDocumentsAxiGateGuidance(t *testing.T) {
 	}
 }
 
+// TestBodyDelegatesUnambiguousAskUserDecisionsWithinAcceptedIntent proves the
+// installed skill does not turn every ask-user classification into a mandatory
+// human interruption. Existing explicit delegation may settle unambiguous work
+// inside accepted intent; only ambiguity, expansion, or destructive authority
+// must go back to the human, and records-only no-surface work remains distinct
+// from missing required product proof.
+func TestBodyDelegatesUnambiguousAskUserDecisionsWithinAcceptedIntent(t *testing.T) {
+	md := Markdown()
+	for _, want := range []string{
+		"`ask-user` is not an automatic human interruption",
+		"unambiguous work inside the accepted intent",
+		"genuinely ambiguous, expands the accepted scope, or authorizes a destructive action",
+		"A true `no-surface` verdict for a records-only",
+		"must not excuse an untested required product journey",
+	} {
+		if !strings.Contains(md, want) {
+			t.Errorf("installed skill delegation contract missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"This is a call only the user can make",
+		"`ask-user` is a decision that belongs to the user, not you",
+	} {
+		if strings.Contains(md, forbidden) {
+			t.Errorf("installed skill retains unconditional escalation wording %q", forbidden)
+		}
+	}
+}
+
 func TestInstallWritesBothPaths(t *testing.T) {
 	root := t.TempDir()
 	written, err := Install(root)

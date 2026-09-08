@@ -466,15 +466,26 @@ func (h *Harness) WorktreeRefSHA(ref string) string {
 // RunInfo so the test can assert on per-step outcomes.
 func (h *Harness) WaitForRun(branch string, timeout time.Duration) *ipc.RunInfo {
 	h.t.Helper()
-	return h.waitForRunStatus(branch, timeout, func(status types.RunStatus) bool {
+	return h.waitForRunStatus(branch, "", timeout, func(status types.RunStatus) bool {
 		return status.Terminal()
 	}, "finish")
+}
+
+// WaitForRunAfter waits for a terminal run created after the named prior run.
+// A trigger can return before the replacement row is visible; excluding the
+// prior terminal row prevents that race from being mistaken for completion of
+// the new launch.
+func (h *Harness) WaitForRunAfter(branch, priorRunID string, timeout time.Duration) *ipc.RunInfo {
+	h.t.Helper()
+	return h.waitForRunStatus(branch, priorRunID, timeout, func(status types.RunStatus) bool {
+		return status.Terminal()
+	}, "finish after prior run "+priorRunID)
 }
 
 // WaitForRunRunning polls until the newest run for branch reaches running.
 func (h *Harness) WaitForRunRunning(branch string, timeout time.Duration) *ipc.RunInfo {
 	h.t.Helper()
-	return h.waitForRunStatus(branch, timeout, func(status types.RunStatus) bool {
+	return h.waitForRunStatus(branch, "", timeout, func(status types.RunStatus) bool {
 		return status == types.RunRunning
 	}, "start running")
 }
@@ -566,7 +577,7 @@ func (h *Harness) CancelRun(runID string) {
 	}
 }
 
-func (h *Harness) waitForRunStatus(branch string, timeout time.Duration, match func(types.RunStatus) bool, action string) *ipc.RunInfo {
+func (h *Harness) waitForRunStatus(branch, excludedRunID string, timeout time.Duration, match func(types.RunStatus) bool, action string) *ipc.RunInfo {
 	h.t.Helper()
 	deadline := time.Now().Add(timeout)
 
@@ -593,7 +604,7 @@ func (h *Harness) waitForRunStatus(branch string, timeout time.Duration, match f
 		}
 		for i := range result.Runs {
 			r := &result.Runs[i]
-			if r.Branch != branch {
+			if r.Branch != branch || r.ID == excludedRunID {
 				continue
 			}
 			lastRun = r
