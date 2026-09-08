@@ -79,6 +79,7 @@ auto_fix:
 
 ci:
   rerun_transient: 0
+  rerun_infrastructure: 0
   revalidate_repairs: false
 
 commit:
@@ -614,6 +615,23 @@ Each rerun is another provider-side workflow run billed to the repository being 
 Set `0` here to never spend someone else's CI minutes; this is the only place to make that choice for a repository whose default branch you do not control.
 
 The per-repo [`ci.rerun_transient`](/no-mistakes/reference/repo-config/#cirerun_transient) overrides this value and owns the classification, the trust boundary, and every case that skips the rerun.
+
+### ci.rerun_infrastructure
+
+Candidate-wide allowance for the narrow GitHub Actions artifact-infrastructure retry described by the [repository setting](/no-mistakes/reference/repo-config/#cirerun_infrastructure). It is independent of `ci.rerun_transient`.
+
+| | |
+|---|---|
+| Type | `int` |
+| Default | `0` |
+| Range | `0` to `1`; values outside it are clamped |
+
+```yaml
+ci:
+  rerun_infrastructure: 0
+```
+
+The trusted per-repository value overrides this operator fallback. When both are absent, the built-in default is off.
 
 ### ci.revalidate_repairs
 

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 )
@@ -897,6 +898,11 @@ func (h *Host) rerunTargetArgs(check scm.Check) ([]string, bool) {
 	switch {
 	case !ok:
 		return nil, false
+	case check.InfrastructureFailure:
+		// The candidate-wide infrastructure allowance can cover several failed
+		// artifact jobs in this one proven run. GitHub's failed-jobs primitive is
+		// one provider request and cannot widen to successful jobs.
+		return []string{runID, "--failed"}, true
 	case jobID != "":
 		return []string{"--job", jobID}, true
 	case strings.EqualFold(strings.TrimSpace(check.State), "CANCELLED"):
@@ -990,7 +996,7 @@ func (h *Host) PreRunFailures(ctx context.Context, checks []scm.Check) ([]bool, 
 		}
 		jobs, seen := runJobs[runID]
 		if !seen {
-			jobs = h.fetchRunJobs(ctx, runID)
+			jobs, _ = h.fetchRunJobs(ctx, runID)
 			runJobs[runID] = jobs
 		}
 		job, found := matchRunJob(jobs, jobID, check.Name)
@@ -1004,18 +1010,25 @@ func (h *Host) PreRunFailures(ctx context.Context, checks []scm.Check) ([]bool, 
 // fetchRunJobs reads a run's jobs (with their steps) from Actions. A run it
 // cannot read yields no jobs, so every check on it fails closed to a genuine
 // failure rather than being guessed as infrastructure.
-func (h *Host) fetchRunJobs(ctx context.Context, runID string) []githubRunJob {
-	viewArgs := append([]string{"run", "view", runID}, h.repoArgs()...)
-	viewArgs = append(viewArgs, "--json", "jobs")
-	out, err := h.cmd(ctx, "gh", viewArgs...).Output()
+func (h *Host) fetchRunJobs(ctx context.Context, runID string) ([]githubRunJob, error) {
+	repo := h.repoSlug()
+	if repo == "" {
+		return nil, errors.New("repository slug is required to read workflow jobs")
+	}
+	args := []string{"api"}
+	if h.host != "" {
+		args = append(args, "--hostname", h.host)
+	}
+	args = append(args, "--method", "GET", "repos/"+repo+"/actions/runs/"+runID+"/jobs", "-f", "filter=latest", "-f", "per_page=100")
+	out, err := h.cmd(ctx, "gh", args...).CombinedOutput()
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("gh api workflow jobs: %s: %w", strings.TrimSpace(string(out)), err)
 	}
-	var payload githubRunView
+	var payload githubRunJobsResponse
 	if err := json.Unmarshal(out, &payload); err != nil {
-		return nil
+		return nil, fmt.Errorf("parse workflow jobs: %w", err)
 	}
-	return payload.Jobs
+	return payload.Jobs, nil
 }
 
 // matchRunJob finds the job a check names: by databaseId when the check's link
@@ -1024,7 +1037,7 @@ func (h *Host) fetchRunJobs(ctx context.Context, runID string) []githubRunJob {
 func matchRunJob(jobs []githubRunJob, jobID, checkName string) (githubRunJob, bool) {
 	if jobID != "" {
 		for _, job := range jobs {
-			if strconv.Itoa(job.DatabaseID) == jobID {
+			if strconv.Itoa(job.databaseID()) == jobID {
 				return job, true
 			}
 		}
@@ -1048,6 +1061,192 @@ func jobFailedAtSetup(job githubRunJob) bool {
 	for _, step := range job.Steps {
 		if step.Number == 1 || strings.EqualFold(strings.TrimSpace(step.Name), "Set up job") {
 			return strings.EqualFold(strings.TrimSpace(step.Conclusion), "failure")
+		}
+	}
+	return false
+}
+
+// ArtifactInfrastructureFailures classifies the one post-repository failure
+// that can safely earn the separate infrastructure budget. GitHub's jobs API
+// proves the exact run/head and every step conclusion, while the job log fills
+// the API's two gaps: which action a custom-named step uses and the HTTP status
+// reported by FinalizeArtifact/ListArtifacts. Missing or ambiguous evidence
+// fails closed to an ordinary failure.
+func (h *Host) ArtifactInfrastructureFailures(ctx context.Context, pr *scm.PR, checks []scm.Check) ([]scm.InfrastructureFailure, error) {
+	result := make([]scm.InfrastructureFailure, len(checks))
+	if pr == nil || strings.TrimSpace(pr.Number) == "" || strings.TrimSpace(pr.HeadSHA) == "" || strings.TrimSpace(pr.BaseBranch) == "" {
+		return result, nil
+	}
+	prNumber, err := strconv.Atoi(strings.TrimSpace(pr.Number))
+	if err != nil {
+		return result, nil
+	}
+	type cachedRun struct {
+		metadata githubWorkflowRun
+		jobs     []githubRunJob
+		err      error
+	}
+	cache := map[string]cachedRun{}
+	for i, check := range checks {
+		runID, jobID, ok := h.actionsRerunTarget(check.Link)
+		if !ok || jobID == "" || !check.Failing() || !strings.EqualFold(strings.TrimSpace(check.State), "FAILURE") {
+			continue
+		}
+		entry, seen := cache[runID]
+		if !seen {
+			entry.metadata, entry.err = h.fetchWorkflowRun(ctx, runID)
+			if entry.err == nil && workflowRunMatchesCandidate(entry.metadata, prNumber, pr.HeadSHA, pr.BaseBranch) {
+				entry.jobs, entry.err = h.fetchRunJobs(ctx, runID)
+			}
+			cache[runID] = entry
+		}
+		if entry.err != nil {
+			return result, entry.err
+		}
+		if !workflowRunMatchesCandidate(entry.metadata, prNumber, pr.HeadSHA, pr.BaseBranch) {
+			continue
+		}
+		job, found := matchRunJob(entry.jobs, jobID, check.Name)
+		if !found || (job.HeadSHA != "" && job.HeadSHA != strings.TrimSpace(pr.HeadSHA)) {
+			continue
+		}
+		if !jobHasOnlyArtifactInfrastructureFailure(job) {
+			continue
+		}
+		logs, err := h.fetchWorkflowJobLogs(ctx, job.databaseID())
+		if err != nil {
+			return result, err
+		}
+		if !logsProveArtifactInfrastructureFailure(logs) {
+			continue
+		}
+		result[i] = scm.InfrastructureFailure{
+			Retryable: true,
+			Group:     "github-actions-run:" + runID,
+			Reason:    "artifact-transfer infrastructure failed after repository steps passed",
+		}
+	}
+	return result, nil
+}
+
+func (h *Host) fetchWorkflowRun(ctx context.Context, runID string) (githubWorkflowRun, error) {
+	var run githubWorkflowRun
+	repo := h.repoSlug()
+	if repo == "" {
+		return run, errors.New("repository slug is required to read workflow run")
+	}
+	args := []string{"api"}
+	if h.host != "" {
+		args = append(args, "--hostname", h.host)
+	}
+	args = append(args, "--method", "GET", "repos/"+repo+"/actions/runs/"+runID)
+	out, err := h.cmd(ctx, "gh", args...).CombinedOutput()
+	if err != nil {
+		return run, fmt.Errorf("gh api workflow run: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	if err := json.Unmarshal(out, &run); err != nil {
+		return run, fmt.Errorf("parse workflow run: %w", err)
+	}
+	return run, nil
+}
+
+func (h *Host) fetchWorkflowJobLogs(ctx context.Context, jobID int) (string, error) {
+	if jobID <= 0 {
+		return "", errors.New("workflow job id is required to read logs")
+	}
+	repo := h.repoSlug()
+	args := []string{"api"}
+	if h.host != "" {
+		args = append(args, "--hostname", h.host)
+	}
+	args = append(args, "--method", "GET", fmt.Sprintf("repos/%s/actions/jobs/%d/logs", repo, jobID))
+	out, err := h.cmd(ctx, "gh", args...).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("gh api workflow job logs: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return string(out), nil
+}
+
+func workflowRunMatchesCandidate(run githubWorkflowRun, prNumber int, headSHA, baseBranch string) bool {
+	if run.RunAttempt != 1 || strings.TrimSpace(run.HeadSHA) != strings.TrimSpace(headSHA) {
+		return false
+	}
+	for _, candidate := range run.PullRequests {
+		if candidate.Number == prNumber && strings.TrimSpace(candidate.Head.SHA) == strings.TrimSpace(headSHA) && strings.TrimSpace(candidate.Base.Ref) == strings.TrimSpace(baseBranch) {
+			return true
+		}
+	}
+	return false
+}
+
+func jobHasOnlyArtifactInfrastructureFailure(job githubRunJob) bool {
+	if !isFailedJob(job) || len(job.Steps) == 0 {
+		return false
+	}
+	failures := 0
+	for _, step := range job.Steps {
+		switch strings.ToUpper(strings.TrimSpace(step.Conclusion)) {
+		case "SUCCESS":
+			continue
+		case "FAILURE", "FAILED", "ERROR":
+			if !artifactTransferStepName(step.Name) {
+				return false
+			}
+			failures++
+		default:
+			// Skipped, cancelled, timed out, missing, and future states are not
+			// proof that every repository step succeeded.
+			return false
+		}
+	}
+	return failures > 0
+}
+
+func artifactTransferStepName(name string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	return strings.Contains(normalized, "actions/upload-artifact") ||
+		strings.Contains(normalized, "actions/download-artifact") ||
+		(strings.Contains(normalized, "artifact") && (strings.Contains(normalized, "upload") || strings.Contains(normalized, "download")))
+}
+
+func logsProveArtifactInfrastructureFailure(logs string) bool {
+	normalized := strings.ToLower(logs)
+	if !strings.Contains(normalized, "actions/upload-artifact@") && !strings.Contains(normalized, "actions/download-artifact@") {
+		return false
+	}
+	for _, operation := range []string{"finalizeartifact", "listartifacts"} {
+		for offset := 0; ; {
+			idx := strings.Index(normalized[offset:], operation)
+			if idx < 0 {
+				break
+			}
+			idx += offset
+			start := max(0, idx-160)
+			end := min(len(normalized), idx+len(operation)+160)
+			window := normalized[start:end]
+			if containsArtifactHTTPFailure(window) {
+				return true
+			}
+			offset = idx + len(operation)
+		}
+	}
+	return false
+}
+
+func containsArtifactHTTPFailure(text string) bool {
+	fields := strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	for i, field := range fields {
+		code, err := strconv.Atoi(field)
+		if err != nil || code != 403 && (code < 500 || code > 599) {
+			continue
+		}
+		start := max(0, i-4)
+		for _, marker := range fields[start:i] {
+			if marker == "http" || marker == "status" || marker == "response" {
+				return true
+			}
 		}
 	}
 	return false
@@ -1144,12 +1343,40 @@ type githubRunView struct {
 	Jobs []githubRunJob `json:"jobs"`
 }
 
+type githubRunJobsResponse struct {
+	Jobs []githubRunJob `json:"jobs"`
+}
+
+type githubWorkflowRun struct {
+	ID           int    `json:"id"`
+	HeadSHA      string `json:"head_sha"`
+	RunAttempt   int    `json:"run_attempt"`
+	PullRequests []struct {
+		Number int `json:"number"`
+		Head   struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
+		Base struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
+	} `json:"pull_requests"`
+}
+
 type githubRunJob struct {
 	DatabaseID int             `json:"databaseId"`
+	ID         int             `json:"id"`
+	HeadSHA    string          `json:"head_sha"`
 	Name       string          `json:"name"`
 	Conclusion string          `json:"conclusion"`
 	Status     string          `json:"status"`
 	Steps      []githubJobStep `json:"steps"`
+}
+
+func (j githubRunJob) databaseID() int {
+	if j.DatabaseID != 0 {
+		return j.DatabaseID
+	}
+	return j.ID
 }
 
 type githubJobStep struct {

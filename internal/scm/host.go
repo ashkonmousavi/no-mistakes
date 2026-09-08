@@ -184,6 +184,18 @@ type Check struct {
 	// it can never be true for a genuine test or lint failure, whose job cleared
 	// setup and failed a later step.
 	PreRunFailure bool
+	// InfrastructureFailure marks a failed check whose provider proved that all
+	// repository-owned steps succeeded and only artifact-transfer infrastructure
+	// failed on the exact PR head/base candidate. It is distinct from
+	// PreRunFailure/cancellation so it can consume its own bounded budget.
+	InfrastructureFailure bool
+	// InfrastructureGroup is the provider's opaque identity for the work one
+	// rerun request targets (for GitHub Actions, the workflow run). It prevents
+	// failures from unrelated runs being combined into one candidate retry.
+	InfrastructureGroup string
+	// InfrastructureReason is a bounded, provider-produced classification label,
+	// never raw logs. It is persisted with the first failure for later readback.
+	InfrastructureReason string
 }
 
 // Failing reports whether the check is in a failed bucket.
@@ -325,6 +337,25 @@ type PreRunFailureDetector interface {
 	// so an unreadable job stays a genuine failure rather than being masked as
 	// infrastructure.
 	PreRunFailures(ctx context.Context, checks []Check) ([]bool, error)
+}
+
+// InfrastructureFailure is the provider's fail-closed disposition for one
+// failed check. Retryable is true only when structured run/job evidence and the
+// provider's failure evidence satisfy the backend's narrow infrastructure
+// policy. Group identifies checks covered by one provider rerun request.
+type InfrastructureFailure struct {
+	Retryable bool
+	Group     string
+	Reason    string
+}
+
+// ArtifactInfrastructureFailureDetector classifies artifact-transfer failures
+// after repository steps ran. It is separate from PreRunFailureDetector because
+// the evidence, budget, and failure class are all intentionally independent.
+type ArtifactInfrastructureFailureDetector interface {
+	// ArtifactInfrastructureFailures returns one positional result per check and
+	// fails closed on missing, ambiguous, stale, or malformed provider evidence.
+	ArtifactInfrastructureFailures(ctx context.Context, pr *PR, checks []Check) ([]InfrastructureFailure, error)
 }
 
 // CheckRerunner re-runs the provider-side work behind a failed check without

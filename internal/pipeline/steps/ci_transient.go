@@ -27,6 +27,10 @@ const (
 	// than to the job. Only a cancelled check qualifies: nothing about the
 	// commit produced it, so one rerun is worth more than an agent round.
 	classTransient failureClass = "transient"
+	// classInfrastructure is a post-repository artifact-transfer failure proven
+	// by provider metadata and logs on the exact head/base candidate. It has a
+	// separate, candidate-wide budget and never borrows cancellation retries.
+	classInfrastructure failureClass = "infrastructure"
 	// classUnknown is a check whose state the provider did not report, or one
 	// this version does not recognize. It never earns a rerun: an
 	// indeterminate state is not evidence of a transient one.
@@ -60,6 +64,9 @@ func classifyCheckFailure(check scm.Check) failureClass {
 	// later step, so it is never marked PreRunFailure.
 	if check.PreRunFailure {
 		return classTransient
+	}
+	if check.InfrastructureFailure {
+		return classInfrastructure
 	}
 	switch strings.ToUpper(strings.TrimSpace(check.State)) {
 	case "CANCELLED", "CANCELED":
@@ -128,6 +135,149 @@ type persistedRollupState struct {
 	GraceRemaining int       `json:"grace_remaining"`
 	HeadSHA        string    `json:"head_sha,omitempty"`
 	ObservedLinks  []string  `json:"observed_links,omitempty"`
+}
+
+type infrastructureFailureRecord struct {
+	Name        string    `json:"name"`
+	Link        string    `json:"link,omitempty"`
+	Reason      string    `json:"reason"`
+	CompletedAt time.Time `json:"completed_at,omitempty"`
+	HeadSHA     string    `json:"head_sha"`
+	BaseBranch  string    `json:"base_branch"`
+}
+
+type infrastructureFailureObservation struct {
+	Name        string    `json:"name"`
+	Link        string    `json:"link,omitempty"`
+	CompletedAt time.Time `json:"completed_at,omitempty"`
+}
+
+type infrastructureCandidateRerun struct {
+	Used           int                                `json:"used"`
+	Group          string                             `json:"group"`
+	FirstFailure   infrastructureFailureRecord        `json:"first_failure"`
+	Observed       []infrastructureFailureObservation `json:"observed"`
+	GraceRemaining int                                `json:"grace_remaining"`
+}
+
+// infrastructureRerunBudget is keyed by exact head/base candidate. Unlike the
+// name-keyed cancellation budget, its one allowance covers the provider work
+// identified by InfrastructureGroup and its first failure remains durable even
+// after a successful rerun.
+type infrastructureRerunBudget struct {
+	Candidates map[string]infrastructureCandidateRerun `json:"-"`
+}
+
+type persistedInfrastructureRerunBudget struct {
+	Infrastructure map[string]infrastructureCandidateRerun `json:"infrastructure,omitempty"`
+}
+
+func infrastructureCandidateKey(headSHA, baseBranch string) string {
+	return strings.TrimSpace(headSHA) + "\x00" + strings.TrimSpace(baseBranch)
+}
+
+func (b *infrastructureRerunBudget) used(headSHA, baseBranch string) int {
+	if b == nil {
+		return 0
+	}
+	return b.Candidates[infrastructureCandidateKey(headSHA, baseBranch)].Used
+}
+
+func (b *infrastructureRerunBudget) spend(check scm.Check, checks []scm.Check, headSHA, baseBranch string) int {
+	if b.Candidates == nil {
+		b.Candidates = map[string]infrastructureCandidateRerun{}
+	}
+	key := infrastructureCandidateKey(headSHA, baseBranch)
+	state := b.Candidates[key]
+	state.Used++
+	state.Group = check.InfrastructureGroup
+	if state.FirstFailure.Name == "" {
+		state.FirstFailure = infrastructureFailureRecord{
+			Name:        check.Name,
+			Link:        check.Link,
+			Reason:      check.InfrastructureReason,
+			CompletedAt: check.CompletedAt,
+			HeadSHA:     strings.TrimSpace(headSHA),
+			BaseBranch:  strings.TrimSpace(baseBranch),
+		}
+	}
+	state.Observed = nil
+	for _, observed := range checks {
+		if observed.InfrastructureFailure && observed.InfrastructureGroup == check.InfrastructureGroup && checkFailedTerminally(observed) {
+			state.Observed = append(state.Observed, infrastructureFailureObservation{Name: observed.Name, Link: observed.Link, CompletedAt: observed.CompletedAt})
+		}
+	}
+	state.GraceRemaining = rerunRollupGracePolls
+	b.Candidates[key] = state
+	return state.Used
+}
+
+func (b *infrastructureRerunBudget) firstFailure(headSHA, baseBranch string) (infrastructureFailureRecord, bool) {
+	state, ok := b.Candidates[infrastructureCandidateKey(headSHA, baseBranch)]
+	return state.FirstFailure, ok && state.FirstFailure.Name != ""
+}
+
+func (b *infrastructureRerunBudget) marshal() (string, error) {
+	if b == nil || len(b.Candidates) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(persistedInfrastructureRerunBudget{Infrastructure: b.Candidates})
+	if err != nil {
+		return "", fmt.Errorf("marshal infrastructure rerun budget: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func (b *infrastructureRerunBudget) unmarshal(encoded string) error {
+	if strings.TrimSpace(encoded) == "" {
+		return nil
+	}
+	var payload persistedInfrastructureRerunBudget
+	if err := json.Unmarshal([]byte(encoded), &payload); err != nil {
+		return fmt.Errorf("unmarshal infrastructure rerun budget: %w", err)
+	}
+	b.Candidates = payload.Infrastructure
+	if b.Candidates == nil {
+		b.Candidates = map[string]infrastructureCandidateRerun{}
+	}
+	return nil
+}
+
+// awaitingFailureKeys returns the original failed observations while the
+// provider still publishes the pre-rerun rollup. A changed completion/link is a
+// new attempt and leaves this grace immediately; missing observations receive
+// the same finite grace as cancellation reruns.
+func (b *infrastructureRerunBudget) awaitingFailureKeys(checks []scm.Check, headSHA, baseBranch string) map[string]bool {
+	key := infrastructureCandidateKey(headSHA, baseBranch)
+	state, ok := b.Candidates[key]
+	if !ok || state.GraceRemaining <= 0 || len(state.Observed) == 0 {
+		return nil
+	}
+	awaiting := map[string]bool{}
+	for _, observation := range state.Observed {
+		matched := false
+		for _, check := range checks {
+			if check.Name != observation.Name || check.Link != observation.Link {
+				continue
+			}
+			matched = true
+			if !checkFailedTerminally(check) || observation.CompletedAt.IsZero() || check.CompletedAt.IsZero() || !check.CompletedAt.Equal(observation.CompletedAt) {
+				return nil
+			}
+			awaiting[checkIdentity(check)] = true
+			break
+		}
+		if !matched {
+			awaiting[observation.Name+"\x00"+observation.Link] = true
+		}
+	}
+	state.GraceRemaining--
+	b.Candidates[key] = state
+	return awaiting
+}
+
+func checkIdentity(check scm.Check) string {
+	return check.Name + "\x00" + check.Link
 }
 
 // marshal renders the budget for persistence. An empty budget marshals to the
@@ -455,6 +605,40 @@ func transientRerunCandidates(checks []scm.Check, budget *checkRerunBudget, limi
 	return candidates
 }
 
+// infrastructureRerunCandidates selects at most one provider job for the exact
+// head/base candidate. Every terminal failure must carry the independently
+// proven infrastructure class and the same provider group; a genuine, unknown,
+// cancelled, timed-out, or unrelated failure blocks the retry rather than being
+// masked by it.
+func infrastructureRerunCandidates(checks []scm.Check, budget *infrastructureRerunBudget, limit int, headSHA, baseBranch string) []scm.Check {
+	if limit <= 0 || budget.used(headSHA, baseBranch) >= limit {
+		return nil
+	}
+	var candidate *scm.Check
+	group := ""
+	for i := range checks {
+		check := &checks[i]
+		if !checkFailedTerminally(*check) {
+			continue
+		}
+		if classifyCheckFailure(*check) != classInfrastructure || strings.TrimSpace(check.InfrastructureGroup) == "" {
+			return nil
+		}
+		if group == "" {
+			group = check.InfrastructureGroup
+			candidate = check
+			continue
+		}
+		if check.InfrastructureGroup != group {
+			return nil
+		}
+	}
+	if candidate == nil {
+		return nil
+	}
+	return []scm.Check{*candidate}
+}
+
 // mergeCheckNames appends the names in extra that base does not already carry.
 // It is how a cancelled check the provider never resolved joins the issues the
 // step reports: a cancelled check is not a failing check, so on its own it
@@ -504,6 +688,9 @@ func (s *CIStep) loadRerunBudget(sctx *pipeline.StepContext) {
 	if err := s.transientReruns.unmarshal(encoded); err != nil {
 		sctx.Log(fmt.Sprintf("warning: could not restore the persisted rerun budget: %v", err))
 	}
+	if err := s.infrastructureReruns.unmarshal(encoded); err != nil {
+		sctx.Log(fmt.Sprintf("warning: could not restore the persisted infrastructure rerun budget: %v", err))
+	}
 }
 
 // persistRerunBudget writes the rerun budget so a recovered run resumes with
@@ -516,11 +703,41 @@ func (s *CIStep) persistRerunBudgetCandidate(sctx *pipeline.StepContext, candida
 	if sctx.DB == nil || sctx.Run == nil {
 		return nil
 	}
-	encoded, err := candidate.marshal()
+	encoded, err := marshalCIRerunState(candidate, &s.infrastructureReruns)
 	if err != nil {
 		return err
 	}
 	return sctx.DB.SetRunCIRerunState(sctx.Run.ID, encoded)
+}
+
+func marshalCIRerunState(transient *checkRerunBudget, infrastructure *infrastructureRerunBudget) (string, error) {
+	payload := map[string]json.RawMessage{}
+	if encoded, err := transient.marshal(); err != nil {
+		return "", err
+	} else if encoded != "" {
+		if err := json.Unmarshal([]byte(encoded), &payload); err != nil {
+			return "", err
+		}
+	}
+	if encoded, err := infrastructure.marshal(); err != nil {
+		return "", err
+	} else if encoded != "" {
+		var infra map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(encoded), &infra); err != nil {
+			return "", err
+		}
+		for key, value := range infra {
+			payload[key] = value
+		}
+	}
+	if len(payload) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal CI rerun state: %w", err)
+	}
+	return string(encoded), nil
 }
 
 func (s *CIStep) retireResolvedReruns(sctx *pipeline.StepContext, checks []scm.Check) (bool, error) {
@@ -580,6 +797,42 @@ func (s *CIStep) rerunTransientChecks(sctx *pipeline.StepContext, host scm.Host,
 		sctx.Log(fmt.Sprintf("re-running CI check %s (%d/%d): %s, not a job failure", check.Name, used, limit, transientReason(check)))
 	}
 	return issued, nil
+}
+
+func (s *CIStep) rerunInfrastructureChecks(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR, checks []scm.Check) (bool, *pipeline.StepOutcome) {
+	limit := sctx.Config.CI.RerunInfrastructure
+	if limit <= 0 {
+		return false, nil
+	}
+	rerunner, ok := host.(scm.CheckRerunner)
+	if !ok {
+		return false, nil
+	}
+	candidates := infrastructureRerunCandidates(checks, &s.infrastructureReruns, limit, sctx.Run.HeadSHA, pr.BaseBranch)
+	if len(candidates) == 0 {
+		return false, nil
+	}
+	published, err := publishedBranchHead(sctx)
+	if err != nil {
+		sctx.Log(fmt.Sprintf("warning: could not verify the published branch head before re-running infrastructure failure: %v", err))
+		return false, nil
+	}
+	if published != sctx.Run.HeadSHA {
+		sctx.Log(fmt.Sprintf("published branch head moved (expected %s, observed %s); not re-running infrastructure failure", shortSHA(sctx.Run.HeadSHA), shortSHA(published)))
+		return false, ciRerunHeadMismatchOutcome(sctx.Run.HeadSHA, published)
+	}
+	check := candidates[0]
+	used := s.infrastructureReruns.spend(check, checks, sctx.Run.HeadSHA, pr.BaseBranch)
+	if err := s.persistRerunBudget(sctx); err != nil {
+		sctx.Log(fmt.Sprintf("warning: could not reserve infrastructure rerun budget for %s: %v", check.Name, err))
+		return false, nil
+	}
+	if err := rerunner.RerunCheck(sctx.Ctx, pr, check); err != nil {
+		sctx.Log(fmt.Sprintf("warning: could not re-run infrastructure CI check %s: %v", check.Name, err))
+		return false, nil
+	}
+	sctx.Log(fmt.Sprintf("re-running CI check %s (%d/%d): %s", check.Name, used, limit, check.InfrastructureReason))
+	return true, nil
 }
 
 // publishedBranchHead returns the commit the run's branch points at on the push
@@ -673,6 +926,51 @@ func markPreRunInfraFailures(sctx *pipeline.StepContext, host scm.Host, checks [
 			checks[idx].PreRunFailure = true
 			checks[idx].Bucket = scm.CheckBucketCancel
 		}
+	}
+}
+
+// markArtifactInfrastructureFailures asks the provider for the stronger
+// post-repository proof used by ci.rerun_infrastructure. It preserves the
+// original failed bucket/state and only adds bounded classification metadata,
+// so the first failure remains visible and the ordinary CI path owns every
+// outcome not admitted by the separate budget.
+func markArtifactInfrastructureFailures(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR, checks []scm.Check) {
+	if sctx.Config.CI.RerunInfrastructure <= 0 {
+		return
+	}
+	detector, ok := host.(scm.ArtifactInfrastructureFailureDetector)
+	if !ok {
+		return
+	}
+	var failedIdx []int
+	for i := range checks {
+		if checks[i].Failing() {
+			failedIdx = append(failedIdx, i)
+		}
+	}
+	if len(failedIdx) == 0 {
+		return
+	}
+	failed := make([]scm.Check, len(failedIdx))
+	for i, idx := range failedIdx {
+		failed[i] = checks[idx]
+	}
+	classified, err := detector.ArtifactInfrastructureFailures(sctx.Ctx, pr, failed)
+	if err != nil {
+		sctx.Log(fmt.Sprintf("warning: could not classify artifact infrastructure failures: %v", err))
+		return
+	}
+	if len(classified) != len(failed) {
+		sctx.Log(fmt.Sprintf("warning: artifact infrastructure classifier returned %d results for %d checks; ignoring", len(classified), len(failed)))
+		return
+	}
+	for i, idx := range failedIdx {
+		if !classified[i].Retryable || strings.TrimSpace(classified[i].Group) == "" {
+			continue
+		}
+		checks[idx].InfrastructureFailure = true
+		checks[idx].InfrastructureGroup = classified[i].Group
+		checks[idx].InfrastructureReason = classified[i].Reason
 	}
 }
 

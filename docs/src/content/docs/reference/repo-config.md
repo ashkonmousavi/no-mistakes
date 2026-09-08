@@ -8,7 +8,7 @@ Per-repo configuration lives in `.no-mistakes.yaml` at the root of your reposito
 :::caution[Security: gate-control fields are read from the default branch]
 `commands.*` execute arbitrary shell on the daemon host via `sh -c` / `cmd.exe /c`, and `agent` selects which process launches there (including ordered fallback lists, ACP aliases such as `cursor`, and `acp:` targets) with the maintainer's credentials.
 To prevent a supply-chain attack where a contributor lands a hostile value on a gated branch, the daemon always reads **`commands` and `agent` from your default branch** (e.g. `origin/main`), never from the pushed SHA, and reads them at the exact commit a fresh fetch resolved (so a stale `origin/<default>` ref cannot serve a value the live default branch removed).
-The daemon also reads `document.instructions`, `review.path_instructions`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.revalidate_repairs`, `test.instructions`, and `test.evidence.branch` only from that trusted copy.
+The daemon also reads `document.instructions`, `review.path_instructions`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.rerun_infrastructure`, `ci.revalidate_repairs`, `test.instructions`, and `test.evidence.branch` only from that trusted copy.
 `pr.base_branch` is trusted-default-branch-only as well, but unlike those fields it follows the same `allow_repo_commands: true` opt-in exception as `commands`/`agent` (see [`pr.base_branch`](#prbase_branch) below).
 If the default branch cannot be fetched and resolved to a readable commit, or its present `.no-mistakes.yaml` cannot be read and parsed, the run aborts before launching an agent.
 A readable default-branch tree with no `.no-mistakes.yaml` is valid and uses defaults.
@@ -75,6 +75,7 @@ auto_fix:
 # and revalidation decides whether a CI repair may ship without review.
 ci:
   rerun_transient: 0
+  rerun_infrastructure: 0
   revalidate_repairs: false
 
 commit:
@@ -474,6 +475,30 @@ Reruns are skipped when:
 - The provider has no rerun API (only GitHub implements one today; GitLab, Forgejo, Bitbucket Cloud, Azure DevOps, and Gitea reach the approval gate without a rerun).
 - The check's details link names nothing the provider can re-run, for example a third-party status pointing at an external dashboard, or a link under a workflow run that names no job the API accepts. A link naming one job re-runs that job; a cancelled check naming only the workflow run re-runs the whole workflow, while other run-only links re-run failed jobs; an unrecognized link is widened into neither.
 - The published branch head no longer equals the commit the run delivered. That case terminates with the expected and observed commits instead: re-running checks against a different head would certify a revision this run never produced. See [pipeline steps: CI](/no-mistakes/reference/pipeline-steps/#ci).
+
+### ci.rerun_infrastructure
+
+How many times one exact head/base candidate may retry an independently proven artifact-transfer infrastructure failure.
+
+| | |
+|---|---|
+| Type | `int` |
+| Default | `0` |
+| Range | `0` to `1`; values outside it are clamped |
+| Trust | Read only from the trusted default branch |
+
+This budget is separate from `ci.rerun_transient`: enabling cancellation retries does not enable this classifier, and an artifact retry never spends a cancellation allowance. The first failure and its head/base, provider link, bounded reason, and completion time are retained in the run's durable CI rerun record before GitHub is asked to rerun the job.
+
+With a value of `1`, a failed GitHub Actions check qualifies only when all of these are proven:
+
+- The workflow run is its first attempt and belongs to the same pull request, exact head SHA, and current forge base branch that the CI step is certifying.
+- Structured workflow-job data reports every non-artifact step successful. The only failed step or steps are artifact upload/download steps; skipped, cancelled, timed-out, missing, unknown, test, and lint outcomes fail closed.
+- The failed job log identifies `actions/upload-artifact` or `actions/download-artifact` and reports `FinalizeArtifact` or `ListArtifacts` failing with HTTP 403 or 5xx. Raw logs are used for classification only and are never stored in the run record.
+- Every failing check in the poll carries the same independently proven provider group. A genuine or unknown sibling, a merge conflict, a different workflow run, or unreadable/malformed evidence suppresses the retry.
+
+The allowance is candidate-wide and spent durably before the provider request. A daemon restart cannot restore it, and a second failed workflow attempt cannot earn a third attempt. While GitHub replaces the old check rollup, the exact first failure receives the same finite publication grace as cancellation reruns; once a new failure appears it follows the ordinary CI failure path. The published branch head is re-read immediately before the rerun, so a moved branch terminates instead of certifying unowned code.
+
+With no trusted repository value, the operator's [`ci.rerun_infrastructure`](/no-mistakes/reference/global-config/#cirerun_infrastructure) applies, then the built-in default of `0`.
 
 ### ci.revalidate_repairs
 

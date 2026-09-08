@@ -39,11 +39,12 @@ const (
 // A feature branch cannot self-declare that value. When checks exist, their
 // actual states are always processed normally - even on a declared no-CI repo.
 type CIStep struct {
-	lastFixedChecks      string               // sorted check names from last fix attempt, to avoid re-fixing
-	lastFixedCompletedAt map[string]time.Time // terminally failed check completion times seen before the last fix attempt
-	ciFixAttempts        int                  // number of CI auto-fix attempts made
-	transientReruns      checkRerunBudget     // per-check rerun budget spent on provider-reported transient failures
-	pollIntervalOverride time.Duration        // if set, overrides computed poll interval (for testing)
+	lastFixedChecks      string                    // sorted check names from last fix attempt, to avoid re-fixing
+	lastFixedCompletedAt map[string]time.Time      // terminally failed check completion times seen before the last fix attempt
+	ciFixAttempts        int                       // number of CI auto-fix attempts made
+	transientReruns      checkRerunBudget          // per-check rerun budget spent on provider-reported transient failures
+	infrastructureReruns infrastructureRerunBudget // candidate-wide budget and first artifact-infrastructure failure
+	pollIntervalOverride time.Duration             // if set, overrides computed poll interval (for testing)
 	waitForNextPoll      func(context.Context, time.Duration) error
 	now                  func() time.Time
 	// baseBranchTip resolves the current tip SHA of the upstream default
@@ -522,6 +523,10 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 			// to the fix agent. Gated on the transient budget, so an opted-out
 			// repo pays no extra provider calls and keeps the prior behavior.
 			markPreRunInfraFailures(sctx, host, checks)
+			// A later artifact-transfer failure needs stronger evidence and a
+			// separate candidate-wide budget. It keeps its failed bucket so the
+			// first failure remains visible and ordinary failures are never masked.
+			markArtifactInfrastructureFailures(sctx, host, pr, checks)
 			// checksPending is the narrow execution state: only checks that are
 			// actively running or queued block a rerun or issue escalation. A
 			// provider-cancelled check is terminal enough to enter the transient
@@ -531,8 +536,6 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 			// conclusive pass, failure, or skip must keep the PR non-ready. This
 			// includes cancelled and unknown provider states.
 			readinessPending := checksPending || hasUnresolvedChecks(checks)
-			failing := failingCheckNames(checks)
-
 			// A rerun the provider has answered is no longer outstanding. This
 			// runs before anything reads the rerun bookkeeping so a resolved
 			// rerun cannot be re-opened by a later poll that no longer reports
@@ -562,7 +565,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 			// the fix agent on its first observation.
 			rerunIssued := false
 			if !checksPending && !mergeConflict {
-				issued, rerunOutcome := s.rerunTransientChecks(sctx, host, pr, checks)
+				issued, rerunOutcome := s.rerunInfrastructureChecks(sctx, host, pr, checks)
 				if rerunOutcome != nil {
 					// The published head moved, so this run never delivered the
 					// commit whose checks were observed: nothing here may leave
@@ -571,14 +574,30 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					return rerunOutcome, nil
 				}
 				rerunIssued = issued
+				if !rerunIssued {
+					issued, rerunOutcome = s.rerunTransientChecks(sctx, host, pr, checks)
+					if rerunOutcome != nil {
+						clearCIMonitorReady(sctx)
+						return rerunOutcome, nil
+					}
+					rerunIssued = issued
+				}
 			}
 			// A cancelled check is unresolved, not green, and it is not a job
 			// failure either: it reaches its own approval gate below rather
 			// than the fix agent. A check whose rerun the provider has not
 			// published yet is neither, so the monitor keeps waiting for it.
 			var unresolvedCancelled, awaitingRerun []string
+			var awaitingInfrastructure map[string]bool
 			if !rerunIssued {
+				awaitingInfrastructure = s.infrastructureReruns.awaitingFailureKeys(checks, sctx.Run.HeadSHA, pr.BaseBranch)
+				if len(awaitingInfrastructure) > 0 {
+					if err := s.persistRerunBudget(sctx); err != nil {
+						sctx.Log(fmt.Sprintf("warning: could not persist infrastructure rerun rollup grace: %v", err))
+					}
+				}
 				unresolvedCancelled, awaitingRerun = s.transientReruns.cancelledAfterRerun(checks)
+				awaitingRerun = mergeCheckNames(awaitingRerun, infrastructureFailureNames(awaitingInfrastructure))
 				// A cancelled check this run never re-ran is just as unresolved,
 				// and just as final: the provider published a conclusion for it,
 				// and with no rerun outstanding nothing this run is waiting on
@@ -600,6 +619,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					unresolvedCancelled = mergeCheckNames(unresolvedCancelled, s.transientReruns.cancelledWithoutRerun(checks))
 				}
 			}
+			failing := failingCheckNamesExcluding(checks, awaitingInfrastructure)
 			sort.Strings(failing)
 			sort.Strings(unresolvedCancelled)
 			sort.Strings(awaitingRerun)

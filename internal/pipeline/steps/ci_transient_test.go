@@ -26,6 +26,17 @@ type fakePreRunHost struct {
 	calls   int
 }
 
+type fakeArtifactInfrastructureHost struct {
+	scm.Host
+	results []scm.InfrastructureFailure
+	calls   int
+}
+
+func (h *fakeArtifactInfrastructureHost) ArtifactInfrastructureFailures(_ context.Context, _ *scm.PR, _ []scm.Check) ([]scm.InfrastructureFailure, error) {
+	h.calls++
+	return append([]scm.InfrastructureFailure(nil), h.results...), nil
+}
+
 func (h *fakePreRunHost) PreRunFailures(_ context.Context, checks []scm.Check) ([]bool, error) {
 	h.calls++
 	out := make([]bool, len(checks))
@@ -41,6 +52,56 @@ func markContext(t *testing.T, rerunBudget int) *pipeline.StepContext {
 		Ctx:    context.Background(),
 		Config: &config.Config{CI: config.CI{RerunTransient: rerunBudget}},
 		Log:    func(string) {},
+	}
+}
+
+func markInfrastructureContext(t *testing.T, rerunBudget int) *pipeline.StepContext {
+	t.Helper()
+	return &pipeline.StepContext{
+		Ctx:    context.Background(),
+		Config: &config.Config{CI: config.CI{RerunInfrastructure: rerunBudget}},
+		Log:    func(string) {},
+	}
+}
+
+// Artifact-service failures are marked without borrowing the cancellation
+// budget or changing their failed bucket. Their separate class is what admits
+// exactly the bounded infrastructure path while preserving the original CI
+// failure for the run record and any later escalation.
+func TestMarkArtifactInfrastructureFailures_UsesSeparateClassAndPreservesFailure(t *testing.T) {
+	t.Parallel()
+
+	checks := []scm.Check{{Name: "browser", Bucket: scm.CheckBucketFail, State: "FAILURE", Link: "job-link"}}
+	host := &fakeArtifactInfrastructureHost{results: []scm.InfrastructureFailure{{Retryable: true, Group: "run:1", Reason: "artifact transfer service"}}}
+	pr := &scm.PR{Number: "42", HeadSHA: "head-1", BaseBranch: "main"}
+	markArtifactInfrastructureFailures(markInfrastructureContext(t, 1), host, pr, checks)
+
+	if host.calls != 1 {
+		t.Fatalf("classifier calls = %d, want 1", host.calls)
+	}
+	if !checks[0].InfrastructureFailure || checks[0].InfrastructureGroup != "run:1" {
+		t.Fatalf("check = %+v, want infrastructure evidence", checks[0])
+	}
+	if checks[0].Bucket != scm.CheckBucketFail || checks[0].State != "FAILURE" {
+		t.Fatalf("marking rewrote first failure: %+v", checks[0])
+	}
+	if got := classifyCheckFailure(checks[0]); got != classInfrastructure {
+		t.Fatalf("classifyCheckFailure = %q, want %q", got, classInfrastructure)
+	}
+}
+
+// The new provider read is opt-in under its own key. Enabling cancelled-check
+// retries alone must not make artifact classification or spend its API budget.
+func TestMarkArtifactInfrastructureFailures_DoesNotBorrowTransientBudget(t *testing.T) {
+	t.Parallel()
+
+	checks := []scm.Check{{Name: "browser", Bucket: scm.CheckBucketFail, State: "FAILURE"}}
+	host := &fakeArtifactInfrastructureHost{results: []scm.InfrastructureFailure{{Retryable: true}}}
+	sctx := markInfrastructureContext(t, 0)
+	sctx.Config.CI.RerunTransient = config.MaxCIRerunTransient
+	markArtifactInfrastructureFailures(sctx, host, &scm.PR{Number: "42"}, checks)
+	if host.calls != 0 || checks[0].InfrastructureFailure {
+		t.Fatalf("transient budget activated infrastructure classifier: calls=%d check=%+v", host.calls, checks[0])
 	}
 }
 
@@ -138,6 +199,7 @@ func TestClassifyCheckFailure(t *testing.T) {
 		// setup/action-download outage) is infrastructure, not a code verdict: it
 		// is re-runnable even though its state is still FAILURE.
 		{"pre-run infrastructure failure", scm.Check{Name: "test", Bucket: scm.CheckBucketCancel, State: "FAILURE", PreRunFailure: true}, classTransient},
+		{"artifact infrastructure failure is separate", scm.Check{Name: "test", Bucket: scm.CheckBucketFail, State: "FAILURE", InfrastructureFailure: true}, classInfrastructure},
 		// The same FAILURE state without the pre-run mark is a genuine failure and
 		// must never be re-run: this is what keeps a real test failure from being
 		// masked as infrastructure.
@@ -645,6 +707,146 @@ func TestRerunningCancelledChecksIsOffByDefault(t *testing.T) {
 	check := scm.Check{Name: "build", Bucket: scm.CheckBucketCancel, State: "CANCELLED"}
 	if got := transientRerunCandidates([]scm.Check{check}, budget, config.DefaultCIRerunTransient); len(got) != 0 {
 		t.Fatalf("selected %d candidates at the default budget, want none", len(got))
+	}
+}
+
+// One infrastructure retry belongs to the exact head/base candidate, not to a
+// check name. A genuine sibling blocks the entire retry, and spending once on
+// the candidate cannot be reset by another artifact check or daemon restart.
+func TestInfrastructureRerunCandidates_OnePerCandidateAndGenuineSiblingBlocks(t *testing.T) {
+	t.Parallel()
+
+	infra := scm.Check{Name: "browser", Bucket: scm.CheckBucketFail, State: "FAILURE", Link: "job-1", InfrastructureFailure: true, InfrastructureGroup: "run:1", InfrastructureReason: "artifact transfer"}
+	budget := &infrastructureRerunBudget{}
+	got := infrastructureRerunCandidates([]scm.Check{infra}, budget, 1, "head-1", "main")
+	if len(got) != 1 {
+		t.Fatalf("first candidate selection = %+v, want one", got)
+	}
+	budget.spend(got[0], []scm.Check{infra}, "head-1", "main")
+	if got := infrastructureRerunCandidates([]scm.Check{infra}, budget, 1, "head-1", "main"); len(got) != 0 {
+		t.Fatalf("same candidate selected again: %+v", got)
+	}
+	if got := infrastructureRerunCandidates([]scm.Check{infra}, budget, 1, "head-2", "main"); len(got) != 1 {
+		t.Fatalf("new head candidate selection = %+v, want one", got)
+	}
+
+	genuine := scm.Check{Name: "unit", Bucket: scm.CheckBucketFail, State: "FAILURE"}
+	if got := infrastructureRerunCandidates([]scm.Check{infra, genuine}, &infrastructureRerunBudget{}, 1, "head-1", "main"); len(got) != 0 {
+		t.Fatalf("genuine sibling was masked by infrastructure retry: %+v", got)
+	}
+	for name, outside := range map[string]scm.Check{
+		"cancelled": {Name: "browser", Bucket: scm.CheckBucketCancel, State: "CANCELLED"},
+		"timed out": {Name: "browser", Bucket: scm.CheckBucketFail, State: "TIMED_OUT"},
+		"unknown":   {Name: "browser", Bucket: scm.CheckBucketFail, State: "QUARANTINED"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := infrastructureRerunCandidates([]scm.Check{outside}, &infrastructureRerunBudget{}, 1, "head-1", "main"); len(got) != 0 {
+				t.Fatalf("outside failure entered infrastructure retry: %+v", got)
+			}
+		})
+	}
+}
+
+// The first failure is durable evidence, not a transient log line. Recovery
+// must preserve its check, provider link, reason, head/base, and spent budget so
+// it cannot issue a second same-candidate rerun after a daemon restart.
+func TestInfrastructureRerunBudget_RestartRetainsFirstFailureAndSpentAttempt(t *testing.T) {
+	t.Parallel()
+
+	failedAt := time.Date(2026, 9, 8, 16, 0, 0, 0, time.UTC)
+	check := scm.Check{Name: "browser", Bucket: scm.CheckBucketFail, State: "FAILURE", CompletedAt: failedAt, Link: "job-1", InfrastructureFailure: true, InfrastructureGroup: "run:1", InfrastructureReason: "FinalizeArtifact HTTP 503"}
+	original := &infrastructureRerunBudget{}
+	original.spend(check, []scm.Check{check}, "head-1", "main")
+	encoded, err := original.marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := &infrastructureRerunBudget{}
+	if err := recovered.unmarshal(encoded); err != nil {
+		t.Fatal(err)
+	}
+	record, ok := recovered.firstFailure("head-1", "main")
+	if !ok {
+		t.Fatal("recovered budget lost first failure")
+	}
+	if record.Name != check.Name || record.Link != check.Link || record.Reason != check.InfrastructureReason || record.CompletedAt != failedAt || record.HeadSHA != "head-1" || record.BaseBranch != "main" {
+		t.Fatalf("recovered first failure = %+v, want original evidence", record)
+	}
+	if got := infrastructureRerunCandidates([]scm.Check{check}, recovered, 1, "head-1", "main"); len(got) != 0 {
+		t.Fatalf("restart handed back a spent candidate retry: %+v", got)
+	}
+}
+
+// Both policies share the existing opaque run column but retain independent
+// budgets. The combined codec must preserve the legacy transient shape and the
+// new first-failure record in one restart-safe payload.
+func TestCIRerunState_RestartPreservesIndependentTransientAndInfrastructureBudgets(t *testing.T) {
+	t.Parallel()
+
+	transient := &checkRerunBudget{}
+	cancelled := scm.Check{Name: "lint", Bucket: scm.CheckBucketCancel, State: "CANCELLED", Link: "cancel-link"}
+	transient.spend(cancelled, []scm.Check{cancelled}, "head-1")
+	infrastructure := &infrastructureRerunBudget{}
+	artifact := scm.Check{Name: "browser", Bucket: scm.CheckBucketFail, State: "FAILURE", Link: "artifact-link", InfrastructureFailure: true, InfrastructureGroup: "run:1", InfrastructureReason: "FinalizeArtifact HTTP 503"}
+	infrastructure.spend(artifact, []scm.Check{artifact}, "head-1", "main")
+
+	encoded, err := marshalCIRerunState(transient, infrastructure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveredTransient := &checkRerunBudget{}
+	recoveredInfrastructure := &infrastructureRerunBudget{}
+	if err := recoveredTransient.unmarshal(encoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoveredInfrastructure.unmarshal(encoded); err != nil {
+		t.Fatal(err)
+	}
+	if recoveredTransient.used("lint") != 1 {
+		t.Fatalf("transient spent = %d, want 1", recoveredTransient.used("lint"))
+	}
+	if recoveredInfrastructure.used("head-1", "main") != 1 {
+		t.Fatalf("infrastructure spent = %d, want 1", recoveredInfrastructure.used("head-1", "main"))
+	}
+}
+
+// A rerun receipt does not make the old failed rollup a new failure. It gets a
+// finite wait, while a changed completion is immediately treated as the second
+// attempt and may not be hidden from the ordinary CI path.
+func TestInfrastructureRerunBudget_WaitsOnlyForExactOldFailureRollup(t *testing.T) {
+	t.Parallel()
+
+	completed := time.Date(2026, 9, 8, 16, 0, 0, 0, time.UTC)
+	old := scm.Check{Name: "browser", Bucket: scm.CheckBucketFail, State: "FAILURE", CompletedAt: completed, Link: "job-1", InfrastructureFailure: true, InfrastructureGroup: "run:1"}
+	budget := &infrastructureRerunBudget{}
+	budget.spend(old, []scm.Check{old}, "head-1", "main")
+	for poll := 0; poll < rerunRollupGracePolls; poll++ {
+		if awaiting := budget.awaitingFailureKeys([]scm.Check{old}, "head-1", "main"); !awaiting[checkIdentity(old)] {
+			t.Fatalf("poll %d awaiting = %v, want exact old failure", poll+1, awaiting)
+		}
+	}
+	if awaiting := budget.awaitingFailureKeys([]scm.Check{old}, "head-1", "main"); len(awaiting) != 0 {
+		t.Fatalf("grace was unbounded: %v", awaiting)
+	}
+
+	budget = &infrastructureRerunBudget{}
+	budget.spend(old, []scm.Check{old}, "head-1", "main")
+	second := old
+	second.CompletedAt = completed.Add(time.Minute)
+	if awaiting := budget.awaitingFailureKeys([]scm.Check{second}, "head-1", "main"); len(awaiting) != 0 {
+		t.Fatalf("new failed attempt was hidden as old rollup: %v", awaiting)
+	}
+}
+
+// The bounded exception is disabled unless trusted configuration opts in.
+func TestRerunningArtifactInfrastructureIsOffByDefault(t *testing.T) {
+	t.Parallel()
+	if config.DefaultCIRerunInfrastructure != 0 || config.MaxCIRerunInfrastructure != 1 {
+		t.Fatalf("infrastructure retry bounds = default %d max %d, want 0 and 1", config.DefaultCIRerunInfrastructure, config.MaxCIRerunInfrastructure)
+	}
+	check := scm.Check{Name: "browser", Bucket: scm.CheckBucketFail, State: "FAILURE", InfrastructureFailure: true, InfrastructureGroup: "run:1"}
+	if got := infrastructureRerunCandidates([]scm.Check{check}, &infrastructureRerunBudget{}, config.DefaultCIRerunInfrastructure, "head", "main"); len(got) != 0 {
+		t.Fatalf("default selected infrastructure retry: %+v", got)
 	}
 }
 

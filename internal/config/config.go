@@ -83,6 +83,15 @@ const (
 	// with an agent round, but they are not free: each one keeps the monitor
 	// polling the same commit, so the budget stays small by construction.
 	MaxCIRerunTransient = 5
+	// DefaultCIRerunInfrastructure keeps artifact-service and runner
+	// infrastructure retries opt-in. The classifier is deliberately narrow, but
+	// every retry still consumes provider resources and repeats work on the same
+	// candidate.
+	DefaultCIRerunInfrastructure = 0
+	// MaxCIRerunInfrastructure is one because the exception answers one
+	// independently proven provider failure; a second failed attempt is new
+	// evidence that must follow the ordinary CI failure path.
+	MaxCIRerunInfrastructure = 1
 	// DefaultCIRevalidateRepairs is the policy the CI step uses when
 	// ci.revalidate_repairs is unset. It is false because restarting the whole
 	// pipeline at Review for every CI repair is the single most expensive
@@ -498,7 +507,8 @@ type AutoFixRaw struct {
 // CIRaw is the YAML representation of CI-step settings.
 // Pointer fields distinguish "not set" (nil) from "set to 0" (disabled).
 type CIRaw struct {
-	RerunTransient *int `yaml:"rerun_transient"`
+	RerunTransient      *int `yaml:"rerun_transient"`
+	RerunInfrastructure *int `yaml:"rerun_infrastructure"`
 	// RevalidateRepairs is a pointer so an explicit `false` in a repository's
 	// config can override a global `true`, which a plain bool could not
 	// express (it would be indistinguishable from "not set").
@@ -513,6 +523,11 @@ type CI struct {
 	// an approval gate. 0 disables reruns and restores the behavior of
 	// escalating every failure on sight.
 	RerunTransient int
+	// RerunInfrastructure is a candidate-wide allowance for a provider-proven
+	// artifact-transfer infrastructure failure after every repository-owned step
+	// succeeded. It is separate from cancellation/pre-run retries, defaults off,
+	// and is capped at one.
+	RerunInfrastructure int
 	// RevalidateRepairs selects what happens after the CI step's fix agent
 	// produces a real repair commit.
 	//
@@ -1041,6 +1056,11 @@ auto_fix:
 # default branch overrides this value.
 ci:
   rerun_transient: 0
+  # How many times one exact head/base candidate may retry a failed GitHub
+  # Actions job when structured job data proves every repository step passed
+  # and the only failure is artifact transfer infrastructure. Defaults to 0 and
+  # is capped at 1. This budget is independent of rerun_transient.
+  rerun_infrastructure: 0
   # Whether EVERY CI repair must re-pass the whole pipeline before it is
   # published, or only the ones whose continuity with the reviewed head cannot
   # be proven. Defaults to false: a repair that descends from the reviewed head
@@ -2359,7 +2379,8 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		// default-branch copy so a pushed branch cannot self-declare no-CI and
 		// bypass checks that the default branch still expects.
 		effective.NoCI = trusted.NoCI
-		// The whole ci block is trusted-only. ci.rerun_transient spends the
+		// The whole ci block is trusted-only. ci.rerun_transient and
+		// ci.rerun_infrastructure spend the
 		// maintainer's resources rather than the contributor's: every rerun is
 		// another provider-side workflow run billed to the repository, so a
 		// pushed branch must not be able to raise its own rerun budget to the
@@ -2665,8 +2686,9 @@ func autoFixDefaults() AutoFix {
 // behavior, so it is opted into rather than paid for by default.
 func ciDefaults() CI {
 	return CI{
-		RerunTransient:    DefaultCIRerunTransient,
-		RevalidateRepairs: DefaultCIRevalidateRepairs,
+		RerunTransient:      DefaultCIRerunTransient,
+		RerunInfrastructure: DefaultCIRerunInfrastructure,
+		RevalidateRepairs:   DefaultCIRevalidateRepairs,
 	}
 }
 
@@ -2677,6 +2699,9 @@ func ciDefaults() CI {
 func applyCIOverrides(dst *CI, src *CIRaw) {
 	if src.RerunTransient != nil {
 		dst.RerunTransient = min(max(*src.RerunTransient, 0), MaxCIRerunTransient)
+	}
+	if src.RerunInfrastructure != nil {
+		dst.RerunInfrastructure = min(max(*src.RerunInfrastructure, 0), MaxCIRerunInfrastructure)
 	}
 	// Applied independently of the rerun budget so a config that sets only one
 	// of the two keys does not silently discard the other, and so an explicit

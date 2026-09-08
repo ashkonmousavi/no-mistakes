@@ -1252,6 +1252,32 @@ func TestRerunCheckTargetsJobFromCheckLink(t *testing.T) {
 	}
 }
 
+// One infrastructure allowance covers every failed artifact job in the
+// provider run. Targeting only the representative job would leave same-group
+// failures untouched while the pipeline temporarily suppresses their old
+// rollup, so this class must use GitHub's failed-jobs rerun primitive once.
+func TestRerunCheck_ArtifactInfrastructureTargetsFailedJobsForOneRun(t *testing.T) {
+	t.Parallel()
+
+	var recorded [][]string
+	host := New(recordingCmdFactory("", &recorded), nil, "", "test/repo")
+	check := scm.Check{
+		Name:                  "browser",
+		Bucket:                scm.CheckBucketFail,
+		State:                 "FAILURE",
+		Link:                  "https://github.com/test/repo/actions/runs/900/job/901",
+		InfrastructureFailure: true,
+		InfrastructureGroup:   "github-actions-run:900",
+	}
+	if err := host.RerunCheck(context.Background(), &scm.PR{Number: "123"}, check); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"gh", "run", "rerun", "900", "--failed", "--repo", "test/repo"}
+	if len(recorded) != 1 || strings.Join(recorded[0], " ") != strings.Join(want, " ") {
+		t.Fatalf("rerun invocations = %v, want one %v", recorded, want)
+	}
+}
+
 func TestRerunCheckTargetsWholeCancelledRun(t *testing.T) {
 	t.Parallel()
 
@@ -1380,10 +1406,10 @@ func TestPreRunFailures_FlagsSetupFailureNotGenuine(t *testing.T) {
 	t.Parallel()
 
 	host := New(githubTestCmdFactory(map[string]githubTestResponse{
-		"gh run view 1 --repo test/repo --json jobs": {
+		"gh api --method GET repos/test/repo/actions/runs/1/jobs -f filter=latest -f per_page=100": {
 			stdout: `{"jobs":[` +
-				`{"databaseId":2,"name":"build","conclusion":"failure","steps":[{"name":"Set up job","number":1,"conclusion":"failure"}]},` +
-				`{"databaseId":3,"name":"unit","conclusion":"failure","steps":[{"name":"Set up job","number":1,"conclusion":"success"},{"name":"Run tests","number":2,"conclusion":"failure"}]}` +
+				`{"id":2,"name":"build","conclusion":"failure","steps":[{"name":"Set up job","number":1,"conclusion":"failure"}]},` +
+				`{"id":3,"name":"unit","conclusion":"failure","steps":[{"name":"Set up job","number":1,"conclusion":"success"},{"name":"Run tests","number":2,"conclusion":"failure"}]}` +
 				`]}` + "\n",
 		},
 	}), nil, "", "test/repo")
@@ -1412,7 +1438,7 @@ func TestPreRunFailures_FailsClosedOnUnreadableRun(t *testing.T) {
 	t.Parallel()
 
 	host := New(githubTestCmdFactory(map[string]githubTestResponse{
-		"gh run view 9 --repo test/repo --json jobs": {stderr: "HTTP 404\n", code: 1},
+		"gh api --method GET repos/test/repo/actions/runs/9/jobs -f filter=latest -f per_page=100": {stderr: "HTTP 404\n", code: 1},
 	}), nil, "", "test/repo")
 
 	infra, err := host.PreRunFailures(context.Background(), []scm.Check{
@@ -1423,6 +1449,137 @@ func TestPreRunFailures_FailsClosedOnUnreadableRun(t *testing.T) {
 	}
 	if len(infra) != 1 || infra[0] {
 		t.Fatalf("PreRunFailures = %v, want nothing flagged when the run is unreadable", infra)
+	}
+}
+
+// An artifact action may fail after every repository-owned step passed. The
+// classifier must bind that narrow exception to the exact PR/head/base and the
+// first workflow attempt, and must use the log only to prove the action identity
+// that GitHub's structured jobs response does not expose.
+func TestArtifactInfrastructureFailures_AdmitsArtifactOnlyFailureOnExactFirstAttempt(t *testing.T) {
+	t.Parallel()
+
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh api --method GET repos/test/repo/actions/runs/1": {
+			stdout: `{"id":1,"head_sha":"head-1","run_attempt":1,"pull_requests":[{"number":42,"head":{"sha":"head-1"},"base":{"ref":"main"}}]}` + "\n",
+		},
+		"gh api --method GET repos/test/repo/actions/runs/1/jobs -f filter=latest -f per_page=100": {
+			stdout: `{"total_count":1,"jobs":[{"id":2,"run_id":1,"head_sha":"head-1","name":"build","status":"completed","conclusion":"failure","steps":[{"name":"Run tests","number":2,"status":"completed","conclusion":"success"},{"name":"Upload artifact","number":3,"status":"completed","conclusion":"failure"}]}]}` + "\n",
+		},
+		"gh api --method GET repos/test/repo/actions/jobs/2/logs": {
+			stdout: "2026-09-08T00:00:00Z ##[group]Run actions/upload-artifact@v4\n2026-09-08T00:00:01Z ##[error]FinalizeArtifact failed: HTTP 503\n",
+		},
+	}), nil, "", "test/repo")
+
+	got, err := host.ArtifactInfrastructureFailures(context.Background(), &scm.PR{Number: "42", HeadSHA: "head-1", BaseBranch: "main"}, []scm.Check{
+		{Name: "build", Bucket: scm.CheckBucketFail, State: "FAILURE", Link: "https://github.com/test/repo/actions/runs/1/job/2"},
+	})
+	if err != nil {
+		t.Fatalf("ArtifactInfrastructureFailures() error = %v", err)
+	}
+	if len(got) != 1 || !got[0].Retryable {
+		t.Fatalf("ArtifactInfrastructureFailures() = %+v, want one retryable result", got)
+	}
+	if got[0].Group != "github-actions-run:1" {
+		t.Fatalf("group = %q, want github-actions-run:1", got[0].Group)
+	}
+}
+
+// A failed repository step can coexist with an artifact action in the log. It
+// must remain a genuine failure; otherwise the infrastructure exception masks
+// the exact test/lint failure it is designed never to delay.
+func TestArtifactInfrastructureFailures_RejectsRepositoryFailureEvenWhenArtifactActionRan(t *testing.T) {
+	t.Parallel()
+
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh api --method GET repos/test/repo/actions/runs/1": {
+			stdout: `{"id":1,"head_sha":"head-1","run_attempt":1,"pull_requests":[{"number":42,"head":{"sha":"head-1"},"base":{"ref":"main"}}]}` + "\n",
+		},
+		"gh api --method GET repos/test/repo/actions/runs/1/jobs -f filter=latest -f per_page=100": {
+			stdout: `{"total_count":1,"jobs":[{"id":2,"run_id":1,"head_sha":"head-1","name":"build","status":"completed","conclusion":"failure","steps":[{"name":"Run tests","number":2,"status":"completed","conclusion":"failure"},{"name":"Upload artifact","number":3,"status":"completed","conclusion":"success"}]}]}` + "\n",
+		},
+	}), nil, "", "test/repo")
+
+	got, err := host.ArtifactInfrastructureFailures(context.Background(), &scm.PR{Number: "42", HeadSHA: "head-1", BaseBranch: "main"}, []scm.Check{
+		{Name: "build", Bucket: scm.CheckBucketFail, State: "FAILURE", Link: "https://github.com/test/repo/actions/runs/1/job/2"},
+	})
+	if err != nil {
+		t.Fatalf("ArtifactInfrastructureFailures() error = %v", err)
+	}
+	if len(got) != 1 || got[0].Retryable {
+		t.Fatalf("ArtifactInfrastructureFailures() = %+v, want genuine failure rejected", got)
+	}
+}
+
+// A service-side FinalizeArtifact/ListArtifacts error is retryable only for a
+// 403 or 5xx response. The HTTP class is log evidence because the jobs API does
+// not carry it; a 400 therefore stays an ordinary failure.
+func TestArtifactInfrastructureFailures_RequiresRetryableArtifactServiceHTTPStatus(t *testing.T) {
+	t.Parallel()
+
+	for name, logText := range map[string]string{
+		"403":                        "Run actions/upload-artifact@v4\nFinalizeArtifact failed: HTTP 403 Forbidden",
+		"503":                        "Run actions/download-artifact@v4\nListArtifacts request returned status 503",
+		"400 is not infrastructure":  "Run actions/upload-artifact@v4\nFinalizeArtifact failed: HTTP 400 Bad Request",
+		"timestamp is not a 5xx":     "2026-09-08T00:00:00.500Z Run actions/upload-artifact@v4\nFinalizeArtifact failed without an HTTP status",
+		"operation without action":   "FinalizeArtifact failed: HTTP 503",
+		"action without service 5xx": "Run actions/upload-artifact@v4\ninput path did not match any files",
+	} {
+		t.Run(name, func(t *testing.T) {
+			host := New(githubTestCmdFactory(map[string]githubTestResponse{
+				"gh api --method GET repos/test/repo/actions/runs/1":                                       {stdout: `{"id":1,"head_sha":"head-1","run_attempt":1,"pull_requests":[{"number":42,"head":{"sha":"head-1"},"base":{"ref":"main"}}]}`},
+				"gh api --method GET repos/test/repo/actions/runs/1/jobs -f filter=latest -f per_page=100": {stdout: `{"total_count":1,"jobs":[{"id":2,"run_id":1,"head_sha":"head-1","name":"build","status":"completed","conclusion":"failure","steps":[{"name":"Run tests","number":2,"conclusion":"success"},{"name":"Upload artifact","number":3,"conclusion":"failure"}]}]}`},
+				"gh api --method GET repos/test/repo/actions/jobs/2/logs":                                  {stdout: logText},
+			}), nil, "", "test/repo")
+			got, err := host.ArtifactInfrastructureFailures(context.Background(), &scm.PR{Number: "42", HeadSHA: "head-1", BaseBranch: "main"}, []scm.Check{{Name: "build", Bucket: scm.CheckBucketFail, State: "FAILURE", Link: "https://github.com/test/repo/actions/runs/1/job/2"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := name == "403" || name == "503"
+			if got[0].Retryable != want {
+				t.Fatalf("Retryable = %v, want %v for log %q", got[0].Retryable, want, logText)
+			}
+		})
+	}
+}
+
+// A rerun, stale head, or changed base is not the candidate being certified.
+// All three must fail closed before any job log can authorize another attempt.
+func TestArtifactInfrastructureFailures_RejectsDifferentCandidateAndSecondAttempt(t *testing.T) {
+	t.Parallel()
+
+	for name, runJSON := range map[string]string{
+		"different head": `{"id":1,"head_sha":"other","run_attempt":1,"pull_requests":[{"number":42,"head":{"sha":"other"},"base":{"ref":"main"}}]}`,
+		"different base": `{"id":1,"head_sha":"head-1","run_attempt":1,"pull_requests":[{"number":42,"head":{"sha":"head-1"},"base":{"ref":"release"}}]}`,
+		"second attempt": `{"id":1,"head_sha":"head-1","run_attempt":2,"pull_requests":[{"number":42,"head":{"sha":"head-1"},"base":{"ref":"main"}}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			host := New(githubTestCmdFactory(map[string]githubTestResponse{
+				"gh api --method GET repos/test/repo/actions/runs/1": {stdout: runJSON},
+			}), nil, "", "test/repo")
+			got, err := host.ArtifactInfrastructureFailures(context.Background(), &scm.PR{Number: "42", HeadSHA: "head-1", BaseBranch: "main"}, []scm.Check{{Name: "build", Bucket: scm.CheckBucketFail, State: "FAILURE", Link: "https://github.com/test/repo/actions/runs/1/job/2"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got[0].Retryable {
+				t.Fatalf("mismatched run was classified retryable: %+v", got[0])
+			}
+		})
+	}
+}
+
+// Malformed structured provider output never becomes an infrastructure
+// verdict. Returning an error lets the CI monitor record why it failed closed.
+func TestArtifactInfrastructureFailures_MalformedJobsFailClosed(t *testing.T) {
+	t.Parallel()
+
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh api --method GET repos/test/repo/actions/runs/1":                                       {stdout: `{"id":1,"head_sha":"head-1","run_attempt":1,"pull_requests":[{"number":42,"head":{"sha":"head-1"},"base":{"ref":"main"}}]}`},
+		"gh api --method GET repos/test/repo/actions/runs/1/jobs -f filter=latest -f per_page=100": {stdout: `{not-json`},
+	}), nil, "", "test/repo")
+	got, err := host.ArtifactInfrastructureFailures(context.Background(), &scm.PR{Number: "42", HeadSHA: "head-1", BaseBranch: "main"}, []scm.Check{{Name: "build", Bucket: scm.CheckBucketFail, State: "FAILURE", Link: "https://github.com/test/repo/actions/runs/1/job/2"}})
+	if err == nil {
+		t.Fatalf("ArtifactInfrastructureFailures() = %+v, want malformed-output error", got)
 	}
 }
 
