@@ -143,7 +143,8 @@ type StepOutcome struct {
 	// the fix attempt performed during this round. Steps populate it in fix
 	// mode so the executor can persist it on the round record and later
 	// rounds can reference what was previously attempted.
-	FixSummary string
+	FixSummary      string
+	RepairPublished bool
 	// ReviewApprovedHeadSHA is set only by a successfully executed full review
 	// round. The executor durably records it only when the review step actually
 	// completes, never while that outcome is parked or after a failed round.
