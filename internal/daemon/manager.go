@@ -422,6 +422,36 @@ func agentListsEqual(a, b []types.AgentName) bool {
 	return true
 }
 
+// trustedConfigOverrideFields names which code-executing RepoConfig fields
+// the pushed branch's own copy disagrees with the effective (trusted) copy
+// the run actually uses, so the run-start baseline log can say exactly which
+// field was silently overridden instead of a generic "commands/agent
+// differ". Only the fields EffectiveRepoConfig takes from the trusted copy
+// when allowRepoCommands is off are compared here (see AGENTS.md "Repo
+// Config Trust Boundary (security)").
+func trustedConfigOverrideFields(pushed, effective *config.RepoConfig) []string {
+	var fields []string
+	if pushed.Commands.Prepare != effective.Commands.Prepare {
+		fields = append(fields, "commands.prepare")
+	}
+	if pushed.Commands.Lint != effective.Commands.Lint {
+		fields = append(fields, "commands.lint")
+	}
+	if pushed.Commands.Test != effective.Commands.Test {
+		fields = append(fields, "commands.test")
+	}
+	if pushed.Commands.Format != effective.Commands.Format {
+		fields = append(fields, "commands.format")
+	}
+	if pushed.Agent != effective.Agent {
+		fields = append(fields, "agent")
+	}
+	if !agentListsEqual(pushed.Agents, effective.Agents) {
+		fields = append(fields, "agents")
+	}
+	return fields
+}
+
 // Subscribe registers a subscriber mailbox for a run.
 //
 // The returned subscription always opens with a stream-gap frame, so a
@@ -1299,11 +1329,15 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 	effectiveRepoCfg := config.EffectiveRepoConfig(repoCfg, trustedRepoCfg, allowRepoCommands)
 	if allowRepoCommands {
 		slog.Warn("allow_repo_commands is enabled on the default branch: honoring commands/agent from pushed branch", "run_id", run.ID, "branch", branch)
-	} else if repoCfg.Commands != effectiveRepoCfg.Commands || repoCfg.Agent != effectiveRepoCfg.Agent || !agentListsEqual(repoCfg.Agents, effectiveRepoCfg.Agents) {
+	} else if diverged := trustedConfigOverrideFields(repoCfg, effectiveRepoCfg); len(diverged) > 0 {
 		// Surface the silent override so a maintainer who shipped a commands.*
-		// or agent change on a feature branch understands why it did not run.
-		// This is not an error: it is the secure default in action.
-		slog.Info("repo commands/agent loaded from default branch, not pushed branch", "run_id", run.ID, "branch", branch, "default_branch", repo.DefaultBranch)
+		// or agent change on a feature branch understands why it did not run,
+		// naming each field involved and the opt-in that would honor it. This
+		// is not an error: it is the secure default in action.
+		slog.Info("repo config fields differ from trusted default branch; using trusted values",
+			"run_id", run.ID, "branch", branch, "default_branch", repo.DefaultBranch,
+			"fields", strings.Join(diverged, ","),
+			"opt_in", "allow_repo_commands on the default branch's .no-mistakes.yaml")
 	}
 	cfg := config.Merge(globalCfg, effectiveRepoCfg)
 	if err := m.paths.ValidateEvidenceRoot(cfg.Test.Evidence.LocalRoot); err != nil {
