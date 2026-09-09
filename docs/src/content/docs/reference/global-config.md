@@ -575,8 +575,8 @@ The key is matched against the checkout path recorded at `init`. After moving a 
 ### auto_fix
 
 Maximum follow-up auto-fix attempts per step. Set a step to `0` to disable the follow-up auto-fix loop, so findings require manual approval.
-The document step attempts documentation fixes during its initial pass, so unresolved documentation findings pause for approval instead of using an automatic follow-up loop.
-For empty `commands.lint`, the document step's combined housekeeping pass also attempts safe lint fixes, and the lint step consumes its result; unresolved blocking lint findings then pause for approval instead of starting another automatic fix loop.
+`auto_fix.document` is also the switch for the document step's [bounded in-run correction](/no-mistakes/reference/pipeline-steps/#document): above `0`, an accepted documentation finding is corrected and committed inside the run (at most one correcting round, restricted to [`document.correction_paths`](/no-mistakes/reference/repo-config/#documentcorrection_paths)); at `0` the step stays strictly report-only and findings are resolved outside the run.
+For empty `commands.lint`, the document step's combined housekeeping pass also assesses lint, and the lint step consumes its result; unresolved blocking lint findings then pause for approval instead of starting another automatic fix loop.
 
 |      |          |
 | ---- | -------- |
@@ -587,7 +587,7 @@ For empty `commands.lint`, the document step's combined housekeeping pass also a
 | `auto_fix.rebase`   | `int` | `3`     | Rebase conflict auto-fix attempts                                                           |
 | `auto_fix.review`   | `int` | `0`     | Review finding auto-fix attempts                                                            |
 | `auto_fix.test`     | `int` | `3`     | Test failure auto-fix attempts                                                              |
-| `auto_fix.document` | `int` | `3`     | Not used by the automatic document pass                                                     |
+| `auto_fix.document` | `int` | `3`     | Bounded in-run documentation correction rounds (`0` = report-only)                          |
 | `auto_fix.lint`     | `int` | `3`     | Lint issue auto-fix attempts                                                                |
 | `auto_fix.ci`       | `int` | `3`     | CI auto-fix attempts for CI failures, plus GitHub, GitLab, Forgejo, and Azure DevOps merge conflicts |
 
