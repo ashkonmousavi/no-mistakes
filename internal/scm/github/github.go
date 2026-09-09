@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 )
@@ -430,6 +431,36 @@ func (h *Host) GetPRBaseBranch(ctx context.Context, pr *scm.PR) (string, error) 
 		return "", fmt.Errorf("gh pr view base branch: %w", err)
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+func (h *Host) GetPRTarget(ctx context.Context, pr *scm.PR) (scm.PRTarget, error) {
+	selector, err := prSelector(pr)
+	if err != nil {
+		return scm.PRTarget{}, err
+	}
+	args := append([]string{"pr", "view", selector}, h.repoArgs()...)
+	args = append(args, "--json", "headRefOid,baseRefName,baseRefOid")
+	out, err := h.cmd(ctx, "gh", args...).Output()
+	if err != nil {
+		return scm.PRTarget{}, fmt.Errorf("gh pr view target: %w", err)
+	}
+	var payload struct {
+		HeadSHA    string `json:"headRefOid"`
+		BaseBranch string `json:"baseRefName"`
+		BaseSHA    string `json:"baseRefOid"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		return scm.PRTarget{}, fmt.Errorf("parse gh pr target: %w", err)
+	}
+	target := scm.PRTarget{
+		HeadSHA:    strings.TrimSpace(payload.HeadSHA),
+		BaseBranch: strings.TrimSpace(payload.BaseBranch),
+		BaseSHA:    strings.TrimSpace(payload.BaseSHA),
+	}
+	if target.HeadSHA == "" || target.BaseBranch == "" || target.BaseSHA == "" {
+		return scm.PRTarget{}, fmt.Errorf("gh pr target is incomplete")
+	}
+	return target, nil
 }
 
 func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
@@ -897,6 +928,15 @@ func (h *Host) rerunTargetArgs(check scm.Check) ([]string, bool) {
 	switch {
 	case !ok:
 		return nil, false
+	case check.InfrastructureFailure:
+		// GitHub's failed-jobs primitive also re-runs dependent jobs. It is
+		// authorized only after the classifier has bound the full failed family,
+		// its one PR-only omission, the joined in-workflow guard, and retained
+		// producer provenance to this exact run.
+		if !check.InfrastructureRerunSafe {
+			return nil, false
+		}
+		return []string{runID, "--failed"}, true
 	case jobID != "":
 		return []string{"--job", jobID}, true
 	case strings.EqualFold(strings.TrimSpace(check.State), "CANCELLED"):
@@ -990,7 +1030,7 @@ func (h *Host) PreRunFailures(ctx context.Context, checks []scm.Check) ([]bool, 
 		}
 		jobs, seen := runJobs[runID]
 		if !seen {
-			jobs = h.fetchRunJobs(ctx, runID)
+			jobs, _ = h.fetchRunJobs(ctx, runID)
 			runJobs[runID] = jobs
 		}
 		job, found := matchRunJob(jobs, jobID, check.Name)
@@ -1004,18 +1044,79 @@ func (h *Host) PreRunFailures(ctx context.Context, checks []scm.Check) ([]bool, 
 // fetchRunJobs reads a run's jobs (with their steps) from Actions. A run it
 // cannot read yields no jobs, so every check on it fails closed to a genuine
 // failure rather than being guessed as infrastructure.
-func (h *Host) fetchRunJobs(ctx context.Context, runID string) []githubRunJob {
-	viewArgs := append([]string{"run", "view", runID}, h.repoArgs()...)
-	viewArgs = append(viewArgs, "--json", "jobs")
-	out, err := h.cmd(ctx, "gh", viewArgs...).Output()
+func (h *Host) fetchRunJobs(ctx context.Context, runID string) ([]githubRunJob, error) {
+	repo := h.repoSlug()
+	if repo == "" {
+		return nil, errors.New("repository slug is required to read workflow jobs")
+	}
+	args := []string{"api"}
+	if h.host != "" {
+		args = append(args, "--hostname", h.host)
+	}
+	args = append(args, "--method", "GET", "repos/"+repo+"/actions/runs/"+runID+"/jobs", "-f", "filter=latest", "-f", "per_page=100")
+	out, err := h.cmd(ctx, "gh", args...).CombinedOutput()
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("gh api workflow jobs: %s: %w", strings.TrimSpace(string(out)), err)
 	}
-	var payload githubRunView
+	var payload githubRunJobsResponse
 	if err := json.Unmarshal(out, &payload); err != nil {
-		return nil
+		return nil, fmt.Errorf("parse workflow jobs: %w", err)
 	}
-	return payload.Jobs
+	return payload.Jobs, nil
+}
+
+// fetchRunAttemptJobs reads and validates the complete job population for one
+// immutable workflow attempt. --paginate --slurp preserves page boundaries so
+// total_count can be checked against the union; a missing page, duplicate job,
+// or inconsistent count fails closed instead of authorizing a partial retry.
+func (h *Host) fetchRunAttemptJobs(ctx context.Context, runID string, attempt int) ([]githubRunJob, error) {
+	repo := h.repoSlug()
+	if repo == "" {
+		return nil, errors.New("repository slug is required to read workflow attempt jobs")
+	}
+	if attempt <= 0 {
+		return nil, errors.New("workflow attempt is required to read jobs")
+	}
+	args := []string{"api"}
+	if h.host != "" {
+		args = append(args, "--hostname", h.host)
+	}
+	endpoint := fmt.Sprintf("repos/%s/actions/runs/%s/attempts/%d/jobs", repo, runID, attempt)
+	args = append(args, "--method", "GET", endpoint, "-f", "per_page=100", "--paginate", "--slurp")
+	out, err := h.cmd(ctx, "gh", args...).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("gh api workflow attempt jobs: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	var pages []githubRunJobsResponse
+	if err := json.Unmarshal(out, &pages); err != nil {
+		return nil, fmt.Errorf("parse workflow attempt jobs: %w", err)
+	}
+	if len(pages) == 0 {
+		return nil, errors.New("workflow attempt jobs response contained no pages")
+	}
+	total := pages[0].TotalCount
+	if total < 0 {
+		return nil, errors.New("workflow attempt jobs response has a negative total_count")
+	}
+	jobs := make([]githubRunJob, 0, total)
+	seen := map[int]bool{}
+	for _, page := range pages {
+		if page.TotalCount != total {
+			return nil, errors.New("workflow attempt jobs pages disagree on total_count")
+		}
+		for _, job := range page.Jobs {
+			id := job.databaseID()
+			if id <= 0 || seen[id] {
+				return nil, errors.New("workflow attempt jobs contain a missing or duplicate job id")
+			}
+			seen[id] = true
+			jobs = append(jobs, job)
+		}
+	}
+	if len(jobs) != total {
+		return nil, fmt.Errorf("workflow attempt jobs response is incomplete: got %d of %d jobs", len(jobs), total)
+	}
+	return jobs, nil
 }
 
 // matchRunJob finds the job a check names: by databaseId when the check's link
@@ -1024,13 +1125,25 @@ func (h *Host) fetchRunJobs(ctx context.Context, runID string) []githubRunJob {
 func matchRunJob(jobs []githubRunJob, jobID, checkName string) (githubRunJob, bool) {
 	if jobID != "" {
 		for _, job := range jobs {
-			if strconv.Itoa(job.DatabaseID) == jobID {
+			if strconv.Itoa(job.databaseID()) == jobID {
 				return job, true
 			}
 		}
 	}
 	for _, job := range jobs {
 		if normalizeRunName(job.Name) == normalizeRunName(checkName) {
+			return job, true
+		}
+	}
+	return githubRunJob{}, false
+}
+
+func matchRunJobExact(jobs []githubRunJob, jobID, checkName string) (githubRunJob, bool) {
+	if jobID == "" {
+		return githubRunJob{}, false
+	}
+	for _, job := range jobs {
+		if strconv.Itoa(job.databaseID()) == jobID && normalizeRunName(job.Name) == normalizeRunName(checkName) {
 			return job, true
 		}
 	}
@@ -1048,6 +1161,1047 @@ func jobFailedAtSetup(job githubRunJob) bool {
 	for _, step := range job.Steps {
 		if step.Number == 1 || strings.EqualFold(strings.TrimSpace(step.Name), "Set up job") {
 			return strings.EqualFold(strings.TrimSpace(step.Conclusion), "failure")
+		}
+	}
+	return false
+}
+
+// ArtifactInfrastructureFailures classifies one complete attempt-one failure
+// family. GitHub's jobs API proves the exact run/head and every conclusion;
+// job logs bind each initiating failure to a pinned artifact action and its
+// terminal service error. The only dispatch-safe family is the joined XAU
+// topology whose own guard will revalidate attempt one inside every rerun job.
+// Missing, ambiguous, stale, or partially joined evidence fails closed.
+func (h *Host) ArtifactInfrastructureFailures(ctx context.Context, pr *scm.PR, checks []scm.Check) ([]scm.InfrastructureFailure, error) {
+	result := make([]scm.InfrastructureFailure, len(checks))
+	if pr == nil || strings.TrimSpace(pr.Number) == "" || strings.TrimSpace(pr.HeadSHA) == "" || strings.TrimSpace(pr.BaseBranch) == "" || strings.TrimSpace(pr.BaseSHA) == "" {
+		return result, nil
+	}
+	prNumber, err := strconv.Atoi(strings.TrimSpace(pr.Number))
+	if err != nil {
+		return result, nil
+	}
+	type cachedRun struct {
+		metadata       githubWorkflowRun
+		jobs           []githubRunJob
+		classification artifactRunClassification
+		classified     bool
+		err            error
+	}
+	cache := map[string]cachedRun{}
+	for i, check := range checks {
+		runID, jobID, ok := h.actionsRerunTarget(check.Link)
+		if !ok || jobID == "" {
+			continue
+		}
+		entry, seen := cache[runID]
+		if !seen {
+			entry.metadata, entry.err = h.fetchWorkflowRun(ctx, runID)
+			if entry.err == nil && workflowRunMatchesCandidate(entry.metadata, prNumber, pr.HeadSHA, pr.BaseBranch, pr.BaseSHA) {
+				entry.jobs, entry.err = h.fetchRunAttemptJobs(ctx, runID, 1)
+			}
+			cache[runID] = entry
+		}
+		if entry.err != nil {
+			return result, entry.err
+		}
+		if !workflowRunMatchesCandidate(entry.metadata, prNumber, pr.HeadSHA, pr.BaseBranch, pr.BaseSHA) {
+			continue
+		}
+		job, found := matchRunJobExact(entry.jobs, jobID, check.Name)
+		if !found || strings.TrimSpace(job.HeadSHA) != strings.TrimSpace(pr.HeadSHA) {
+			continue
+		}
+		if !entry.classified {
+			entry.classification, entry.err = h.classifyArtifactRun(ctx, entry.metadata, entry.jobs, checks, runID, pr.HeadSHA, pr.BaseSHA)
+			entry.classified = true
+			cache[runID] = entry
+		}
+		if entry.err != nil {
+			return result, entry.err
+		}
+		classification := entry.classification
+		if classification.skippedDependentJobs[job.databaseID()] {
+			result[i] = scm.InfrastructureFailure{
+				RerunDependent: true,
+				Group:          "github-actions-run:" + runID,
+				HeadSHA:        strings.TrimSpace(pr.HeadSHA),
+				BaseSHA:        strings.TrimSpace(pr.BaseSHA),
+				RerunSafe:      classification.rerunSafe,
+				Evidence:       classification.evidence,
+			}
+			continue
+		}
+		if classification.omittedJobs[job.databaseID()] {
+			result[i] = scm.InfrastructureFailure{
+				RerunOmission: true,
+				Group:         "github-actions-run:" + runID,
+				HeadSHA:       strings.TrimSpace(pr.HeadSHA),
+				BaseSHA:       strings.TrimSpace(pr.BaseSHA),
+				RerunSafe:     classification.rerunSafe,
+				Evidence:      classification.evidence,
+			}
+			continue
+		}
+		if !classification.failedJobs[job.databaseID()] || !check.Failing() || !strings.EqualFold(strings.TrimSpace(check.State), "FAILURE") {
+			continue
+		}
+		result[i] = scm.InfrastructureFailure{
+			Retryable: true,
+			Group:     "github-actions-run:" + runID,
+			Reason:    artifactInfrastructureReason(classification),
+			HeadSHA:   strings.TrimSpace(pr.HeadSHA),
+			BaseSHA:   strings.TrimSpace(pr.BaseSHA),
+			RerunSafe: classification.rerunSafe,
+			Evidence:  classification.evidence,
+		}
+	}
+	return result, nil
+}
+
+type artifactRunClassification struct {
+	failedJobs           map[int]bool
+	omittedJobs          map[int]bool
+	skippedDependentJobs map[int]bool
+	rerunSafe            bool
+	dispatchRefusal      string
+	evidence             scm.InfrastructureEvidenceReceipt
+}
+
+func artifactInfrastructureReason(classification artifactRunClassification) string {
+	reason := "artifact-transfer infrastructure failed; dependent work must pass on recovery"
+	if classification.dispatchRefusal != "" {
+		return reason + "; dispatch refused: " + classification.dispatchRefusal
+	}
+	return reason
+}
+
+func (h *Host) classifyArtifactRun(ctx context.Context, run githubWorkflowRun, jobs []githubRunJob, checks []scm.Check, runID, headSHA, baseSHA string) (artifactRunClassification, error) {
+	classification := artifactRunClassification{failedJobs: map[int]bool{}, omittedJobs: map[int]bool{}, skippedDependentJobs: map[int]bool{}}
+	joinedTopology := joinedXAUArtifactRetryTopology(strings.TrimSpace(run.Event), jobs)
+	if !h.runAttemptPopulationMatchesChecks(jobs, checks, runID, headSHA, joinedTopology) {
+		return classification, nil
+	}
+	initiatingNames := map[string]bool{}
+	potentialDependentJobs := map[int][]scm.InfrastructureStepReceipt{}
+	var dependentSteps []scm.InfrastructureStepReceipt
+	pinnedInitiatingActions := true
+	for _, job := range jobs {
+		switch strings.ToLower(strings.TrimSpace(job.Conclusion)) {
+		case "failure":
+			logs, err := h.fetchWorkflowJobLogs(ctx, job.databaseID())
+			if err != nil {
+				return classification, err
+			}
+			classification.evidence.LogJobIDs = append(classification.evidence.LogJobIDs, int64(job.databaseID()))
+			if disposition, ok := artifactFailureDisposition(job, logs, joinedTopology); ok {
+				initiatingNames[strings.TrimSpace(job.Name)] = true
+				pinnedInitiatingActions = pinnedInitiatingActions && disposition.PinnedActions
+				dependentSteps = append(dependentSteps, disposition.DependentSteps...)
+				classification.failedJobs[job.databaseID()] = true
+				continue
+			}
+			if joinedTopology {
+				if steps, ok := joinedXAURepositoryDependencyFailure(job, logs); ok {
+					potentialDependentJobs[job.databaseID()] = steps
+					continue
+				}
+			}
+			return emptyArtifactRunClassification(), nil
+		}
+	}
+	if len(initiatingNames) == 0 {
+		return emptyArtifactRunClassification(), nil
+	}
+	dependentNames := joinedXAURetryDependentNames(initiatingNames)
+	var dependentJobs []int64
+	for _, job := range jobs {
+		name := strings.TrimSpace(job.Name)
+		conclusion := strings.ToLower(strings.TrimSpace(job.Conclusion))
+		if dependentNames[name] && !initiatingNames[name] {
+			if conclusion == "success" {
+				return emptyArtifactRunClassification(), nil
+			}
+			dependentJobs = append(dependentJobs, int64(job.databaseID()))
+			if conclusion == "skipped" {
+				classification.skippedDependentJobs[job.databaseID()] = true
+				continue
+			}
+			steps, ok := potentialDependentJobs[job.databaseID()]
+			if !ok {
+				return emptyArtifactRunClassification(), nil
+			}
+			dependentSteps = append(dependentSteps, steps...)
+			classification.failedJobs[job.databaseID()] = true
+			continue
+		}
+		if conclusion == "skipped" {
+			if run.Event != "pull_request" || name != joinedXAUPROnlyOmittedJob {
+				return emptyArtifactRunClassification(), nil
+			}
+			classification.omittedJobs[job.databaseID()] = true
+		}
+		if _, unresolved := potentialDependentJobs[job.databaseID()]; unresolved {
+			return emptyArtifactRunClassification(), nil
+		}
+	}
+	artifacts, err := h.fetchRunArtifacts(ctx, runID)
+	if err != nil {
+		return classification, err
+	}
+	classification.evidence.ProviderRunID = runID
+	classification.evidence.Attempt = 1
+	classification.evidence.DependentJobs = dependentJobs
+	classification.evidence.DependentSteps = dependentSteps
+	classification.evidence.Artifacts = artifacts
+	if joinedTopology && pinnedInitiatingActions && xauArtifactReceiptsProveAttemptOne(artifacts, run.ID, headSHA, jobs) {
+		classification.rerunSafe, err = h.xauRetryRuleLanded(ctx, strings.TrimSpace(baseSHA), headSHA)
+		if err != nil {
+			return classification, err
+		}
+		if !classification.rerunSafe {
+			classification.dispatchRefusal = "joined XAU retry-control identity is not reviewed on the unchanged trusted base"
+		}
+	}
+	return classification, nil
+}
+
+func emptyArtifactRunClassification() artifactRunClassification {
+	return artifactRunClassification{failedJobs: map[int]bool{}, omittedJobs: map[int]bool{}, skippedDependentJobs: map[int]bool{}}
+}
+
+func joinedXAURetryDependentNames(initiating map[string]bool) map[string]bool {
+	journeys := []string{
+		"journey smoke (chromium / desktop)",
+		"journey smoke (firefox / desktop)",
+		"journey smoke (webkit / desktop)",
+		"journey smoke (chromium / touch390)",
+		"journey smoke (webkit / touch390)",
+	}
+	shards := []string{"repository shard 1 of 4", "repository shard 2 of 4", "repository shard 3 of 4", "repository shard 4 of 4"}
+	direct := map[string][]string{
+		"verify original run or bounded infrastructure retry": append(append([]string{"build and seal the Dashboard V2 distribution", "repository checks", "repository"}, journeys...), shards...),
+		"build and seal the Dashboard V2 distribution":        append(append([]string{"repository"}, journeys...), shards...),
+		joinedXAUPROnlyOmittedJob:                             append([]string{"repository checks", "repository"}, shards...),
+		"repository checks":                                   {"repository"},
+	}
+	for _, name := range journeys {
+		direct[name] = []string{"repository"}
+	}
+	for _, name := range shards {
+		direct[name] = []string{"repository"}
+	}
+	result := map[string]bool{}
+	queue := make([]string, 0, len(initiating))
+	for name := range initiating {
+		queue = append(queue, name)
+	}
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		for _, dependent := range direct[name] {
+			if !result[dependent] {
+				result[dependent] = true
+				queue = append(queue, dependent)
+			}
+		}
+	}
+	return result
+}
+
+var xauRetryRulePaths = []string{
+	".github/workflows/xau-ci.yml",
+	"scripts/ci_check_infrastructure_retry.py",
+}
+
+type xauRetryContractIdentity struct {
+	workflowBlobSHA string
+	verifierBlobSHA string
+}
+
+// reviewedXAURetryContractIdentities is intentionally empty until the XAU
+// owner lands a corrected, joined workflow and verifier and their exact blob
+// pair passes cross-repository review. Adding one exact pair here is the bounded
+// activation mechanism; equality between arbitrary base/head files is not.
+var reviewedXAURetryContractIdentities = [...]xauRetryContractIdentity{}
+
+func xauRetryContractIdentityReviewed(identity xauRetryContractIdentity, reviewed []xauRetryContractIdentity) bool {
+	if !isHexSHA(identity.workflowBlobSHA) || !isHexSHA(identity.verifierBlobSHA) {
+		return false
+	}
+	for _, candidate := range reviewed {
+		if identity == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+// xauRetryRuleLanded proves the retry guard is established on the trusted base
+// with an explicitly reviewed implementation identity, and unchanged on the
+// candidate. A branch cannot authorize provider mutation with old, lookalike,
+// or independently changed workflow/verifier files.
+func (h *Host) xauRetryRuleLanded(ctx context.Context, baseSHA, headSHA string) (bool, error) {
+	if baseSHA == "" || headSHA == "" {
+		return false, nil
+	}
+	var identity xauRetryContractIdentity
+	for index, path := range xauRetryRulePaths {
+		baseBlob, err := h.fetchRepoContentBlob(ctx, path, baseSHA)
+		if err != nil {
+			return false, err
+		}
+		headBlob, err := h.fetchRepoContentBlob(ctx, path, headSHA)
+		if err != nil {
+			return false, err
+		}
+		if baseBlob == "" || headBlob != baseBlob {
+			return false, nil
+		}
+		if index == 0 {
+			identity.workflowBlobSHA = baseBlob
+		} else {
+			identity.verifierBlobSHA = baseBlob
+		}
+	}
+	return xauRetryContractIdentityReviewed(identity, reviewedXAURetryContractIdentities[:]), nil
+}
+
+func (h *Host) fetchRepoContentBlob(ctx context.Context, path, ref string) (string, error) {
+	repo := h.repoSlug()
+	if repo == "" || strings.TrimSpace(path) == "" || strings.TrimSpace(ref) == "" {
+		return "", errors.New("repository, path, and ref are required to read retry-rule identity")
+	}
+	args := []string{"api"}
+	if h.host != "" {
+		args = append(args, "--hostname", h.host)
+	}
+	args = append(args, "--method", "GET", "repos/"+repo+"/contents/"+strings.TrimLeft(path, "/"), "-f", "ref="+ref)
+	out, err := h.cmd(ctx, "gh", args...).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("gh api retry-rule content: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	var payload struct {
+		SHA  string `json:"sha"`
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		return "", fmt.Errorf("parse retry-rule content: %w", err)
+	}
+	if payload.Type != "file" || !isHexSHA(payload.SHA) {
+		return "", nil
+	}
+	return payload.SHA, nil
+}
+
+func isHexSHA(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			if r < 'a' || r > 'f' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func joinedXAURepositoryDependencyFailure(job githubRunJob, logs string) ([]scm.InfrastructureStepReceipt, bool) {
+	if strings.TrimSpace(job.Name) != "repository" || !isFailedJob(job) || strings.TrimSpace(logs) == "" {
+		return nil, false
+	}
+	failed := false
+	var dependent []scm.InfrastructureStepReceipt
+	for _, step := range job.Steps {
+		if jobLifecycleStep(step.Name) {
+			continue
+		}
+		conclusion := strings.ToLower(strings.TrimSpace(step.Conclusion))
+		switch conclusion {
+		case "success":
+			continue
+		case "failure":
+			if failed || strings.TrimSpace(step.Name) != "Prove every shard ran and together covered the battery" {
+				return nil, false
+			}
+			failed = true
+			dependent = append(dependent, scm.InfrastructureStepReceipt{JobID: int64(job.databaseID()), Number: step.Number, Name: strings.TrimSpace(step.Name)})
+		case "skipped":
+			if !failed {
+				if joinedXAUAttemptOneOmittedStep(job.Name, step.Name) {
+					continue
+				}
+				return nil, false
+			}
+			dependent = append(dependent, scm.InfrastructureStepReceipt{JobID: int64(job.databaseID()), Number: step.Number, Name: strings.TrimSpace(step.Name)})
+		default:
+			return nil, false
+		}
+	}
+	return dependent, failed
+}
+
+func xauArtifactReceiptsProveAttemptOne(artifacts []scm.InfrastructureArtifactReceipt, runID int, headSHA string, jobs []githubRunJob) bool {
+	if runID <= 0 || strings.TrimSpace(headSHA) == "" {
+		return false
+	}
+	found := make(map[string]bool, len(artifacts))
+	for _, artifact := range artifacts {
+		name := strings.TrimSpace(artifact.Name)
+		attemptOneName := name == "dashboard-v2-dist-1" || strings.HasSuffix(name, "-a1")
+		if !attemptOneName || found[name] || artifact.ProviderRunID != int64(runID) || artifact.HeadSHA != strings.TrimSpace(headSHA) || !validSHA256Digest(artifact.Digest) {
+			return false
+		}
+		found[name] = true
+	}
+	for _, job := range jobs {
+		if !strings.EqualFold(strings.TrimSpace(job.Conclusion), "success") {
+			continue
+		}
+		required, producer := xauAttemptOneArtifactForProducer(strings.TrimSpace(job.Name), strings.TrimSpace(headSHA))
+		if producer && !found[required] {
+			return false
+		}
+	}
+	return true
+}
+
+func xauAttemptOneArtifactForProducer(jobName, headSHA string) (string, bool) {
+	switch jobName {
+	case "build and seal the Dashboard V2 distribution":
+		return "dashboard-v2-dist-1", true
+	case "repository shard 1 of 4":
+		return "delivery-lane-shard-1-" + headSHA + "-a1", true
+	case "repository shard 2 of 4":
+		return "delivery-lane-shard-2-" + headSHA + "-a1", true
+	case "repository shard 3 of 4":
+		return "delivery-lane-shard-3-" + headSHA + "-a1", true
+	case "repository shard 4 of 4":
+		return "delivery-lane-shard-4-" + headSHA + "-a1", true
+	case "journey smoke (chromium / desktop)":
+		return "xau-journey-evidence-chromium-desktop-" + headSHA + "-a1", true
+	case "journey smoke (firefox / desktop)":
+		return "xau-journey-evidence-firefox-desktop-" + headSHA + "-a1", true
+	case "journey smoke (webkit / desktop)":
+		return "xau-journey-evidence-webkit-desktop-" + headSHA + "-a1", true
+	case "journey smoke (chromium / touch390)":
+		return "xau-journey-evidence-chromium-touch390-" + headSHA + "-a1", true
+	case "journey smoke (webkit / touch390)":
+		return "xau-journey-evidence-webkit-touch390-" + headSHA + "-a1", true
+	default:
+		return "", false
+	}
+}
+
+func validSHA256Digest(digest string) bool {
+	const prefix = "sha256:"
+	if !strings.HasPrefix(digest, prefix) || len(digest) != len(prefix)+64 {
+		return false
+	}
+	for _, r := range digest[len(prefix):] {
+		if r < '0' || r > '9' {
+			if r < 'a' || r > 'f' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (h *Host) fetchRunArtifacts(ctx context.Context, runID string) ([]scm.InfrastructureArtifactReceipt, error) {
+	repo := h.repoSlug()
+	if repo == "" {
+		return nil, errors.New("repository slug is required to read workflow artifacts")
+	}
+	args := []string{"api"}
+	if h.host != "" {
+		args = append(args, "--hostname", h.host)
+	}
+	args = append(args, "--method", "GET", "repos/"+repo+"/actions/runs/"+runID+"/artifacts", "-f", "per_page=100", "--paginate", "--slurp")
+	out, err := h.cmd(ctx, "gh", args...).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("gh api workflow artifacts: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	var pages []githubRunArtifactsResponse
+	if err := json.Unmarshal(out, &pages); err != nil {
+		return nil, fmt.Errorf("parse workflow artifacts: %w", err)
+	}
+	if len(pages) == 0 {
+		return nil, errors.New("workflow artifacts response contained no pages")
+	}
+	total := pages[0].TotalCount
+	if total < 0 {
+		return nil, errors.New("workflow artifacts response has a negative total_count")
+	}
+	artifacts := make([]scm.InfrastructureArtifactReceipt, 0, total)
+	seen := map[int64]bool{}
+	for _, page := range pages {
+		if page.TotalCount != total {
+			return nil, errors.New("workflow artifact pages disagree on total_count")
+		}
+		for _, artifact := range page.Artifacts {
+			if artifact.ID <= 0 || seen[artifact.ID] || strings.TrimSpace(artifact.Name) == "" || artifact.Expired {
+				return nil, errors.New("workflow artifacts contain missing, duplicate, or expired evidence")
+			}
+			seen[artifact.ID] = true
+			artifacts = append(artifacts, scm.InfrastructureArtifactReceipt{
+				ID:            artifact.ID,
+				Name:          strings.TrimSpace(artifact.Name),
+				Digest:        strings.TrimSpace(artifact.Digest),
+				ProviderRunID: artifact.WorkflowRun.ID,
+				HeadSHA:       strings.TrimSpace(artifact.WorkflowRun.HeadSHA),
+			})
+		}
+	}
+	if len(artifacts) != total {
+		return nil, fmt.Errorf("workflow artifacts response is incomplete: got %d of %d artifacts", len(artifacts), total)
+	}
+	return artifacts, nil
+}
+
+func (h *Host) fetchWorkflowRun(ctx context.Context, runID string) (githubWorkflowRun, error) {
+	var run githubWorkflowRun
+	repo := h.repoSlug()
+	if repo == "" {
+		return run, errors.New("repository slug is required to read workflow run")
+	}
+	args := []string{"api"}
+	if h.host != "" {
+		args = append(args, "--hostname", h.host)
+	}
+	args = append(args, "--method", "GET", "repos/"+repo+"/actions/runs/"+runID)
+	out, err := h.cmd(ctx, "gh", args...).CombinedOutput()
+	if err != nil {
+		return run, fmt.Errorf("gh api workflow run: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	if err := json.Unmarshal(out, &run); err != nil {
+		return run, fmt.Errorf("parse workflow run: %w", err)
+	}
+	return run, nil
+}
+
+func (h *Host) fetchWorkflowJobLogs(ctx context.Context, jobID int) (string, error) {
+	if jobID <= 0 {
+		return "", errors.New("workflow job id is required to read logs")
+	}
+	repo := h.repoSlug()
+	args := []string{"api"}
+	if h.host != "" {
+		args = append(args, "--hostname", h.host)
+	}
+	args = append(args, "--method", "GET", fmt.Sprintf("repos/%s/actions/jobs/%d/logs", repo, jobID))
+	out, err := h.cmd(ctx, "gh", args...).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("gh api workflow job logs: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return string(out), nil
+}
+
+func workflowRunMatchesCandidate(run githubWorkflowRun, prNumber int, headSHA, baseBranch, baseSHA string) bool {
+	if run.RunAttempt != 1 || strings.TrimSpace(run.HeadSHA) != strings.TrimSpace(headSHA) {
+		return false
+	}
+	for _, candidate := range run.PullRequests {
+		if candidate.Number == prNumber && strings.TrimSpace(candidate.Head.SHA) == strings.TrimSpace(headSHA) && strings.TrimSpace(candidate.Base.Ref) == strings.TrimSpace(baseBranch) && strings.TrimSpace(candidate.Base.SHA) == strings.TrimSpace(baseSHA) {
+			return true
+		}
+	}
+	return false
+}
+
+const boundedInfrastructureRetryStep = "Admit only the original run or one verified infrastructure retry"
+
+var joinedXAUArtifactRetryJobNames = map[string]struct{}{
+	"verify original run or bounded infrastructure retry":       {},
+	"build and seal the Dashboard V2 distribution":              {},
+	"journey smoke (chromium / desktop)":                        {},
+	"journey smoke (firefox / desktop)":                         {},
+	"journey smoke (webkit / desktop)":                          {},
+	"journey smoke (chromium / touch390)":                       {},
+	"journey smoke (webkit / touch390)":                         {},
+	"look for a proving pull request with the same pushed tree": {},
+	"repository shard 1 of 4":                                   {},
+	"repository shard 2 of 4":                                   {},
+	"repository shard 3 of 4":                                   {},
+	"repository shard 4 of 4":                                   {},
+	"repository checks":                                         {},
+	"repository":                                                {},
+}
+
+const joinedXAUPROnlyOmittedJob = "look for a proving pull request with the same pushed tree"
+
+// joinedXAUArtifactRetryTopology binds the fork's only safe dependent-job
+// rerun route to the same versioned XAU population its in-workflow verifier
+// checks. The five browser matrix cells are independent jobs, and the one
+// whole-job omission is valid only for the push-only reuse lookup on a PR.
+func joinedXAUArtifactRetryTopology(event string, jobs []githubRunJob) bool {
+	event = strings.TrimSpace(event)
+	if event != "pull_request" && event != "push" {
+		return false
+	}
+	if len(jobs) != len(joinedXAUArtifactRetryJobNames) {
+		return false
+	}
+	seen := make(map[string]bool, len(jobs))
+	for _, job := range jobs {
+		name := strings.TrimSpace(job.Name)
+		if _, ok := joinedXAUArtifactRetryJobNames[name]; !ok || seen[name] {
+			return false
+		}
+		seen[name] = true
+		conclusion := strings.ToLower(strings.TrimSpace(job.Conclusion))
+		if conclusion == "skipped" {
+			if len(job.Steps) != 0 || name == joinedXAUPROnlyOmittedJob && event != "pull_request" {
+				return false
+			}
+			continue
+		}
+		if conclusion != "success" && conclusion != "failure" {
+			return false
+		}
+		if conclusion == "success" && !joinedXAUSuccessfulJobSteps(job) {
+			return false
+		}
+		guardCount := 0
+		for _, step := range job.Steps {
+			if strings.TrimSpace(step.Name) == boundedInfrastructureRetryStep && strings.EqualFold(strings.TrimSpace(step.Conclusion), "success") {
+				guardCount++
+			}
+		}
+		if guardCount != 1 {
+			return false
+		}
+	}
+	for _, job := range jobs {
+		if strings.TrimSpace(job.Name) == joinedXAUPROnlyOmittedJob {
+			return event != "pull_request" || strings.EqualFold(strings.TrimSpace(job.Conclusion), "skipped")
+		}
+	}
+	return false
+}
+
+const (
+	joinedXAURetainedBundleStep = "Digest-bind and extract the retained Dashboard V2 distribution"
+	joinedXAURetainedProofStep  = "Digest-bind and extract retained shard and journey evidence"
+)
+
+// joinedXAUAttemptOneOmittedStep is the complete set of conditional steps the
+// joined workflow intentionally skips on attempt one. These exact owner/name
+// pairs are structural evidence only: callers also require the complete joined
+// topology, and dispatch separately requires a reviewed workflow/verifier blob
+// identity before this model can authorize a provider mutation.
+func joinedXAUAttemptOneOmittedStep(jobName, stepName string) bool {
+	jobName = strings.TrimSpace(jobName)
+	stepName = strings.TrimSpace(stepName)
+	switch stepName {
+	case joinedXAURetainedBundleStep:
+		switch jobName {
+		case "journey smoke (chromium / desktop)",
+			"journey smoke (firefox / desktop)",
+			"journey smoke (webkit / desktop)",
+			"journey smoke (chromium / touch390)",
+			"journey smoke (webkit / touch390)",
+			"repository shard 1 of 4",
+			"repository shard 2 of 4",
+			"repository shard 3 of 4",
+			"repository shard 4 of 4":
+			return true
+		}
+	case joinedXAURetainedProofStep:
+		return jobName == "repository"
+	case "Print verify log tail on failure", "Upload verify log artifact on failure":
+		switch jobName {
+		case "repository checks",
+			"repository shard 1 of 4",
+			"repository shard 2 of 4",
+			"repository shard 3 of 4",
+			"repository shard 4 of 4":
+			return true
+		}
+	}
+	return false
+}
+
+// joinedXAUSuccessfulJobSteps prevents an otherwise successful producer from
+// hiding skipped required work. Only lifecycle bookkeeping and the exact
+// attempt-one omissions above may be non-successful in a successful job.
+func joinedXAUSuccessfulJobSteps(job githubRunJob) bool {
+	for _, step := range job.Steps {
+		if jobLifecycleStep(step.Name) {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(step.Conclusion)) {
+		case "success":
+			continue
+		case "skipped":
+			if joinedXAUAttemptOneOmittedStep(job.Name, step.Name) {
+				continue
+			}
+		}
+		return false
+	}
+	return true
+}
+
+type artifactJobDisposition struct {
+	Initiating     bool
+	PinnedActions  bool
+	DependentSteps []scm.InfrastructureStepReceipt
+}
+
+const (
+	xauUploadArtifactAction   = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+	xauDownloadArtifactAction = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+)
+
+func jobLifecycleStep(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return name == "set up job" || name == "set up runner" || name == "complete runner" || name == "complete job" || strings.HasPrefix(name, "post ")
+}
+
+func artifactActionOperation(action string) string {
+	switch {
+	case strings.HasPrefix(action, "actions/upload-artifact@"):
+		return "finalizeartifact"
+	case strings.HasPrefix(action, "actions/download-artifact@"):
+		return "listartifacts"
+	default:
+		return ""
+	}
+}
+
+func consequentialNoFilesFailure(text string) bool {
+	errors := 0
+	for _, line := range strings.Split(text, "\n") {
+		payload, ok := runnerErrorPayload(line)
+		if !ok {
+			continue
+		}
+		errors++
+		payload = strings.TrimSpace(payload)
+		if !strings.HasPrefix(payload, "No files were found with the provided path:") || !strings.HasSuffix(payload, "No artifacts will be uploaded.") {
+			return false
+		}
+	}
+	return errors == 1
+}
+
+// artifactFailureDisposition admits a job only when its first failed work is
+// one pinned artifact client's terminal 403/5xx. Required work skipped after
+// that initiating error, plus the narrowly recognized no-files artifact
+// consequence, is recorded as recovery-dependent. An executed test failure at
+// any point still refuses the infrastructure class.
+func artifactFailureDisposition(job githubRunJob, logs string, joinedTopology bool) (artifactJobDisposition, bool) {
+	var disposition artifactJobDisposition
+	if !isFailedJob(job) || len(job.Steps) == 0 {
+		return disposition, false
+	}
+	segments := actionLogSegments(logs)
+	executed := make([]githubJobStep, 0, len(job.Steps))
+	for _, step := range job.Steps {
+		if !jobLifecycleStep(step.Name) && !strings.EqualFold(strings.TrimSpace(step.Conclusion), "skipped") {
+			executed = append(executed, step)
+		}
+	}
+	if len(executed) == 0 || len(segments) != len(executed) {
+		return disposition, false
+	}
+	segmentByNumber := make(map[int]actionLogSegment, len(executed))
+	for i, step := range executed {
+		segmentByNumber[step.Number] = segments[i]
+	}
+	initiated := false
+	pinnedActions := true
+	for _, step := range job.Steps {
+		if jobLifecycleStep(step.Name) {
+			continue
+		}
+		conclusion := strings.ToLower(strings.TrimSpace(step.Conclusion))
+		switch conclusion {
+		case "success":
+			continue
+		case "skipped":
+			if joinedTopology && joinedXAUAttemptOneOmittedStep(job.Name, step.Name) {
+				continue
+			}
+			if !initiated {
+				return artifactJobDisposition{}, false
+			}
+			disposition.DependentSteps = append(disposition.DependentSteps, scm.InfrastructureStepReceipt{JobID: int64(job.databaseID()), Number: step.Number, Name: strings.TrimSpace(step.Name)})
+		case "failure", "failed", "error":
+			segment, ok := segmentByNumber[step.Number]
+			if !ok {
+				return artifactJobDisposition{}, false
+			}
+			operation := artifactActionOperation(segment.action)
+			if !initiated {
+				if operation == "" || !terminalArtifactRequestFailure(segment.text, operation) {
+					return artifactJobDisposition{}, false
+				}
+				initiated = true
+				disposition.Initiating = true
+				pinnedActions = segment.action == xauUploadArtifactAction || segment.action == xauDownloadArtifactAction
+				continue
+			}
+			if operation != "finalizeartifact" || !consequentialNoFilesFailure(segment.text) {
+				return artifactJobDisposition{}, false
+			}
+			pinnedActions = pinnedActions && segment.action == xauUploadArtifactAction
+			disposition.DependentSteps = append(disposition.DependentSteps, scm.InfrastructureStepReceipt{JobID: int64(job.databaseID()), Number: step.Number, Name: strings.TrimSpace(step.Name)})
+		default:
+			return artifactJobDisposition{}, false
+		}
+	}
+	disposition.PinnedActions = pinnedActions
+	return disposition, initiated
+}
+
+func (h *Host) runAttemptPopulationMatchesChecks(jobs []githubRunJob, checks []scm.Check, runID, headSHA string, joinedTopology bool) bool {
+	for _, job := range jobs {
+		if strings.TrimSpace(job.HeadSHA) != strings.TrimSpace(headSHA) || !strings.EqualFold(strings.TrimSpace(job.Status), "completed") {
+			return false
+		}
+		conclusion := strings.ToLower(strings.TrimSpace(job.Conclusion))
+		if conclusion == "skipped" && !joinedTopology {
+			return false
+		}
+		if conclusion != "success" && conclusion != "failure" && conclusion != "skipped" {
+			return false
+		}
+		matches := 0
+		for _, check := range checks {
+			candidateRun, candidateJob, ok := h.actionsRerunTarget(check.Link)
+			if !ok || candidateRun != runID || candidateJob != strconv.Itoa(job.databaseID()) || normalizeRunName(check.Name) != normalizeRunName(job.Name) {
+				continue
+			}
+			matches++
+			switch conclusion {
+			case "success":
+				if check.Bucket != scm.CheckBucketPass || !strings.EqualFold(strings.TrimSpace(check.State), "SUCCESS") {
+					return false
+				}
+			case "failure":
+				if !check.Failing() || !strings.EqualFold(strings.TrimSpace(check.State), "FAILURE") {
+					return false
+				}
+			case "skipped":
+				if check.Bucket != scm.CheckBucketSkip || !strings.EqualFold(strings.TrimSpace(check.State), "SKIPPED") {
+					return false
+				}
+			}
+		}
+		if matches != 1 {
+			return false
+		}
+	}
+	checksForRun := 0
+	for _, check := range checks {
+		candidateRun, jobID, ok := h.actionsRerunTarget(check.Link)
+		if ok && candidateRun == runID && jobID != "" {
+			checksForRun++
+		}
+	}
+	return len(jobs) > 0 && checksForRun == len(jobs)
+}
+
+type actionLogSegment struct {
+	action string
+	text   string
+}
+
+func actionLogSegments(logs string) []actionLogSegment {
+	const marker = "##[group]Run "
+	var segments []actionLogSegment
+	for remaining := logs; ; {
+		start := strings.Index(remaining, marker)
+		if start < 0 {
+			break
+		}
+		remaining = remaining[start+len(marker):]
+		lineEnd := strings.IndexByte(remaining, '\n')
+		if lineEnd < 0 {
+			lineEnd = len(remaining)
+		}
+		header := strings.TrimSpace(remaining[:lineEnd])
+		next := strings.Index(remaining[lineEnd:], marker)
+		segmentEnd := len(remaining)
+		if next >= 0 {
+			segmentEnd = lineEnd + next
+		}
+		segments = append(segments, actionLogSegment{action: strings.ToLower(header), text: remaining[:segmentEnd]})
+		remaining = remaining[segmentEnd:]
+	}
+	return segments
+}
+
+func logsProveArtifactInfrastructureFailure(job githubRunJob, logs string) bool {
+	disposition, ok := artifactFailureDisposition(job, logs, false)
+	return ok && disposition.Initiating
+}
+
+// terminalArtifactRequestFailure binds the permitted operation and retryable
+// response to one request line, then requires that request to be the action's
+// terminal outcome. This deliberately rejects ambiguous multi-request logs: a
+// successful ListArtifacts followed by some other operation's 403, or a 503
+// that recovered before an unclassified failure, proves no retryable terminal
+// failure for the permitted operation.
+func terminalArtifactRequestFailure(text, operation string) bool {
+	requestLine := -1
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		if !strings.Contains(strings.ToLower(line), operation) {
+			continue
+		}
+		if requestLine >= 0 || !artifactRequestRecordFailed(line, operation) {
+			return false
+		}
+		requestLine = i
+	}
+	if requestLine < 0 {
+		return false
+	}
+	for _, line := range lines[requestLine+1:] {
+		line = strings.ToLower(strings.TrimSpace(line))
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, "##[error]") || strings.Contains(line, "error") || strings.Contains(line, "fail") || strings.Contains(line, "success") || strings.Contains(line, "succeed") || strings.Contains(line, "recover") || containsHTTPResponseMarker(line) {
+			return false
+		}
+	}
+	return true
+}
+
+// artifactRequestRecordFailed recognizes the bounded terminal form emitted by
+// @actions/artifact 2.3.2, including download-artifact v4.3.0's wrapper. The
+// runner envelope and entire payload are anchored: the parser never seeks
+// forward through another clause to find a qualifying operation.
+func artifactRequestRecordFailed(line, operation string) bool {
+	payload, ok := runnerErrorPayload(line)
+	if !ok {
+		return false
+	}
+	payload = strings.ToLower(payload)
+	for _, recognized := range []string{
+		"createartifact", "finalizeartifact", "listartifacts",
+		"getsignedartifacturl", "downloadartifact", "uploadartifact",
+	} {
+		count := strings.Count(payload, recognized)
+		if recognized == operation {
+			if count != 1 {
+				return false
+			}
+		} else if count != 0 {
+			return false
+		}
+	}
+	prefix := ""
+	switch operation {
+	case "finalizeartifact":
+		prefix = "failed to finalizeartifact: "
+	case "listartifacts":
+		prefix = "unable to download artifact(s): failed to listartifacts: "
+	default:
+		return false
+	}
+	if !strings.HasPrefix(payload, prefix) {
+		return false
+	}
+	result := strings.TrimPrefix(payload, prefix)
+	const nonRetryable = "received non-retryable error: failed request: "
+	const exhausted = "failed to make request after 5 attempts: failed request: "
+	exhaustedRetry := false
+	switch {
+	case strings.HasPrefix(result, nonRetryable):
+		result = strings.TrimPrefix(result, nonRetryable)
+	case strings.HasPrefix(result, exhausted):
+		result = strings.TrimPrefix(result, exhausted)
+		exhaustedRetry = true
+	default:
+		return false
+	}
+	code, ok := artifactRequestStatus(result)
+	if !ok || code != 403 && (code < 500 || code > 599) {
+		return false
+	}
+	retryableByClient := code == 500 || code == 502 || code == 503 || code == 504
+	if exhaustedRetry != retryableByClient {
+		return false
+	}
+	return true
+}
+
+func runnerErrorPayload(line string) (string, bool) {
+	line = strings.TrimSpace(line)
+	const annotation = "##[error]"
+	if strings.HasPrefix(line, annotation) {
+		payload := strings.TrimPrefix(line, annotation)
+		return payload, strings.TrimSpace(payload) != ""
+	}
+	separator := strings.IndexByte(line, ' ')
+	if separator <= 0 {
+		return "", false
+	}
+	if _, err := time.Parse(time.RFC3339Nano, line[:separator]); err != nil {
+		return "", false
+	}
+	remainder := line[separator+1:]
+	if !strings.HasPrefix(remainder, annotation) {
+		return "", false
+	}
+	payload := strings.TrimPrefix(remainder, annotation)
+	return payload, strings.TrimSpace(payload) != ""
+}
+
+func artifactRequestStatus(result string) (int, bool) {
+	if len(result) < len("(403) x") || result[0] != '(' {
+		return 0, false
+	}
+	closeParen := strings.IndexByte(result, ')')
+	if closeParen != 4 || len(result) <= closeParen+1 || result[closeParen+1] != ' ' {
+		return 0, false
+	}
+	code, err := strconv.Atoi(result[1:closeParen])
+	if err != nil {
+		return 0, false
+	}
+	reason := result[closeParen+2:]
+	standardReason := artifactHTTPReason[code]
+	if reason != standardReason {
+		// Captured attempt-one run 34250655836 / job 102144122733 adds
+		// this exact intermediary detail to @actions/artifact 2.3.2's 403
+		// status text. Keep the observed provider form bounded; no arbitrary
+		// suffix or generalized 403 prose is admitted.
+		const intermediary403 = "forbidden: error from intermediary with http status code 403 \"forbidden\""
+		if code != 403 || reason != intermediary403 {
+			return 0, false
+		}
+	}
+	return code, true
+}
+
+var artifactHTTPReason = map[int]string{
+	403: "forbidden",
+	500: "internal server error",
+	501: "not implemented",
+	502: "bad gateway",
+	503: "service unavailable",
+	504: "gateway timeout",
+	505: "http version not supported",
+	507: "insufficient storage",
+	508: "loop detected",
+	510: "not extended",
+	511: "network authentication required",
+}
+
+func containsHTTPResponseMarker(text string) bool {
+	for _, field := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if field == "http" || field == "status" || field == "response" {
+			return true
 		}
 	}
 	return false
@@ -1144,12 +2298,57 @@ type githubRunView struct {
 	Jobs []githubRunJob `json:"jobs"`
 }
 
+type githubRunJobsResponse struct {
+	TotalCount int            `json:"total_count"`
+	Jobs       []githubRunJob `json:"jobs"`
+}
+
+type githubRunArtifactsResponse struct {
+	TotalCount int `json:"total_count"`
+	Artifacts  []struct {
+		ID          int64  `json:"id"`
+		Name        string `json:"name"`
+		Digest      string `json:"digest"`
+		Expired     bool   `json:"expired"`
+		WorkflowRun struct {
+			ID      int64  `json:"id"`
+			HeadSHA string `json:"head_sha"`
+		} `json:"workflow_run"`
+	} `json:"artifacts"`
+}
+
+type githubWorkflowRun struct {
+	ID           int    `json:"id"`
+	Event        string `json:"event"`
+	HeadSHA      string `json:"head_sha"`
+	RunAttempt   int    `json:"run_attempt"`
+	PullRequests []struct {
+		Number int `json:"number"`
+		Head   struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
+		Base struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		} `json:"base"`
+	} `json:"pull_requests"`
+}
+
 type githubRunJob struct {
 	DatabaseID int             `json:"databaseId"`
+	ID         int             `json:"id"`
+	HeadSHA    string          `json:"head_sha"`
 	Name       string          `json:"name"`
 	Conclusion string          `json:"conclusion"`
 	Status     string          `json:"status"`
 	Steps      []githubJobStep `json:"steps"`
+}
+
+func (j githubRunJob) databaseID() int {
+	if j.DatabaseID != 0 {
+		return j.DatabaseID
+	}
+	return j.ID
 }
 
 type githubJobStep struct {

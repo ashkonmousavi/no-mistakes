@@ -8,7 +8,7 @@ Per-repo configuration lives in `.no-mistakes.yaml` at the root of your reposito
 :::caution[Security: gate-control fields are read from the default branch]
 `commands.*` execute arbitrary shell on the daemon host via `sh -c` / `cmd.exe /c`, and `agent` selects which process launches there (including ordered fallback lists, ACP aliases such as `cursor`, and `acp:` targets) with the maintainer's credentials.
 To prevent a supply-chain attack where a contributor lands a hostile value on a gated branch, the daemon always reads **`commands` and `agent` from your default branch** (e.g. `origin/main`), never from the pushed SHA, and reads them at the exact commit a fresh fetch resolved (so a stale `origin/<default>` ref cannot serve a value the live default branch removed).
-The daemon also reads `document.instructions`, `review.path_instructions`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.revalidate_repairs`, `test.instructions`, and `test.evidence.branch` only from that trusted copy.
+The daemon also reads `document.instructions`, `review.path_instructions`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.rerun_infrastructure`, `ci.revalidate_repairs`, `test.instructions`, and `test.evidence.branch` only from that trusted copy.
 `pr.base_branch` is trusted-default-branch-only as well, but unlike those fields it follows the same `allow_repo_commands: true` opt-in exception as `commands`/`agent` (see [`pr.base_branch`](#prbase_branch) below).
 If the default branch cannot be fetched and resolved to a readable commit, or its present `.no-mistakes.yaml` cannot be read and parsed, the run aborts before launching an agent.
 A readable default-branch tree with no `.no-mistakes.yaml` is valid and uses defaults.
@@ -75,6 +75,7 @@ auto_fix:
 # and revalidation decides whether a CI repair may ship without review.
 ci:
   rerun_transient: 0
+  rerun_infrastructure: 0
   revalidate_repairs: false
 
 commit:
@@ -474,6 +475,36 @@ Reruns are skipped when:
 - The provider has no rerun API (only GitHub implements one today; GitLab, Forgejo, Bitbucket Cloud, Azure DevOps, and Gitea reach the approval gate without a rerun).
 - The check's details link names nothing the provider can re-run, for example a third-party status pointing at an external dashboard, or a link under a workflow run that names no job the API accepts. A link naming one job re-runs that job; a cancelled check naming only the workflow run re-runs the whole workflow, while other run-only links re-run failed jobs; an unrecognized link is widened into neither.
 - The published branch head no longer equals the commit the run delivered. That case terminates with the expected and observed commits instead: re-running checks against a different head would certify a revision this run never produced. See [pipeline steps: CI](/no-mistakes/reference/pipeline-steps/#ci).
+
+### ci.rerun_infrastructure
+
+Candidate-wide budget for an independently proven artifact-transfer infrastructure failure family. GitHub reruns the initiating failed jobs and their dependents while reusing successful producers; this fork dispatches only when the exact XAU workflow and its in-workflow retry verifier prove that complete shape.
+
+| | |
+|---|---|
+| Type | `int` |
+| Default | `0` |
+| Range | `0` to `1`; values outside it are clamped |
+| Trust | Read only from the trusted default branch |
+
+This budget is separate from `ci.rerun_transient`: enabling cancellation retries does not enable this classifier, and infrastructure classification never spends a cancellation allowance. The default remains `0`. Setting `1` permits the extra read-only classification calls and permits one GitHub rerun only after every dispatch condition below is proven.
+
+With a value of `1`, a failed GitHub Actions check qualifies only when all of these are proven:
+
+- The workflow run is its first attempt and belongs to the same pull request, exact head SHA, current forge base branch, and freshly resolved base SHA that the CI step is certifying.
+- The attempt-specific jobs endpoint is fully paginated and its page counts, complete job population, exact check/job IDs, head SHA, terminal status, and conclusions agree. The joined XAU population is exact: five browser journey cells (`chromium`, `firefox`, and `webkit` desktop plus `chromium` and `webkit` touch390), four repository shards, build, checks, fan-in, retry guard, and reuse lookup. Every step in a successful job must pass except the exact attempt-one retry extractor or failure-only diagnostic omissions owned by that job. Missing, duplicate, wrong-engine, pending, unrepresented members, unknown skips, and skipped required work refuse.
+- The first failed work in each initiating job is a pinned artifact upload/download operation. Each such step is paired with its own ordered job-log `Run` group and carries its own terminal `FinalizeArtifact` or `ListArtifacts` HTTP 403/5xx. A recovered error from another step cannot qualify it.
+- Required work skipped after the initiating service error, and only the strict no-files upload consequence caused by that skipped work, is recorded as dependent work that must pass on recovery. An executed test/lint failure, cancellation, timeout, unknown state, or any other failed step refuses the family. A failed `repository` fan-in is admitted only as a dependent of a classified upstream failure; its exact attempt-one retry extractor may be skipped before that named failure, while another pre-failure skip refuses.
+- GitHub's failed-jobs rerun may not include a job that already succeeded. Skipped jobs must be downstream of an initiating failure, except for exactly one nondependent `pull_request`-only omission: the push-only `look for a proving pull request with the same pushed tree` job.
+- Every non-skipped job must have passed `Admit only the original run or one verified infrastructure retry`. Both `.github/workflows/xau-ci.yml` and `scripts/ci_check_infrastructure_retry.py` must already exist with identical blob identities on the trusted base and candidate, so a contributor branch cannot self-authorize the rerun. Equality alone is insufficient: that exact workflow/verifier pair must also be present in the source-reviewed `reviewedXAURetryContractIdentities` allowlist. The allowlist is intentionally empty until the corrected joined implementation passes cross-repository review.
+- Reading every failed attempt-1 job log plus the complete non-expired artifact inventory produces a bounded receipt containing the run/attempt, log job IDs, dependent job/step obligations, and artifact IDs/names/digests/run/head provenance. Every successful bundle, shard, and journey producer must have its exact attempt-one artifact. A producer legitimately in the retry closure may omit attempt-one output because it must publish the replacement during recovery. Raw logs are never stored.
+- Every failing check in the poll carries the same independently proven provider group. A genuine or unknown sibling, a merge conflict, a different workflow run, or unreadable/malformed evidence suppresses the retry.
+
+The durable state is keyed by exact head and base commits, is structurally validated on recovery, and is non-admitting when the database read, decode, or reservation fails. A spent candidate stays spent even when a different workflow group later fails. Dispatch first re-reads both the published feature head and base tip, persists the allowance and receipt, then issues exactly one `gh run rerun RUN_ID --failed` request.
+
+The conditional route is currently non-dispatching because no reviewed workflow/verifier identity is registered. Activation requires the corrected joined XAU implementation on the trusted base, its exact reviewed blob pair added to this runtime, complete retained-producer provenance, and installation of that runtime. All non-XAU workflows, old or changed retry-control files, incomplete provenance, or unmatched topologies remain classified only for an explicit failure rather than sent to the CI code-fix agent.
+
+With no trusted repository value, the operator's [`ci.rerun_infrastructure`](/no-mistakes/reference/global-config/#cirerun_infrastructure) applies, then the built-in default of `0`.
 
 ### ci.revalidate_repairs
 

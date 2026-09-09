@@ -3,6 +3,8 @@ package steps
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
@@ -79,6 +81,33 @@ func failingCheckNames(checks []scm.Check) []string {
 			names = append(names, c.Name)
 		}
 	}
+	return names
+}
+
+// failingCheckNamesExcluding hides only the exact provider observations whose
+// accepted rerun has not appeared in the rollup yet. Identity includes the
+// link, so a same-named genuine sibling remains a failure.
+func failingCheckNamesExcluding(checks []scm.Check, excluded map[string]bool) []string {
+	var names []string
+	for _, check := range checks {
+		if check.Failing() && !excluded[checkIdentity(check)] {
+			names = append(names, check.Name)
+		}
+	}
+	return names
+}
+
+func infrastructureFailureNames(keys map[string]bool) []string {
+	names := make([]string, 0, len(keys))
+	seen := map[string]bool{}
+	for key := range keys {
+		name, _, _ := strings.Cut(key, "\x00")
+		if name != "" && !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
 	return names
 }
 

@@ -26,6 +26,35 @@ type fakePreRunHost struct {
 	calls   int
 }
 
+type fakeArtifactInfrastructureHost struct {
+	scm.Host
+	results []scm.InfrastructureFailure
+	calls   int
+}
+
+type fakeCheckRerunner struct {
+	scm.Host
+	calls  int
+	target scm.PRTarget
+}
+
+func (h *fakeCheckRerunner) RerunCheck(context.Context, *scm.PR, scm.Check) error {
+	h.calls++
+	return nil
+}
+
+func (h *fakeCheckRerunner) GetPRTarget(_ context.Context, pr *scm.PR) (scm.PRTarget, error) {
+	if h.target.HeadSHA != "" || h.target.BaseBranch != "" || h.target.BaseSHA != "" {
+		return h.target, nil
+	}
+	return scm.PRTarget{HeadSHA: pr.HeadSHA, BaseBranch: pr.BaseBranch, BaseSHA: pr.BaseSHA}, nil
+}
+
+func (h *fakeArtifactInfrastructureHost) ArtifactInfrastructureFailures(_ context.Context, _ *scm.PR, _ []scm.Check) ([]scm.InfrastructureFailure, error) {
+	h.calls++
+	return append([]scm.InfrastructureFailure(nil), h.results...), nil
+}
+
 func (h *fakePreRunHost) PreRunFailures(_ context.Context, checks []scm.Check) ([]bool, error) {
 	h.calls++
 	out := make([]bool, len(checks))
@@ -41,6 +70,56 @@ func markContext(t *testing.T, rerunBudget int) *pipeline.StepContext {
 		Ctx:    context.Background(),
 		Config: &config.Config{CI: config.CI{RerunTransient: rerunBudget}},
 		Log:    func(string) {},
+	}
+}
+
+func markInfrastructureContext(t *testing.T, rerunBudget int) *pipeline.StepContext {
+	t.Helper()
+	return &pipeline.StepContext{
+		Ctx:    context.Background(),
+		Config: &config.Config{CI: config.CI{RerunInfrastructure: rerunBudget}},
+		Log:    func(string) {},
+	}
+}
+
+// Artifact-service failures are marked without borrowing the cancellation
+// budget or changing their failed bucket. Their separate class is what admits
+// exactly the bounded infrastructure path while preserving the original CI
+// failure for the run record and any later escalation.
+func TestMarkArtifactInfrastructureFailures_UsesSeparateClassAndPreservesFailure(t *testing.T) {
+	t.Parallel()
+
+	checks := []scm.Check{{Name: "browser", Bucket: scm.CheckBucketFail, State: "FAILURE", Link: "job-link"}}
+	host := &fakeArtifactInfrastructureHost{results: []scm.InfrastructureFailure{{Retryable: true, Group: "run:1", Reason: "artifact transfer service"}}}
+	pr := &scm.PR{Number: "42", HeadSHA: "head-1", BaseBranch: "main"}
+	markArtifactInfrastructureFailures(markInfrastructureContext(t, 1), host, pr, checks)
+
+	if host.calls != 1 {
+		t.Fatalf("classifier calls = %d, want 1", host.calls)
+	}
+	if !checks[0].InfrastructureFailure || checks[0].InfrastructureGroup != "run:1" {
+		t.Fatalf("check = %+v, want infrastructure evidence", checks[0])
+	}
+	if checks[0].Bucket != scm.CheckBucketFail || checks[0].State != "FAILURE" {
+		t.Fatalf("marking rewrote first failure: %+v", checks[0])
+	}
+	if got := classifyCheckFailure(checks[0]); got != classInfrastructure {
+		t.Fatalf("classifyCheckFailure = %q, want %q", got, classInfrastructure)
+	}
+}
+
+// The new provider read is opt-in under its own key. Enabling cancelled-check
+// retries alone must not make artifact classification or spend its API budget.
+func TestMarkArtifactInfrastructureFailures_DoesNotBorrowTransientBudget(t *testing.T) {
+	t.Parallel()
+
+	checks := []scm.Check{{Name: "browser", Bucket: scm.CheckBucketFail, State: "FAILURE"}}
+	host := &fakeArtifactInfrastructureHost{results: []scm.InfrastructureFailure{{Retryable: true}}}
+	sctx := markInfrastructureContext(t, 0)
+	sctx.Config.CI.RerunTransient = config.MaxCIRerunTransient
+	markArtifactInfrastructureFailures(sctx, host, &scm.PR{Number: "42"}, checks)
+	if host.calls != 0 || checks[0].InfrastructureFailure {
+		t.Fatalf("transient budget activated infrastructure classifier: calls=%d check=%+v", host.calls, checks[0])
 	}
 }
 
@@ -138,6 +217,7 @@ func TestClassifyCheckFailure(t *testing.T) {
 		// setup/action-download outage) is infrastructure, not a code verdict: it
 		// is re-runnable even though its state is still FAILURE.
 		{"pre-run infrastructure failure", scm.Check{Name: "test", Bucket: scm.CheckBucketCancel, State: "FAILURE", PreRunFailure: true}, classTransient},
+		{"artifact infrastructure failure is separate", scm.Check{Name: "test", Bucket: scm.CheckBucketFail, State: "FAILURE", InfrastructureFailure: true}, classInfrastructure},
 		// The same FAILURE state without the pre-run mark is a genuine failure and
 		// must never be re-run: this is what keeps a real test failure from being
 		// masked as infrastructure.
@@ -646,6 +726,396 @@ func TestRerunningCancelledChecksIsOffByDefault(t *testing.T) {
 	if got := transientRerunCandidates([]scm.Check{check}, budget, config.DefaultCIRerunTransient); len(got) != 0 {
 		t.Fatalf("selected %d candidates at the default budget, want none", len(got))
 	}
+}
+
+// One infrastructure retry belongs to the exact head/base candidate, not to a
+// check name. A genuine sibling blocks the entire retry, and spending once on
+// the candidate cannot be reset by another artifact check or daemon restart.
+func TestInfrastructureRerunCandidates_OnePerCandidateAndGenuineSiblingBlocks(t *testing.T) {
+	t.Parallel()
+
+	infra := scm.Check{Name: "browser", Bucket: scm.CheckBucketFail, State: "FAILURE", Link: "job-1", InfrastructureFailure: true, InfrastructureGroup: "run:1", InfrastructureReason: "artifact transfer", InfrastructureHeadSHA: "head-1", InfrastructureBaseSHA: "base-1", InfrastructureRerunSafe: true, InfrastructureEvidence: scm.InfrastructureEvidenceReceipt{ProviderRunID: "1", Attempt: 1, LogJobIDs: []int64{2}}}
+	budget := &infrastructureRerunBudget{}
+	got := infrastructureRerunCandidates([]scm.Check{infra}, budget, 1, "head-1", "base-1")
+	if len(got) != 1 {
+		t.Fatalf("first candidate selection = %+v, want one", got)
+	}
+	budget.spend(got[0], []scm.Check{infra}, "head-1", "main", "base-1")
+	if got := infrastructureRerunCandidates([]scm.Check{infra}, budget, 1, "head-1", "base-1"); len(got) != 0 {
+		t.Fatalf("same candidate selected again: %+v", got)
+	}
+	newHead := infra
+	newHead.InfrastructureHeadSHA = "head-2"
+	if got := infrastructureRerunCandidates([]scm.Check{newHead}, budget, 1, "head-2", "base-1"); len(got) != 1 {
+		t.Fatalf("new head candidate selection = %+v, want one", got)
+	}
+
+	genuine := scm.Check{Name: "unit", Bucket: scm.CheckBucketFail, State: "FAILURE"}
+	if got := infrastructureRerunCandidates([]scm.Check{infra, genuine}, &infrastructureRerunBudget{}, 1, "head-1", "base-1"); len(got) != 0 {
+		t.Fatalf("genuine sibling was masked by infrastructure retry: %+v", got)
+	}
+	omission := scm.Check{Name: "look for a proving pull request with the same pushed tree", Bucket: scm.CheckBucketSkip, State: "SKIPPED", InfrastructureGroup: "run:1", InfrastructureHeadSHA: "head-1", InfrastructureBaseSHA: "base-1", InfrastructureRerunSafe: true, InfrastructureRerunOmission: true}
+	if got := infrastructureRerunCandidates([]scm.Check{infra, omission}, &infrastructureRerunBudget{}, 1, "head-1", "base-1"); len(got) != 1 {
+		t.Fatalf("group-bound PR-only omission blocked the joined retry family: %+v", got)
+	}
+	dependent := scm.Check{Name: "repository", Bucket: scm.CheckBucketSkip, State: "SKIPPED", InfrastructureGroup: "run:1", InfrastructureHeadSHA: "head-1", InfrastructureBaseSHA: "base-1", InfrastructureRerunSafe: true, InfrastructureRerunDependent: true}
+	if got := infrastructureRerunCandidates([]scm.Check{infra, omission, dependent}, &infrastructureRerunBudget{}, 1, "head-1", "base-1"); len(got) != 1 {
+		t.Fatalf("group-bound skipped dependent blocked the joined retry family: %+v", got)
+	}
+	wrongGroup := omission
+	wrongGroup.InfrastructureGroup = "run:2"
+	if got := infrastructureRerunCandidates([]scm.Check{infra, wrongGroup}, &infrastructureRerunBudget{}, 1, "head-1", "base-1"); len(got) != 0 {
+		t.Fatalf("cross-group omission was admitted: %+v", got)
+	}
+	for name, outside := range map[string]scm.Check{
+		"cancelled": {Name: "browser", Bucket: scm.CheckBucketCancel, State: "CANCELLED"},
+		"timed out": {Name: "browser", Bucket: scm.CheckBucketFail, State: "TIMED_OUT"},
+		"unknown":   {Name: "browser", Bucket: scm.CheckBucketFail, State: "QUARANTINED"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := infrastructureRerunCandidates([]scm.Check{outside}, &infrastructureRerunBudget{}, 1, "head-1", "base-1"); len(got) != 0 {
+				t.Fatalf("outside failure entered infrastructure retry: %+v", got)
+			}
+		})
+	}
+	for name, sibling := range map[string]scm.Check{
+		"unknown sibling": {Name: "required", State: "QUARANTINED"},
+		"pending sibling": {Name: "required", Bucket: scm.CheckBucketPending, State: "IN_PROGRESS"},
+		"skipped sibling": {Name: "required", Bucket: scm.CheckBucketSkip, State: "SKIPPED"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := infrastructureRerunCandidates([]scm.Check{infra, sibling}, &infrastructureRerunBudget{}, 1, "head-1", "base-1"); len(got) != 0 {
+				t.Fatalf("unproved sibling was masked by infrastructure retry: %+v", got)
+			}
+		})
+	}
+}
+
+// The first failure is durable evidence, not a transient log line. Recovery
+// must preserve its check, provider link, reason, head/base, and spent budget so
+// it cannot issue a second same-candidate rerun after a daemon restart.
+func TestInfrastructureRerunBudget_RestartRetainsFirstFailureAndSpentAttempt(t *testing.T) {
+	t.Parallel()
+
+	failedAt := time.Date(2026, 9, 8, 16, 0, 0, 0, time.UTC)
+	check := scm.Check{Name: "browser", Bucket: scm.CheckBucketFail, State: "FAILURE", CompletedAt: failedAt, Link: "job-1", InfrastructureFailure: true, InfrastructureGroup: "run:1", InfrastructureReason: "FinalizeArtifact HTTP 503", InfrastructureHeadSHA: "head-1", InfrastructureBaseSHA: "base-1", InfrastructureRerunSafe: true, InfrastructureEvidence: scm.InfrastructureEvidenceReceipt{
+		ProviderRunID: "1", Attempt: 1, LogJobIDs: []int64{2, 3}, DependentJobs: []int64{3, 4},
+		DependentSteps: []scm.InfrastructureStepReceipt{{JobID: 2, Number: 7, Name: "Run tests"}, {JobID: 3, Number: 4, Name: "Prove fan-in"}},
+		Artifacts:      []scm.InfrastructureArtifactReceipt{{ID: 91, Name: "bundle-a1", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ProviderRunID: 1, HeadSHA: "head-1"}},
+	}}
+	original := &infrastructureRerunBudget{}
+	original.spend(check, []scm.Check{check}, "head-1", "main", "base-1")
+	encoded, err := original.marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := &infrastructureRerunBudget{}
+	if err := recovered.unmarshal(encoded); err != nil {
+		t.Fatal(err)
+	}
+	record, ok := recovered.firstFailure("head-1", "base-1")
+	if !ok {
+		t.Fatal("recovered budget lost first failure")
+	}
+	if record.Name != check.Name || record.Link != check.Link || record.Reason != check.InfrastructureReason || record.CompletedAt != failedAt || record.HeadSHA != "head-1" || record.BaseBranch != "main" || record.BaseSHA != "base-1" {
+		t.Fatalf("recovered first failure = %+v, want original evidence", record)
+	}
+	if record.Evidence.ProviderRunID != "1" || record.Evidence.Attempt != 1 || len(record.Evidence.LogJobIDs) != 2 || len(record.Evidence.DependentJobs) != 2 || len(record.Evidence.DependentSteps) != 2 || len(record.Evidence.Artifacts) != 1 || record.Evidence.Artifacts[0].Digest == "" {
+		t.Fatalf("recovered retention receipt = %+v", record.Evidence)
+	}
+	if got := infrastructureRerunCandidates([]scm.Check{check}, recovered, 1, "head-1", "base-1"); len(got) != 0 {
+		t.Fatalf("restart handed back a spent candidate retry: %+v", got)
+	}
+}
+
+// Both policies share the existing opaque run column but retain independent
+// budgets. The combined codec must preserve the legacy transient shape and the
+// new first-failure record in one restart-safe payload.
+func TestCIRerunState_RestartPreservesIndependentTransientAndInfrastructureBudgets(t *testing.T) {
+	t.Parallel()
+
+	transient := &checkRerunBudget{}
+	cancelled := scm.Check{Name: "lint", Bucket: scm.CheckBucketCancel, State: "CANCELLED", Link: "cancel-link"}
+	transient.spend(cancelled, []scm.Check{cancelled}, "head-1")
+	infrastructure := &infrastructureRerunBudget{}
+	artifact := scm.Check{Name: "browser", Bucket: scm.CheckBucketFail, State: "FAILURE", Link: "artifact-link", InfrastructureFailure: true, InfrastructureGroup: "run:1", InfrastructureReason: "FinalizeArtifact HTTP 503", InfrastructureHeadSHA: "head-1", InfrastructureBaseSHA: "base-1", InfrastructureRerunSafe: true, InfrastructureEvidence: scm.InfrastructureEvidenceReceipt{ProviderRunID: "1", Attempt: 1, LogJobIDs: []int64{2}}}
+	infrastructure.spend(artifact, []scm.Check{artifact}, "head-1", "main", "base-1")
+
+	encoded, err := marshalCIRerunState(transient, infrastructure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveredTransient := &checkRerunBudget{}
+	recoveredInfrastructure := &infrastructureRerunBudget{}
+	if err := recoveredTransient.unmarshal(encoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoveredInfrastructure.unmarshal(encoded); err != nil {
+		t.Fatal(err)
+	}
+	if recoveredTransient.used("lint") != 1 {
+		t.Fatalf("transient spent = %d, want 1", recoveredTransient.used("lint"))
+	}
+	if recoveredInfrastructure.used("head-1", "base-1") != 1 {
+		t.Fatalf("infrastructure spent = %d, want 1", recoveredInfrastructure.used("head-1", "base-1"))
+	}
+}
+
+// A rerun receipt does not make the old failed rollup a new failure. It gets a
+// finite wait, while a changed completion is immediately treated as the second
+// attempt and may not be hidden from the ordinary CI path.
+func TestInfrastructureRerunBudget_WaitsOnlyForExactOldFailureRollup(t *testing.T) {
+	t.Parallel()
+
+	completed := time.Date(2026, 9, 8, 16, 0, 0, 0, time.UTC)
+	old := scm.Check{Name: "browser", Bucket: scm.CheckBucketFail, State: "FAILURE", CompletedAt: completed, Link: "job-1", InfrastructureFailure: true, InfrastructureGroup: "run:1", InfrastructureHeadSHA: "head-1", InfrastructureBaseSHA: "base-1", InfrastructureRerunSafe: true, InfrastructureEvidence: scm.InfrastructureEvidenceReceipt{ProviderRunID: "1", Attempt: 1, LogJobIDs: []int64{2}}}
+	budget := &infrastructureRerunBudget{}
+	budget.spend(old, []scm.Check{old}, "head-1", "main", "base-1")
+	for poll := 0; poll < rerunRollupGracePolls; poll++ {
+		if awaiting := budget.awaitingFailureKeys([]scm.Check{old}, "head-1", "base-1"); !awaiting[checkIdentity(old)] {
+			t.Fatalf("poll %d awaiting = %v, want exact old failure", poll+1, awaiting)
+		}
+	}
+	if awaiting := budget.awaitingFailureKeys([]scm.Check{old}, "head-1", "base-1"); len(awaiting) != 0 {
+		t.Fatalf("grace was unbounded: %v", awaiting)
+	}
+
+	budget = &infrastructureRerunBudget{}
+	budget.spend(old, []scm.Check{old}, "head-1", "main", "base-1")
+	second := old
+	second.CompletedAt = completed.Add(time.Minute)
+	if awaiting := budget.awaitingFailureKeys([]scm.Check{second}, "head-1", "base-1"); len(awaiting) != 0 {
+		t.Fatalf("new failed attempt was hidden as old rollup: %v", awaiting)
+	}
+}
+
+// The bounded exception is disabled unless trusted configuration opts in.
+func TestRerunningArtifactInfrastructureIsOffByDefault(t *testing.T) {
+	t.Parallel()
+	if config.DefaultCIRerunInfrastructure != 0 || config.MaxCIRerunInfrastructure != 1 {
+		t.Fatalf("infrastructure retry bounds = default %d max %d, want 0 and 1", config.DefaultCIRerunInfrastructure, config.MaxCIRerunInfrastructure)
+	}
+	check := scm.Check{Name: "browser", Bucket: scm.CheckBucketFail, State: "FAILURE", InfrastructureFailure: true, InfrastructureGroup: "run:1", InfrastructureHeadSHA: "head", InfrastructureBaseSHA: "base", InfrastructureRerunSafe: true}
+	if got := infrastructureRerunCandidates([]scm.Check{check}, &infrastructureRerunBudget{}, config.DefaultCIRerunInfrastructure, "head", "base"); len(got) != 0 {
+		t.Fatalf("default selected infrastructure retry: %+v", got)
+	}
+}
+
+func TestInfrastructureFailuresWithoutExactRerun_ReportMismatchInsteadOfAutofix(t *testing.T) {
+	t.Parallel()
+	checks := []scm.Check{
+		{Name: "artifact", Bucket: scm.CheckBucketFail, State: "FAILURE", InfrastructureFailure: true, InfrastructureRerunSafe: false},
+		{Name: "green", Bucket: scm.CheckBucketPass, State: "SUCCESS"},
+	}
+	if got := infrastructureFailuresWithoutExactRerun(checks); len(got) != 1 || got[0] != "artifact" {
+		t.Fatalf("unsafe infrastructure failures = %v, want artifact", got)
+	}
+}
+
+// The monitor may have started on main and then observe the same PR retargeted
+// to another branch. That differs from main advancing: the live head/base tuple
+// no longer identifies the candidate at all, so classification must stop.
+func TestVerifyInfrastructurePRTarget_RetargetDuringMonitorIsRefused(t *testing.T) {
+	t.Parallel()
+	host := &fakeCheckRerunner{target: scm.PRTarget{HeadSHA: "head-1", BaseBranch: "release", BaseSHA: "release-1"}}
+	mismatch, err := verifyInfrastructurePRTarget(context.Background(), host, &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(mismatch, "PR target changed during CI monitoring") || !strings.Contains(mismatch, "release") {
+		t.Fatalf("retarget mismatch = %q, want explicit old/new target refusal", mismatch)
+	}
+}
+
+// A single transient GetPRTarget error must only disable infrastructure
+// retry for the poll where it occurred, not for the rest of the run: the CI
+// monitor loop calls rearmPRPollIdentity at the top of every poll to restore
+// pr.HeadSHA/pr.BaseBranch from the run's known-good values before deciding
+// whether to invalidate them again this poll.
+func TestRearmPRPollIdentity_RecoversFromPriorPollInvalidation(t *testing.T) {
+	t.Parallel()
+	pr := &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}
+
+	invalidateInfrastructurePRTarget(pr)
+	if pr.HeadSHA != "" || pr.BaseBranch != "" || pr.BaseSHA != "" {
+		t.Fatalf("pr after invalidation = %+v, want all target fields cleared", pr)
+	}
+
+	// The next poll resolves pr.BaseSHA from the live base branch tip before
+	// rearmPRPollIdentity runs, exactly as the CI monitor loop does.
+	pr.BaseSHA = "base-1"
+	rearmPRPollIdentity(pr, "head-1", "main")
+	if pr.HeadSHA != "head-1" || pr.BaseBranch != "main" || pr.BaseSHA != "base-1" {
+		t.Fatalf("pr after rearm = %+v, want head/base/baseSHA restored from the run's known-good values", pr)
+	}
+
+	host := &fakeCheckRerunner{}
+	mismatch, err := verifyInfrastructurePRTarget(context.Background(), host, pr)
+	if err != nil || mismatch != "" {
+		t.Fatalf("verifyInfrastructurePRTarget after rearm = mismatch %q err %v, want a clean pass now that the target is restored", mismatch, err)
+	}
+}
+
+// Infrastructure admission is unavailable until the durable state has been
+// read and structurally validated. A read/decode/reservation failure must occur
+// before any provider request, and a recovered spend covers a later workflow
+// group on the same immutable candidate.
+func TestInfrastructureRerunDispatch_FailsClosedAcrossPersistenceBoundaries(t *testing.T) {
+	newContext := func(t *testing.T) (*pipeline.StepContext, string) {
+		t.Helper()
+		dbPath := filepath.Join(t.TempDir(), "state.db")
+		database, err := db.Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = database.Close() })
+		repo, err := database.InsertRepo(t.TempDir(), "https://github.com/test/repo", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		run, err := database.InsertRun(repo.ID, "refs/heads/feature", "head-1", "base-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &pipeline.StepContext{Ctx: context.Background(), DB: database, Run: run, Repo: repo, Config: &config.Config{CI: config.CI{RerunInfrastructure: 1}}, Log: func(string) {}}, dbPath
+	}
+	checkFor := func(group string) scm.Check {
+		return scm.Check{Name: "build", Bucket: scm.CheckBucketFail, State: "FAILURE", Link: "job-2", InfrastructureFailure: true, InfrastructureGroup: group, InfrastructureReason: "artifact service", InfrastructureHeadSHA: "head-1", InfrastructureBaseSHA: "base-1", InfrastructureRerunSafe: true, InfrastructureEvidence: scm.InfrastructureEvidenceReceipt{ProviderRunID: "1", Attempt: 1, LogJobIDs: []int64{2}}}
+	}
+	prepareFreshness := func(step *CIStep) {
+		step.publishedHead = func(*pipeline.StepContext) (string, error) { return "head-1", nil }
+		step.baseBranchTip = func(context.Context) (string, bool) { return "base-1", true }
+	}
+
+	t.Run("failed read", func(t *testing.T) {
+		sctx, _ := newContext(t)
+		if err := sctx.DB.Close(); err != nil {
+			t.Fatal(err)
+		}
+		step := &CIStep{}
+		prepareFreshness(step)
+		step.loadRerunBudget(sctx)
+		host := &fakeCheckRerunner{}
+		step.rerunInfrastructureChecks(sctx, host, &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
+		if host.calls != 0 {
+			t.Fatalf("provider requests = %d after failed state read, want 0", host.calls)
+		}
+	})
+
+	t.Run("corrupt and invalid state", func(t *testing.T) {
+		valid := &infrastructureRerunBudget{}
+		validCheck := checkFor("run:1")
+		valid.spend(validCheck, []scm.Check{validCheck}, "head-1", "main", "base-1")
+		validPayload, err := valid.marshal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var invalidCountPayload persistedInfrastructureRerunBudget
+		if err := json.Unmarshal([]byte(validPayload), &invalidCountPayload); err != nil {
+			t.Fatal(err)
+		}
+		key := infrastructureCandidateKey("head-1", "base-1")
+		invalidCount := invalidCountPayload.Infrastructure[key]
+		invalidCount.Used = -1
+		invalidCountPayload.Infrastructure[key] = invalidCount
+		invalidCountJSON, err := json.Marshal(invalidCountPayload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, encoded := range map[string]string{
+			"corrupt":       `{not-json`,
+			"invalid count": string(invalidCountJSON),
+		} {
+			t.Run(name, func(t *testing.T) {
+				sctx, _ := newContext(t)
+				if err := sctx.DB.SetRunCIRerunState(sctx.Run.ID, encoded); err != nil {
+					t.Fatal(err)
+				}
+				step := &CIStep{}
+				prepareFreshness(step)
+				step.loadRerunBudget(sctx)
+				host := &fakeCheckRerunner{}
+				step.rerunInfrastructureChecks(sctx, host, &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
+				if host.calls != 0 {
+					t.Fatalf("provider requests = %d after invalid state, want 0", host.calls)
+				}
+			})
+		}
+	})
+
+	t.Run("failed reservation", func(t *testing.T) {
+		sctx, _ := newContext(t)
+		step := &CIStep{infrastructureStateAvailable: true}
+		prepareFreshness(step)
+		if err := sctx.DB.Close(); err != nil {
+			t.Fatal(err)
+		}
+		host := &fakeCheckRerunner{}
+		step.rerunInfrastructureChecks(sctx, host, &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
+		if host.calls != 0 {
+			t.Fatalf("provider requests = %d after failed reservation, want 0", host.calls)
+		}
+	})
+
+	t.Run("spent candidate survives recovery and changed workflow group", func(t *testing.T) {
+		sctx, _ := newContext(t)
+		spent := &infrastructureRerunBudget{}
+		first := checkFor("run:1")
+		spent.spend(first, []scm.Check{first}, "head-1", "main", "base-1")
+		encoded, err := marshalCIRerunState(&checkRerunBudget{}, spent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sctx.DB.SetRunCIRerunState(sctx.Run.ID, encoded); err != nil {
+			t.Fatal(err)
+		}
+		step := &CIStep{}
+		prepareFreshness(step)
+		step.loadRerunBudget(sctx)
+		host := &fakeCheckRerunner{}
+		step.rerunInfrastructureChecks(sctx, host, &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:2")})
+		if host.calls != 0 {
+			t.Fatalf("provider requests = %d after recovered spend, want 0", host.calls)
+		}
+	})
+
+	t.Run("same base branch advanced", func(t *testing.T) {
+		sctx, _ := newContext(t)
+		step := &CIStep{infrastructureStateAvailable: true}
+		step.publishedHead = func(*pipeline.StepContext) (string, error) { return "head-1", nil }
+		step.baseBranchTip = func(context.Context) (string, bool) { return "base-2", true }
+		host := &fakeCheckRerunner{}
+		issued, outcome := step.rerunInfrastructureChecks(sctx, host, &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
+		if issued || host.calls != 0 || outcome != nil {
+			t.Fatalf("same-branch advance = issued %v, calls %d, outcome %+v; want a quiet freshness refusal distinct from retarget", issued, host.calls, outcome)
+		}
+	})
+
+	t.Run("PR retargeted before dispatch", func(t *testing.T) {
+		sctx, _ := newContext(t)
+		step := &CIStep{infrastructureStateAvailable: true}
+		prepareFreshness(step)
+		host := &fakeCheckRerunner{target: scm.PRTarget{HeadSHA: "head-1", BaseBranch: "release", BaseSHA: "base-1"}}
+		issued, outcome := step.rerunInfrastructureChecks(sctx, host, &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
+		if issued || host.calls != 0 {
+			t.Fatalf("retargeted PR dispatched retry: issued=%v calls=%d", issued, host.calls)
+		}
+		if outcome == nil || !strings.Contains(outcome.Findings, "PR target changed during CI monitoring") {
+			t.Fatalf("retargeted PR outcome = %+v, want explicit monitor-target refusal", outcome)
+		}
+	})
+
+	t.Run("published feature branch advanced", func(t *testing.T) {
+		sctx, _ := newContext(t)
+		step := &CIStep{infrastructureStateAvailable: true}
+		step.publishedHead = func(*pipeline.StepContext) (string, error) { return "head-2", nil }
+		step.baseBranchTip = func(context.Context) (string, bool) { return "base-1", true }
+		host := &fakeCheckRerunner{}
+		step.rerunInfrastructureChecks(sctx, host, &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, []scm.Check{checkFor("run:1")})
+		if host.calls != 0 {
+			t.Fatalf("provider requests = %d after branch advance, want 0", host.calls)
+		}
+	})
 }
 
 // The budget has to survive a daemon restart. Before it was durable, a
