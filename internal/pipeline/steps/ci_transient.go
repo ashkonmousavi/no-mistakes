@@ -1004,6 +1004,19 @@ func invalidateInfrastructurePRTarget(pr *scm.PR) {
 	pr.BaseSHA = ""
 }
 
+// rearmPRPollIdentity resets the per-poll fields of pr to the run's known-good
+// values at the top of every poll. pr.BaseSHA is deliberately left untouched:
+// it is re-resolved from the live base branch tip a few lines earlier in the
+// poll loop, and this function runs afterward. Without this, a poll that
+// called invalidateInfrastructurePRTarget after a transient GetPRTarget error
+// would leave pr.HeadSHA and pr.BaseBranch permanently blank, disabling the
+// opt-in artifact-infrastructure retry for the rest of the run instead of
+// just the poll where the transient error occurred.
+func rearmPRPollIdentity(pr *scm.PR, headSHA, baseBranch string) {
+	pr.HeadSHA = headSHA
+	pr.BaseBranch = baseBranch
+}
+
 func (s *CIStep) currentBaseBranchTip(sctx *pipeline.StepContext, baseBranch string) (string, bool) {
 	ctx, cancel := context.WithTimeout(sctx.Ctx, defaultBaseBranchTipResolveWindow)
 	defer cancel()

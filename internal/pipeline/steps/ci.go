@@ -509,7 +509,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 
 		// Check CI status - wait for all checks to complete before fixing
 		ciFixLimit := sctx.Config.AutoFix.CI
-		pr.HeadSHA = sctx.Run.HeadSHA
+		rearmPRPollIdentity(pr, sctx.Run.HeadSHA, baseBranch)
 		checks, err := host.GetChecks(ctx, pr)
 		if err != nil {
 			clearCIMonitorReady(sctx)

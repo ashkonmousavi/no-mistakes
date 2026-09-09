@@ -927,6 +927,35 @@ func TestVerifyInfrastructurePRTarget_RetargetDuringMonitorIsRefused(t *testing.
 	}
 }
 
+// A single transient GetPRTarget error must only disable infrastructure
+// retry for the poll where it occurred, not for the rest of the run: the CI
+// monitor loop calls rearmPRPollIdentity at the top of every poll to restore
+// pr.HeadSHA/pr.BaseBranch from the run's known-good values before deciding
+// whether to invalidate them again this poll.
+func TestRearmPRPollIdentity_RecoversFromPriorPollInvalidation(t *testing.T) {
+	t.Parallel()
+	pr := &scm.PR{HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}
+
+	invalidateInfrastructurePRTarget(pr)
+	if pr.HeadSHA != "" || pr.BaseBranch != "" || pr.BaseSHA != "" {
+		t.Fatalf("pr after invalidation = %+v, want all target fields cleared", pr)
+	}
+
+	// The next poll resolves pr.BaseSHA from the live base branch tip before
+	// rearmPRPollIdentity runs, exactly as the CI monitor loop does.
+	pr.BaseSHA = "base-1"
+	rearmPRPollIdentity(pr, "head-1", "main")
+	if pr.HeadSHA != "head-1" || pr.BaseBranch != "main" || pr.BaseSHA != "base-1" {
+		t.Fatalf("pr after rearm = %+v, want head/base/baseSHA restored from the run's known-good values", pr)
+	}
+
+	host := &fakeCheckRerunner{}
+	mismatch, err := verifyInfrastructurePRTarget(context.Background(), host, pr)
+	if err != nil || mismatch != "" {
+		t.Fatalf("verifyInfrastructurePRTarget after rearm = mismatch %q err %v, want a clean pass now that the target is restored", mismatch, err)
+	}
+}
+
 // Infrastructure admission is unavailable until the durable state has been
 // read and structurally validated. A read/decode/reservation failure must occur
 // before any provider request, and a recovered spend covers a later workflow
