@@ -8,7 +8,7 @@ Per-repo configuration lives in `.no-mistakes.yaml` at the root of your reposito
 :::caution[Security: gate-control fields are read from the default branch]
 `commands.*` execute arbitrary shell on the daemon host via `sh -c` / `cmd.exe /c`, and `agent` selects which process launches there (including ordered fallback lists, ACP aliases such as `cursor`, and `acp:` targets) with the maintainer's credentials.
 To prevent a supply-chain attack where a contributor lands a hostile value on a gated branch, the daemon always reads **`commands` and `agent` from your default branch** (e.g. `origin/main`), never from the pushed SHA, and reads them at the exact commit a fresh fetch resolved (so a stale `origin/<default>` ref cannot serve a value the live default branch removed).
-The daemon also reads `document.instructions`, `review.path_instructions`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.rerun_infrastructure`, `ci.revalidate_repairs`, `test.instructions`, and `test.evidence.branch` only from that trusted copy.
+The daemon also reads `document.instructions`, `document.correction_paths`, `review.path_instructions`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.rerun_infrastructure`, `ci.revalidate_repairs`, `test.instructions`, and `test.evidence.branch` only from that trusted copy.
 `pr.base_branch` is trusted-default-branch-only as well, but unlike those fields it follows the same `allow_repo_commands: true` opt-in exception as `commands`/`agent` (see [`pr.base_branch`](#prbase_branch) below).
 If the default branch cannot be fetched and resolved to a readable commit, or its present `.no-mistakes.yaml` cannot be read and parsed, the run aborts before launching an agent.
 A readable default-branch tree with no `.no-mistakes.yaml` is valid and uses defaults.
@@ -38,6 +38,9 @@ ignore_patterns:
 document:
   instructions: |
     docs/ owns detailed product guidance; README.md owns the introduction.
+  correction_paths:
+    - "docs/**"
+    - "*.md"
 
 # Optional extra review guidance, scoped to the paths a change touches.
 # Read only from the trusted default branch.
@@ -286,6 +289,31 @@ It augments or clarifies the built-in policy; it cannot disable documentation in
 
 Like `commands.*` and `agent`, this field steers gate behavior, so it is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`: a contributor's pushed branch cannot weaken the documentation rules that gate its own review.
 
+### document.correction_paths
+
+The documentation-and-records path class: the only files the document step's bounded correction may edit, and the only files a post-review head advance may contain without sending the run back through Review.
+
+| | |
+| --- | --- |
+| Type | `string[]` (globs, same rules as `ignore_patterns`) |
+| Default | `*.md`, `docs/**`, `openspec/**`, `contracts/**`, `README*` |
+
+Setting this **replaces** the default class rather than adding to it, so list every path a documentation correction should be able to reach:
+
+```yaml
+document:
+  correction_paths:
+    - "docs/**"
+    - "contracts/**"
+    - "*.md"
+```
+
+An entry that is empty, or a glob the matcher cannot compile, is rejected when the file is parsed rather than silently matching nothing.
+
+This is a path class, not a safety verdict. A `.md` file can still influence executable behaviour, generated output, or delivery authority, which is why the document step classifies each finding separately. The re-validation is not branched on that classification: every correction inside this class re-runs [`commands.test`](#commandstest), because the run continues from Test on any head advance the class covers. Membership answers only "is this the documentation and records surface the Document gate owns"; the corrected head still receives the project's test command, lint, the exact-head attestation, and the full CI battery. See [Push](/no-mistakes/reference/pipeline-steps/#push) for what the class does and does not skip.
+
+Like `document.instructions`, this field steers gate behavior, so it is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`, regardless of [`allow_repo_commands`](#allow_repo_commands): a pushed branch that could widen this class could name its own source directory "documentation" and publish unreviewed code through the cheaper path.
+
 ### review.path_instructions
 
 Extra review guidance, scoped to the paths a change actually touches.
@@ -414,8 +442,8 @@ Override auto-fix attempt limits for specific steps. Fields not set here inherit
 | `auto_fix.ci` | `int` | Inherits from global (default `3`) |
 
 Set to `0` to disable the follow-up auto-fix loop for a step (findings require manual approval).
-The document step attempts documentation fixes during its initial pass, so unresolved documentation findings pause for approval instead of using an automatic follow-up loop.
-For empty `commands.lint`, the document step's combined housekeeping pass also attempts safe lint fixes, and the lint step consumes its result; unresolved blocking lint findings pause for approval instead of starting another automatic fix loop.
+`auto_fix.document` is also the switch for the document step's [bounded in-run correction](/no-mistakes/reference/pipeline-steps/#document): above `0`, an accepted documentation finding is corrected and committed inside the run (at most one correcting round, restricted to [`document.correction_paths`](#documentcorrection_paths)); at `0` the step stays strictly report-only and findings are resolved outside the run.
+For empty `commands.lint`, the document step's combined housekeeping pass also assesses lint, and the lint step consumes its result; unresolved blocking lint findings pause for approval instead of starting another automatic fix loop.
 
 `auto_fix.ci` covers the CI step's CI failure and merge-conflict auto-fix attempts.
 

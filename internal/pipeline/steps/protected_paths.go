@@ -25,14 +25,31 @@ func stagePipelineChanges(sctx *pipeline.StepContext) error {
 			if len(entry) < 4 || entry[2] != ' ' {
 				return fmt.Errorf("check protected_paths: invalid git status entry %q", entry)
 			}
-			file := entry[3:]
-			for _, pattern := range sctx.Config.ProtectedPaths {
-				if matchIgnorePattern(file, pattern) {
-					return &pipeline.ProtectedPathError{Path: file, Rule: pattern}
-				}
+			if err := assertNoProtectedPaths(sctx, []string{entry[3:]}); err != nil {
+				return err
 			}
 		}
 	}
 	_, err := stepGitRun(sctx, "add", "-A")
 	return err
+}
+
+// assertNoProtectedPaths refuses when any of the given repository-relative
+// paths matches a protected_paths rule. It is the pattern half of the guard
+// above, shared with the path-scoped document correction commit, which already
+// knows exactly which paths it is about to stage and so needs no status read
+// of its own. Keeping one matcher means a protected path cannot be refused by
+// the catch-all staging path and quietly accepted by the scoped one.
+func assertNoProtectedPaths(sctx *pipeline.StepContext, paths []string) error {
+	if sctx.Config == nil || len(sctx.Config.ProtectedPaths) == 0 {
+		return nil
+	}
+	for _, file := range paths {
+		for _, pattern := range sctx.Config.ProtectedPaths {
+			if matchIgnorePattern(file, pattern) {
+				return &pipeline.ProtectedPathError{Path: file, Rule: pattern}
+			}
+		}
+	}
+	return nil
 }

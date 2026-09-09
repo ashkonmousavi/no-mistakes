@@ -1103,3 +1103,31 @@ func TestBuildTestingSummaryForPR_FallsBackForBinaryEvidence(t *testing.T) {
 		t.Fatalf("did not expect binary content to be embedded as text, got:\n%s", md)
 	}
 }
+
+// TestBuildPipelineSummary_DocumentCorrectionAndEditorialNotesAreStatedTruthfully
+// proves the pull request states what the run actually did to the branch: the
+// files a bounded documentation correction committed are named, and an
+// editorial finding is labelled a recorded note rather than reading as an
+// unanswered request.
+func TestBuildPipelineSummary_DocumentCorrectionAndEditorialNotesAreStatedTruthfully(t *testing.T) {
+	corrected := `{"findings":[{"id":"document-2","severity":"info","file":"README.md","line":4,"description":"prefer 'install' over 'set up'","action":"no-op","class":"editorial"}],"summary":"one note","corrected_paths":["contracts/rows.md","docs/reference.md"]}`
+	applied := changesAppliedSummary
+	steps := []*db.StepResult{{ID: "s1", StepName: types.StepDocument, Status: types.StepStatusCompleted, FindingsJSON: &corrected}}
+	rounds := map[string][]*db.StepRound{
+		"s1": {
+			{Round: 1, Trigger: "initial", DurationMS: 100},
+			{Round: 2, Trigger: "auto_fix", DurationMS: 200, FindingsJSON: &corrected, FixSummary: &applied},
+		},
+	}
+
+	md, _ := BuildPipelineSummary(steps, rounds, testPipelineHeadSHA)
+
+	for _, want := range []string{
+		"Documentation corrected in this run: `contracts/rows.md`, `docs/reference.md`",
+		"_(editorial note - recorded, not blocking)_",
+	} {
+		if !strings.Contains(md, want) {
+			t.Errorf("expected %q in the pipeline summary, got:\n%s", want, md)
+		}
+	}
+}

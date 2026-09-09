@@ -56,6 +56,33 @@ func unmarshalRequiredFindings(raw []byte, findings *Findings, requireNonEmptySu
 	return nil
 }
 
+// unmarshalRequiredDocumentFindings validates the document analyzer's output
+// on top of the shared finding contract: every DOCUMENTATION finding must
+// carry a known class (editorial, substantive, or behavioural).
+//
+// The class is validated here rather than only in the JSON schema because the
+// combined document+lint pass returns both duties in one array, and a lint
+// finding legitimately carries no class - a constraint the schema's flat
+// "required" list cannot express. It is held as strictly as the severity and
+// action fields for the same reason those are: the class decides whether a
+// finding gates, and accepting an omission would silently hand the analyzer
+// the power to un-gate a substantive documentation defect by leaving a field
+// out.
+func unmarshalRequiredDocumentFindings(raw []byte, findings *Findings, combinedLint bool) error {
+	if err := unmarshalRequiredFindings(raw, findings, true); err != nil {
+		return err
+	}
+	for i, item := range findings.Items {
+		if combinedLint && item.Category == types.FindingCategoryLint {
+			continue
+		}
+		if !types.IsKnownFindingClass(item.Class) {
+			return fmt.Errorf("finding %d has class %q, want one of %s", i, item.Class, strings.Join(types.KnownFindingClasses(), ", "))
+		}
+	}
+	return nil
+}
+
 func unmarshalRequiredTestFindings(raw []byte, findings *Findings) error {
 	if err := unmarshalRequiredFindings(raw, findings, false); err != nil {
 		return err

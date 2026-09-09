@@ -21,6 +21,14 @@ const (
 	// RestartReasonFinalHeadRereview marks a restart at Review caused by the
 	// run's final head advancing after Review approved it.
 	RestartReasonFinalHeadRereview RestartReason = "final_head_rereview"
+	// RestartReasonDocumentationHeadRecheck marks a restart at Test caused by
+	// a post-review head advance that touched documentation-and-records paths
+	// only. Review is deliberately NOT repeated - it already read every source
+	// file in the candidate, and re-reading them was the 8-round loop the
+	// read-only document step was introduced to stop - but the corrected head
+	// still owes the project's own test command, the lint gate, the exact-head
+	// attestation, and the full CI battery before anything is claimed about it.
+	RestartReasonDocumentationHeadRecheck RestartReason = "documentation_head_recheck"
 )
 
 // StepContext provides shared resources to pipeline steps during execution.

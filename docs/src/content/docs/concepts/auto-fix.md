@@ -30,10 +30,9 @@ flowchart TD
    - If issues remain, the step pauses for user approval
    - If everything passes, the step completes and the pipeline moves on
 
-The document step applies fixes during its initial pass instead of relying on a follow-up automatic fix loop.
-When `commands.lint` is empty, that same invocation is a combined documentation-and-lint housekeeping pass: it updates documentation, detects relevant linters and formatters, applies safe fixes, verifies both duties, and categorizes any unresolved findings for the document or lint gate.
+The document step does not follow this loop. Its analysis turn is read-only, and correcting an accepted finding is a separate bounded turn gated on `auto_fix.document`; the [Document step](/no-mistakes/reference/pipeline-steps/#document) owns that model, the finding classes that decide what gates, and the combined documentation-and-lint housekeeping pass.
 The lint step consumes a usable lint result from that pass instead of starting a second cold agent invocation; when the combined pass is skipped, cannot produce trustworthy structured output, or loses its in-memory result across a daemon restart, lint falls back to its own agent pass.
-Unresolved documentation findings and unresolved blocking lint findings pause for approval instead of entering another automatic fix loop.
+Unresolved blocking lint findings pause for approval instead of entering another automatic fix loop.
 
 ## Before the agent: deterministic CI reruns
 
@@ -73,10 +72,8 @@ An unclassified finding is never eligible for automatic fixing.
 Classification also follows the remedy, not only the topic: when the smallest honest remedy would add new durable state, a schema change, new background, retry, or persistence machinery, a new subsystem, or otherwise extend the change beyond its stated intent rather than correct what it already does, the review agent classifies the finding `ask-user` and says in the description that the remedy, not the defect, is what needs authorization. The review step's dedicated Simplification pass uses the same action for a component the stated intent does not strictly require: it is reported as an `ask-user` warning whose recommended remedy is removal. The [pipeline-step reference](/no-mistakes/reference/pipeline-steps/) owns which repair agents apply the shared removal-first rule. Agents driving the AXI skill should relay `ask-user` findings to the user unless they have explicit `--yes` consent to resolve gates unattended.
 See [AXI `--yes`](/no-mistakes/reference/cli/#no-mistakes-axi-run) and [TUI yolo mode](/no-mistakes/guides/tui/#action-bar) for automatic gate handling and its exceptions.
 
-The `review`, `test`, and configured-command `lint` steps use this shared model directly. The `document` step also uses the same `action` field, but unresolved documentation findings pause for approval because the initial document pass already attempted the documentation updates it could make safely.
-When `commands.lint` is empty, the combined housekeeping pass routes documentation and lint findings to their owning gates. Its unresolved lint findings describe issues left after safe fixes, so blocking findings pause for approval instead of remaining eligible for another automatic fix loop.
-
-Documentation findings use the same approval UI, but the `document` step treats any finding as an unresolved documentation gap or judgment call that should pause for approval.
+The `review`, `test`, and configured-command `lint` steps use this shared model directly. The `document` step also uses the same `action` field, but adds a required class that decides whether a finding gates at all; the [Document step](/no-mistakes/reference/pipeline-steps/#document) owns those rules.
+When `commands.lint` is empty, the combined housekeeping pass routes documentation and lint findings to their owning gates. Its lint half is a read-only assessment, so blocking lint findings pause for approval instead of remaining eligible for another automatic fix loop.
 
 ## User-triggered fixes
 
@@ -97,7 +94,7 @@ After a user-triggered fix, the step re-runs and pauses again to show you the re
 When the Review, Test, Document, Lint, or CI step commits auto-fix changes, its subject comes from `commit.fix_message`.
 The [global config reference](/no-mistakes/reference/global-config/#commitfix_message) owns the template syntax, default, validation rules, size limits, and supported placeholders; the [repo config reference](/no-mistakes/reference/repo-config/#commitfix_message) owns the repository override and trust behavior.
 The pipeline validates the template, agent summary, predicted output size, and final rendered subject before `git add -A`, so a rejected value does not leave changes staged.
-The combined document-and-lint housekeeping pass runs in the Document step, so its documentation and safe lint fixes use the Document value for `{{.Step}}`; configured-command lint fixes use the Lint value.
+A bounded documentation correction is committed by the Document step, so it uses the Document value for `{{.Step}}`; configured-command lint fixes use the Lint value.
 
 Before a step-specific fix commit, the pipeline verifies that the live worktree HEAD still descends from the head recorded after its previous commit.
 It allows a legitimate forward commit made by an agent, but aborts the run if an out-of-band backward or divergent reset would drop the reviewed history.

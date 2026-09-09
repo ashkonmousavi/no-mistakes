@@ -29,7 +29,7 @@ func TestDocumentStep_ReadOnly_ReportsFindingsWithoutTouchingWorktree(t *testing
 		name: "test",
 		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
 			callCount++
-			return &agent.Result{Output: json.RawMessage(`{"findings":[{"severity":"warning","file":"README.md","line":3,"description":"stale install instructions","action":"ask-user"}],"summary":"README stale"}`)}, nil
+			return &agent.Result{Output: json.RawMessage(`{"findings":[{"severity":"warning","file":"README.md","line":3,"description":"stale install instructions","action":"ask-user","class":"substantive"}],"summary":"README stale"}`)}, nil
 		},
 	}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
@@ -300,7 +300,7 @@ func TestDocumentStep_ReadOnly_UnresolvedFindingsReportNoChangesApplied(t *testi
 	ag := &mockAgent{
 		name: "test",
 		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
-			return &agent.Result{Output: json.RawMessage(`{"findings":[{"severity":"warning","description":"config docs conflict, needs human decision","action":"ask-user"}],"summary":"docs mostly updated"}`)}, nil
+			return &agent.Result{Output: json.RawMessage(`{"findings":[{"severity":"warning","description":"config docs conflict, needs human decision","action":"ask-user","class":"substantive"}],"summary":"docs mostly updated"}`)}, nil
 		},
 	}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
