@@ -13,6 +13,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 func TestLoadRecoveredConfig_BoundsFetchAndFailsClosed(t *testing.T) {
@@ -210,5 +211,83 @@ func TestLoadTrustedRepoConfig_PinnedSHAReadsFreshDefaultBranch(t *testing.T) {
 	}
 	if trusted.Commands.Lint != "echo fresh-B" {
 		t.Fatalf("trusted lint = %q, want fresh-B (read at pinned SHA, not stale ref)", trusted.Commands.Lint)
+	}
+}
+
+// TestTrustedConfigOverrideFields is the regression test for the run-start
+// baseline log: when the pushed branch's own commands/agent fields differ
+// from the trusted default-branch values the run actually uses, the log
+// must name exactly which fields diverged (this is what would have told a
+// maintainer, at baseline, that their pushed commands.test change did not
+// take effect and why) instead of a generic "commands/agent differ" line.
+// A pushed copy identical to the effective one must report no divergence.
+func TestTrustedConfigOverrideFields(t *testing.T) {
+	base := func() *config.RepoConfig {
+		return &config.RepoConfig{
+			Commands: config.Commands{Prepare: "echo prepare", Lint: "echo lint", Test: "echo test", Format: "echo format"},
+			Agent:    types.AgentName("claude"),
+			Agents:   []types.AgentName{types.AgentName("claude"), types.AgentName("codex")},
+		}
+	}
+
+	tests := []struct {
+		name   string
+		pushed *config.RepoConfig
+		effect *config.RepoConfig
+		want   []string
+	}{
+		{
+			name:   "identical pushed and effective reports no divergence",
+			pushed: base(),
+			effect: base(),
+			want:   nil,
+		},
+		{
+			name:   "pushed test command overridden by trusted value",
+			pushed: func() *config.RepoConfig { c := base(); c.Commands.Test = "echo pushed-test"; return c }(),
+			effect: base(),
+			want:   []string{"commands.test"},
+		},
+		{
+			name: "pushed lint and agent overridden by trusted values",
+			pushed: func() *config.RepoConfig {
+				c := base()
+				c.Commands.Lint = "echo pushed-lint"
+				c.Agent = types.AgentName("codex")
+				return c
+			}(),
+			effect: base(),
+			want:   []string{"commands.lint", "agent"},
+		},
+		{
+			name: "pushed agents list overridden by trusted value",
+			pushed: func() *config.RepoConfig {
+				c := base()
+				c.Agents = []types.AgentName{types.AgentName("codex")}
+				return c
+			}(),
+			effect: base(),
+			want:   []string{"agents"},
+		},
+		{
+			name:   "every code-executing field overridden",
+			pushed: &config.RepoConfig{},
+			effect: base(),
+			want:   []string{"commands.prepare", "commands.lint", "commands.test", "commands.format", "agent", "agents"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := trustedConfigOverrideFields(tt.pushed, tt.effect)
+			if len(got) != len(tt.want) {
+				t.Fatalf("trustedConfigOverrideFields() = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("trustedConfigOverrideFields() = %v, want %v", got, tt.want)
+				}
+			}
+		})
 	}
 }
