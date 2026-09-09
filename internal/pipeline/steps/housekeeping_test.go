@@ -37,7 +37,7 @@ func TestDocumentStep_CombinedPassCoversBothDutiesAndSplitsFindings(t *testing.T
 		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
 			return &agent.Result{Output: json.RawMessage(`{
 				"findings":[
-					{"severity":"warning","description":"config docs conflict","action":"ask-user","category":"documentation"},
+					{"severity":"warning","file":"README.md","description":"config docs conflict","action":"ask-user","category":"documentation","class":"substantive"},
 					{"severity":"warning","description":"unfixable vet warning","action":"ask-user","category":"lint"}
 				],
 				"summary":"housekeeping pass"
@@ -129,7 +129,7 @@ func TestDocumentStep_ConfiguredLintCommandKeepsLintCategorizedFindingInDocument
 		name: "test",
 		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
 			return &agent.Result{Output: json.RawMessage(`{
-				"findings":[{"severity":"warning","description":"documentation needs a decision","action":"ask-user","category":"lint"}],
+				"findings":[{"severity":"warning","description":"documentation needs a decision","action":"ask-user","category":"lint","class":"substantive"}],
 				"summary":"documentation needs review"
 			}`)}, nil
 		},
@@ -267,7 +267,7 @@ func TestDocumentStep_CombinedRetryDropsPriorLintResultWhenOutputIsUntrusted(t *
 		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
 			calls++
 			if calls == 1 {
-				return &agent.Result{Output: json.RawMessage(`{"findings":[{"severity":"warning","description":"docs need a decision","action":"ask-user","category":"documentation"}],"summary":"docs need review"}`)}, nil
+				return &agent.Result{Output: json.RawMessage(`{"findings":[{"severity":"warning","file":"README.md","description":"docs need a decision","action":"ask-user","category":"documentation","class":"substantive"}],"summary":"docs need review"}`)}, nil
 			}
 			return &agent.Result{Text: "untrusted output"}, nil
 		},

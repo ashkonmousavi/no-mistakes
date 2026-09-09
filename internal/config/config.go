@@ -313,6 +313,19 @@ type DocumentRaw struct {
 	// placement policy with the repository's ownership map or extra
 	// placement rules.
 	Instructions string `yaml:"instructions"`
+	// CorrectionPaths narrows or widens the documentation-and-records path
+	// class: the only files the document step's bounded correction may edit,
+	// and the only files a post-review head advance may contain without
+	// sending the run back through Review. Empty uses
+	// pipeline.DefaultDocumentCorrectionPaths. Globs follow the
+	// ignore_patterns rules (pipeline.MatchPathGlob).
+	//
+	// This decides what may be corrected and what may skip Review, so like
+	// document.instructions it is honored ONLY from the trusted default-branch
+	// copy of .no-mistakes.yaml (see EffectiveRepoConfig, which takes the whole
+	// document block from the trusted copy): a pushed branch must not be able
+	// to widen the class that governs its own corrections.
+	CorrectionPaths []string `yaml:"correction_paths"`
 }
 
 // ReviewRaw is the YAML representation of review-step settings.
@@ -693,11 +706,15 @@ type PR struct {
 	BaseBranch string
 }
 
-// Document is the resolved document-step config. Instructions come from the
-// trusted default-branch repo config and augment the built-in placement
-// policy in the document prompt.
+// Document is the resolved document-step config. Both fields come from the
+// trusted default-branch repo config: Instructions augments the built-in
+// placement policy in the document prompt, and CorrectionPaths bounds what a
+// correction may touch and what may skip Review. An empty CorrectionPaths
+// means "use the built-in class"; callers resolve it through
+// pipeline.DocumentCorrectionPaths rather than reading this field raw.
 type Document struct {
-	Instructions string
+	Instructions    string
+	CorrectionPaths []string
 }
 
 // Review is the resolved review-step config. PathInstructions come from the
@@ -1038,7 +1055,8 @@ log_level: info
 #   /Users/you/src/my-repo: /Users/you/work/my-repo-runs
 
 # Maximum follow-up auto-fix attempts per step (0 = disabled after the initial pass)
-# Document fixes are attempted during the initial document pass.
+# document is also the switch for the document step's bounded in-run
+# documentation correction: 0 keeps that step strictly report-only.
 auto_fix:
   rebase: 3
   lint: 3
@@ -2220,6 +2238,21 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 	if err := validateReviewRaw(cfg.Review); err != nil {
 		return nil, fmt.Errorf("parse repo config: %w", err)
 	}
+	// Reject a document.correction_paths glob the matcher could never compile,
+	// for the same reason protected_paths is validated here rather than at use:
+	// a pattern that silently matches nothing would quietly shrink the class a
+	// correction may edit, and a repository would discover that only when a
+	// correction it expected to be allowed failed the round.
+	for i, pattern := range cfg.Document.CorrectionPaths {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			return nil, fmt.Errorf("document.correction_paths[%d] must not be empty", i)
+		}
+		if err := validatePathInstructionGlob(pattern); err != nil {
+			return nil, fmt.Errorf("document.correction_paths[%d] %q is not a valid glob: %w", i, pattern, err)
+		}
+		cfg.Document.CorrectionPaths[i] = pattern
+	}
 	for i, pattern := range cfg.ProtectedPaths {
 		pattern = strings.TrimSpace(pattern)
 		if pattern == "" {
@@ -2315,6 +2348,22 @@ func validatePathInstructionGlob(pattern string) error {
 		return err
 	}
 	return nil
+}
+
+// trimmedPatternList drops blank entries and surrounding whitespace from a
+// configured glob list, so a YAML list that carries an empty item or padded
+// values cannot turn into a pattern that matches nothing (or, for a trailing
+// "/**" prefix rule, everything under "").
+func trimmedPatternList(patterns []string) []string {
+	var out []string
+	for _, pattern := range patterns {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			continue
+		}
+		out = append(out, pattern)
+	}
+	return out
 }
 
 // EffectiveRepoConfig returns the repo config that should drive the pipeline
@@ -2830,7 +2879,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		Commit:         commit,
 		Intent:         intent,
 		Test:           test,
-		Document:       Document{Instructions: strings.TrimSpace(repo.Document.Instructions)},
+		Document:       Document{Instructions: strings.TrimSpace(repo.Document.Instructions), CorrectionPaths: trimmedPatternList(repo.Document.CorrectionPaths)},
 		Review:         Review{PathInstructions: resolvePathInstructions(repo.Review.PathInstructions)},
 		PR:             PR{BaseBranch: strings.TrimSpace(repo.PR.BaseBranch)},
 		ForgeProfiles:  global.ForgeProfiles,

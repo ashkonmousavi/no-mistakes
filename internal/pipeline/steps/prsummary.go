@@ -1404,6 +1404,10 @@ func buildStepDetails(summaryLine string, sr *db.StepResult, rounds []*db.StepRo
 			} else {
 				inner.WriteString("✅ No issues found.\n")
 			}
+			// A correction that resolved everything it was asked to leaves no
+			// finding behind, which is exactly the round whose committed files
+			// a reader most needs named.
+			writeCorrectedPaths(&inner, &findings, flavor)
 			writeTestedDetails(&inner, sr, &findings, flavor)
 			inner.WriteString("\n")
 			continue
@@ -1491,6 +1495,7 @@ func fixRoundLine(r *db.StepRound) string {
 // writeFindingItems renders each finding as a `file:line - description` bullet,
 // followed by any test command details for the test step.
 func writeFindingItems(b *strings.Builder, sr *db.StepResult, findings *types.Findings, flavor prBodyFlavor) {
+	writeCorrectedPaths(b, findings, flavor)
 	for _, f := range findings.Items {
 		emoji := severityEmoji(f.Severity)
 		loc := ""
@@ -1501,9 +1506,36 @@ func writeFindingItems(b *strings.Builder, sr *db.StepResult, findings *types.Fi
 			}
 			loc += "` - "
 		}
-		b.WriteString(fmt.Sprintf("- %s %s%s\n", emoji, loc, escapePRText(f.Description, flavor)))
+		b.WriteString(fmt.Sprintf("- %s %s%s%s\n", emoji, loc, escapePRText(f.Description, flavor), editorialNoteSuffix(f)))
 	}
 	writeTestedDetails(b, sr, findings, flavor)
+}
+
+// editorialNoteSuffix labels an editorial documentation finding on the pull
+// request. Without it a reader sees a bullet in a step's finding list and
+// reasonably assumes something is being asked of them; an editorial finding is
+// recorded precisely because it is NOT blocking, and saying so is the whole
+// difference between a note and an unanswered request.
+func editorialNoteSuffix(f types.Finding) string {
+	if f.Class == "" || !f.IsEditorial() {
+		return ""
+	}
+	return " _(editorial note - recorded, not blocking)_"
+}
+
+// writeCorrectedPaths states what a document-step bounded correction actually
+// committed in this round. "Fix applied" alone does not say which files moved,
+// and this run's whole claim - that the correction is documentation and
+// records only - is a claim about exactly this list.
+func writeCorrectedPaths(b *strings.Builder, findings *types.Findings, flavor prBodyFlavor) {
+	if len(findings.CorrectedPaths) == 0 {
+		return
+	}
+	quoted := make([]string, 0, len(findings.CorrectedPaths))
+	for _, path := range findings.CorrectedPaths {
+		quoted = append(quoted, "`"+escapePRText(path, flavor)+"`")
+	}
+	b.WriteString(fmt.Sprintf("- 📝 Documentation corrected in this run: %s\n", strings.Join(quoted, ", ")))
 }
 
 // writeTestedDetails lists what the test step exercised: its live-validation

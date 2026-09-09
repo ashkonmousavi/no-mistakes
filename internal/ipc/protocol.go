@@ -369,7 +369,8 @@ type StepResultInfo struct {
 	RoundCount    int      `json:"round_count,omitempty"`
 	FixRoundCount int      `json:"fix_round_count,omitempty"`
 	// RoundTrigger is the latest round's trigger (e.g. "initial", "auto_fix",
-	// "final_head_rereview") so a client can name why a step is running again.
+	// "final_head_rereview", "documentation_head_recheck") so a client can name
+	// why a step is running again.
 	RoundTrigger     string  `json:"round_trigger,omitempty"`
 	AutoFixLimit     int     `json:"auto_fix_limit,omitempty"`
 	PendingFixSource string  `json:"pending_fix_source,omitempty"`

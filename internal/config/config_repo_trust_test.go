@@ -632,3 +632,50 @@ func TestMerge_CarriesDisableProjectSettings(t *testing.T) {
 		t.Error("Merge must leave DisableProjectSettings false by default")
 	}
 }
+
+// TestEffectiveRepoConfig_DocumentCorrectionPathsTrustedOnly proves the
+// documentation-and-records path class is honored only from the trusted
+// default-branch copy. That class decides both what a pipeline correction may
+// edit and which head advance may skip Review, so a pushed branch that could
+// widen it would be able to name its own source directory as "documentation"
+// and publish unreviewed code through the cheaper path.
+func TestEffectiveRepoConfig_DocumentCorrectionPathsTrustedOnly(t *testing.T) {
+	pushed := &RepoConfig{Document: DocumentRaw{CorrectionPaths: []string{"internal/**"}}}
+	trusted := &RepoConfig{Document: DocumentRaw{CorrectionPaths: []string{"contracts/**"}}}
+
+	for _, allowRepoCommands := range []bool{false, true} {
+		effective := EffectiveRepoConfig(pushed, trusted, allowRepoCommands)
+		if len(effective.Document.CorrectionPaths) != 1 || effective.Document.CorrectionPaths[0] != "contracts/**" {
+			t.Fatalf("allow_repo_commands=%v: CorrectionPaths = %v, want the trusted copy's class", allowRepoCommands, effective.Document.CorrectionPaths)
+		}
+	}
+
+	// Without a trusted copy the pushed class is discarded entirely, so the
+	// built-in default class stays active.
+	if effective := EffectiveRepoConfig(pushed, nil, false); len(effective.Document.CorrectionPaths) != 0 {
+		t.Fatalf("CorrectionPaths = %v, want empty (built-in class) without a trusted copy", effective.Document.CorrectionPaths)
+	}
+}
+
+// TestLoadRepoFromBytes_DocumentCorrectionPathsRejectsInvalidGlob proves an
+// uncompilable or empty pattern fails the config rather than silently matching
+// nothing, which would quietly shrink the class a correction may edit.
+func TestLoadRepoFromBytes_DocumentCorrectionPathsRejectsInvalidGlob(t *testing.T) {
+	for name, yaml := range map[string]string{
+		"unclosed character class": "document:\n  correction_paths:\n    - 'docs/[a-.md'\n",
+		"empty entry":              "document:\n  correction_paths:\n    - ''\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := LoadRepoFromBytes([]byte(yaml)); err == nil {
+				t.Fatalf("expected %s to be rejected", name)
+			}
+		})
+	}
+	cfg, err := LoadRepoFromBytes([]byte("document:\n  correction_paths:\n    - '  contracts/**  '\n    - '*.md'\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Document.CorrectionPaths) != 2 || cfg.Document.CorrectionPaths[0] != "contracts/**" {
+		t.Fatalf("CorrectionPaths = %#v, want trimmed patterns", cfg.Document.CorrectionPaths)
+	}
+}

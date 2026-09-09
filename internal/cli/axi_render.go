@@ -397,11 +397,15 @@ func (s stepView) agentPIDString() string {
 }
 
 func (s stepView) roundSummary() string {
-	// A Review round triggered by the final head moving is not an ordinary
-	// repeat: naming it keeps "why is Review running again" answerable from
-	// axi status alone.
+	// A round triggered by the final head moving is not an ordinary repeat:
+	// naming it keeps "why is this step running again" answerable from axi
+	// status alone. Review restarts when the advance touched code;
+	// Test restarts when it was documentation and records only.
 	if s.Name == string(types.StepReview) && s.RoundTrigger == string(pipeline.RestartReasonFinalHeadRereview) {
 		return fmt.Sprintf("final_head_rereview %d", s.RoundCount)
+	}
+	if s.Name == string(types.StepTest) && s.RoundTrigger == string(pipeline.RestartReasonDocumentationHeadRecheck) {
+		return fmt.Sprintf("documentation_head_recheck %d", s.RoundCount)
 	}
 	if s.Status == string(types.StepStatusFixing) {
 		attempt := s.FixRoundCount
@@ -555,7 +559,7 @@ func gateFieldsWithHelp(gate stepView, help []string) []toon.Field {
 	if parsed.RiskLevel != "" {
 		gfields = append(gfields, toon.Field{Key: "risk", Value: parsed.RiskLevel})
 	}
-	if gate.RoundTrigger == string(pipeline.RestartReasonFinalHeadRereview) {
+	if gate.RoundTrigger == string(pipeline.RestartReasonFinalHeadRereview) || gate.RoundTrigger == string(pipeline.RestartReasonDocumentationHeadRecheck) {
 		gfields = append(gfields, toon.Field{Key: "reason", Value: gate.RoundTrigger})
 	}
 	// Point-of-use reminder at the review gate: review auto-fix defaults to

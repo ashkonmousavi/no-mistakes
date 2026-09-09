@@ -47,6 +47,32 @@ const documentScopeDiscipline = `Scope discipline:
 - Preserve load-bearing user guidance, security rationale, compatibility constraints, and onboarding material. A long document is not a defect by itself; duplication and wrong placement are.
 - Prefer consolidation, deletion, and pointers to the owner over addition and synchronization.`
 
+// documentClassPolicy is the classification contract. It is the answer to the
+// failure this step's gate actually produced: every finding arrived with
+// action ask-user regardless of what correcting it protected, so a reviewer's
+// wording preference blocked a release exactly as hard as a contract row the
+// implementation contradicts.
+//
+// The classification is by EFFECT, never by file extension or severity label.
+// A `.md` file that a validator reads, that a generator consumes, or that
+// carries delivery authority is behavioural, and a beautifully formatted
+// heading in contracts/ is still editorial.
+const documentClassPolicy = `Classification (required on every documentation finding, in the "class" field):
+- "editorial" - a preference: optional wording, cosmetic formatting, a suggested rephrasing, a style nit, a consolidation you would like but nothing depends on. Recorded as a note on the pull request. It NEVER blocks the change, so use it whenever the documentation is not actually wrong.
+- "substantive" - the documentation misinforms a reader who relies on it: it contradicts a required specification or the implementation, gives an operator an instruction that would not work, omits evidence a specification requires, or claims work is complete that is not. Blocks until corrected or explicitly accepted.
+- "behavioural" - a substantive defect in a file that influences executable behaviour, generated output, or delivery authority: a specification a validator or generator actually reads, a contract or records file a check verifies, a policy file that steers an agent or a gate. Blocks, and the correction additionally re-runs this project's own test command.
+
+Rules for classifying:
+- Classify by what correcting the finding protects, NOT by the file extension and NOT by the severity you assigned. A ".md" file can be behavioural, and an "error" severity does not by itself make a finding substantive.
+- When a finding is only a suggestion you would not hold a release for, it is editorial. Do not inflate it to substantive to make sure someone sees it: an editorial note is published on the pull request either way.
+- When you are unsure between substantive and behavioural, choose behavioural - the only cost is re-running the test command.
+- When you are unsure between editorial and substantive, choose substantive.
+
+Action, separately from class:
+- Set "action" to "auto-fix" when your description states the correction precisely enough that another agent could apply it from the description and the file alone. The pipeline then corrects it inside this run, editing only the files your findings name and only inside the documentation-and-records paths listed above.
+- Set "action" to "ask-user" only when the correction needs a judgement someone else has to make (which of two contradicting documents is right, whether a documented behaviour should change).
+- Set "action" to "no-op" for a finding that needs no change at all.`
+
 // housekeepingLintSection adds the agent-driven lint duty to the combined
 // document+lint pass. Read-only, like the document duty: the agent discovers
 // and runs the relevant checks but reports every issue instead of fixing it.
@@ -58,10 +84,43 @@ Combined lint duty (same pass - no separate lint agent will run):
 - Do not run tests or broader behavioral validation.
 - This is a read-only review: do not apply any fix. Report every lint, format, or static-analysis issue you find as a finding with "category" set to "lint", naming the file and line.
 
-Set "category" on every finding: "documentation" for documentation findings, "lint" for lint findings.`
+Set "category" on every finding: "documentation" for documentation findings, "lint" for lint findings. The "class" field above is required on every documentation finding; omit it on lint findings.`
+
+// documentFindingsSchema is findingsSchema plus the required per-finding
+// class. It is a separate schema rather than an extension of the shared one
+// because only the document step classifies; lint and rebase share
+// findingsSchema and must not be told to emit a field they have no vocabulary
+// for.
+var documentFindingsSchema = json.RawMessage(`{
+	"type": "object",
+	"properties": {
+		"findings": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"properties": {
+					"id": {"type": "string"},
+					"severity": {"type": "string", "enum": ["error", "warning", "info"]},
+					"file": {"type": "string"},
+					"line": {"type": "integer"},
+					"description": {"type": "string"},
+					"action": {"type": "string", "enum": ["no-op", "auto-fix", "ask-user"]},
+					"class": {"type": "string", "enum": ["editorial", "substantive", "behavioural"], "description": "what correcting this protects: editorial (a preference, never blocks), substantive (the documentation misinforms), behavioural (the file influences executable behaviour, generated output, or delivery authority). Classify by effect, never by file extension or severity."}
+				},
+				"required": ["severity", "description", "action", "class"]
+			}
+		},
+		"summary": {"type": "string"}
+	},
+	"required": ["findings", "summary"]
+}`)
 
 // housekeepingFindingsSchema extends findingsSchema with the per-finding
-// category that routes combined-pass findings to their owning gates.
+// category that routes combined-pass findings to their owning gates, and with
+// the document class. The class stays out of "required" here because one
+// combined array carries both duties and a lint finding legitimately has no
+// class; unmarshalRequiredDocumentFindings enforces it on the documentation
+// half, where the flat schema cannot.
 var housekeepingFindingsSchema = json.RawMessage(`{
 	"type": "object",
 	"properties": {
@@ -76,7 +135,8 @@ var housekeepingFindingsSchema = json.RawMessage(`{
 					"line": {"type": "integer"},
 					"description": {"type": "string"},
 					"action": {"type": "string", "enum": ["no-op", "auto-fix", "ask-user"]},
-					"category": {"type": "string", "enum": ["documentation", "lint"]}
+					"category": {"type": "string", "enum": ["documentation", "lint"]},
+					"class": {"type": "string", "enum": ["editorial", "substantive", "behavioural"], "description": "required on every documentation finding, omitted on lint findings: what correcting this protects - editorial (a preference, never blocks), substantive (the documentation misinforms), behavioural (the file influences executable behaviour, generated output, or delivery authority). Classify by effect, never by file extension or severity."}
 				},
 				"required": ["severity", "description", "action", "category"]
 			}
@@ -91,6 +151,18 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 		return nil, err
 	}
 	ctx := sctx.Ctx
+	classPatterns := pipeline.DocumentCorrectionPaths(sctx.Config)
+
+	// The bounded correction runs FIRST, before anything reads the head, so
+	// everything after it - the changed-file scan, the analyzer prompt, the
+	// read-only verdict - describes the corrected tree. That ordering is what
+	// makes the rest of this function the correction's own re-check rather
+	// than a separate pass someone has to remember to add.
+	correction, err := applyBoundedDocumentCorrection(sctx, classPatterns)
+	if err != nil {
+		return nil, err
+	}
+
 	baseSHA := resolveBranchBaseSHA(ctx, sctx.WorkDir, sctx.Run.BaseSHA, sctx.Repo.DefaultBranch)
 
 	ignorePatterns := "none"
@@ -115,7 +187,14 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 	}
 	if !hasNonIgnoredDocumentChanges(changedFiles, sctx.Config.IgnorePatterns) {
 		sctx.Log("no changes to document")
-		return &pipeline.StepOutcome{}, nil
+		// A correction this round already committed still has to be reported,
+		// even when every remaining changed path is ignored: it advanced the
+		// branch, and a step that returned an empty outcome here would leave
+		// the run's own history claiming nothing happened.
+		return &pipeline.StepOutcome{
+			Findings:   correctionOnlyFindings(correction),
+			FixSummary: fixResultSummary(correction.Applied),
+		}, nil
 	}
 
 	if combinedLint {
@@ -140,8 +219,8 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 		sctx.Log("document step: worktree already carries changes from an earlier step; they are preserved and excluded from the read-only check")
 	}
 
-	prompt := s.buildPrompt(sctx, baseSHA, ignorePatterns, combinedLint)
-	schema := findingsSchema
+	prompt := s.buildPrompt(sctx, baseSHA, ignorePatterns, classPatterns, combinedLint)
+	schema := documentFindingsSchema
 	purpose := "document"
 	if combinedLint {
 		schema = housekeepingFindingsSchema
@@ -159,18 +238,21 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 		return nil, fmt.Errorf("agent document: %w", err)
 	}
 
-	// Genuinely read-only. The earlier fork patch kept a prompt that told the
-	// agent to fix documentation and never report what it had already fixed,
-	// then silently discarded the agent's edits before computing approval from
-	// the remaining findings: a compliant agent that fixed and reported nothing
-	// produced a passing run while the stale documentation it "fixed" was
-	// thrown away unreported. Any worktree mutation after the agent returns -
-	// tracked or untracked - is now a failed step with a clear error;
-	// discarding it is cleanup after the failure is recorded, never a silent
-	// pass. This is checked before the structured-output validation below, so a
-	// pass that both mutated the worktree and returned opaque output reports
-	// the mutation rather than hiding it, and a combined-mode mutation can
-	// never reach the lint stash.
+	// The ANALYSIS turn is genuinely read-only, and stays so even in a round
+	// that just corrected something: the correction is a separate, bounded,
+	// path-scoped turn that already committed, so by the time this one runs the
+	// only changes in the tree are an earlier step's. The earlier fork patch
+	// kept a prompt that told the analyzer to fix documentation and never
+	// report what it had already fixed, then silently discarded the agent's
+	// edits before computing approval from the remaining findings: a compliant
+	// agent that fixed and reported nothing produced a passing run while the
+	// stale documentation it "fixed" was thrown away unreported. Any worktree
+	// mutation after the analyzer returns - tracked or untracked - is a failed
+	// step with a clear error; discarding it is cleanup after the failure is
+	// recorded, never a silent pass. This is checked before the
+	// structured-output validation below, so a pass that both mutated the
+	// worktree and returned opaque output reports the mutation rather than
+	// hiding it, and a combined-mode mutation can never reach the lint stash.
 	_, exitFingerprint, err := documentWorktreeFingerprint(ctx, sctx.WorkDir)
 	if err != nil {
 		return nil, err
@@ -197,7 +279,7 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 			// step, and no other step's work is destroyed to tidy up this one.
 			sctx.Log(label + " step is read-only: agent mutated the worktree; leaving the tree untouched because an earlier step's changes are present")
 		}
-		return nil, fmt.Errorf("%s step must be read-only but the agent modified the worktree:\n%s", label, mutations)
+		return nil, fmt.Errorf("%s analysis must be read-only but the agent modified the worktree:\n%s", label, mutations)
 	}
 
 	// Without trustworthy structured output we cannot confirm the agent
@@ -207,7 +289,7 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 	var findings Findings
 	if result.Output == nil {
 		return nil, fmt.Errorf("document analyzer returned no structured findings")
-	} else if err := unmarshalRequiredFindings(result.Output, &findings, true); err != nil {
+	} else if err := unmarshalRequiredDocumentFindings(result.Output, &findings, combinedLint); err != nil {
 		return nil, fmt.Errorf("validate document analyzer findings: %w", err)
 	}
 
@@ -225,26 +307,109 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 		}
 	}
 
-	needsApproval := len(docFindings.Items) > 0
-	findingsJSON, _ := json.Marshal(docFindings)
+	docFindings, editorial, gating := classifyDocumentFindings(docFindings)
+	if editorial > 0 {
+		sctx.Log(fmt.Sprintf("document findings: %d editorial note(s) recorded on the pull request without gating", editorial))
+	}
+	if len(correction.Paths) > 0 {
+		docFindings.CorrectedPaths = correction.Paths
+		sctx.Log(fmt.Sprintf("documentation correction committed in this run: %s", strings.Join(correction.Paths, ", ")))
+	}
 
-	sctx.Log(fmt.Sprintf("document findings: %d unresolved items", len(docFindings.Items)))
+	// Only a finding whose file the correction may actually reach can be
+	// resolved by another round, so offering an auto-fix loop for anything else
+	// would burn agent passes to change nothing - the exact shape of the two
+	// --action fix rounds that applied no edits in run
+	// 01M23AB8T1WKJAG8FMJKG583HP.
+	// The correctable set is computed from the auto-fixable findings alone -
+	// the exact subset autoFixableFindingsJSON will hand the next round - so a
+	// correctable file belonging to some other finding can never be mistaken
+	// for work that round could do.
+	correctable, _ := correctableDocumentPaths(types.AutoFixableFindings(docFindings), classPatterns)
+	// The round this step is completing has not been persisted yet, so a
+	// correction it just applied is invisible to the durable budget read.
+	// Counting it here is what stops the executor from starting one more
+	// round that could only re-check and report.
+	spent := documentCorrectionRoundsSpent(sctx)
+	if correction.Applied {
+		spent++
+	}
+	autoFixable := documentCorrectionEnabled(sctx) &&
+		spent < maxDocumentCorrectionRounds &&
+		len(correctable) > 0
+
+	findingsJSON := mustMarshalFindings(docFindings)
+
+	sctx.Log(fmt.Sprintf("document findings: %d unresolved items (%d gating, %d editorial)", len(docFindings.Items), gating, editorial))
 
 	return &pipeline.StepOutcome{
-		NeedsApproval: needsApproval,
-		AutoFixable:   false,
+		NeedsApproval: gating > 0,
+		AutoFixable:   autoFixable,
 		Findings:      string(findingsJSON),
-		// Document is report-only in this fork. A descriptive analyzer summary
-		// names what it found, not a fix the round applied; recording it as the
-		// fix summary would make downstream history claim work happened here.
-		FixSummary: noChangesAppliedSummary,
+		// The analysis turn never changes anything, so the fix summary reports
+		// only what the bounded correction turn committed. Recording "changes
+		// applied" for a round that applied none would make downstream history
+		// claim work happened here.
+		FixSummary: fixResultSummary(correction.Applied),
 	}, nil
+}
+
+// classifyDocumentFindings applies the class contract to the analyzer's own
+// answer and returns the findings the step will report, plus how many are
+// editorial notes and how many actually gate.
+//
+// An editorial finding's action is rewritten to no-op, because "never gates"
+// has to be true of the payload itself: the executor parks on any ask-user
+// finding in the JSON, and the auto-fix selector picks up any auto-fix one.
+// Leaving the analyzer's original action in place and merely intending not to
+// gate on it would park the run on a wording preference exactly as before. The
+// class is preserved, so the finding is still published as the note it is.
+func classifyDocumentFindings(findings Findings) (Findings, int, int) {
+	editorial, gating := 0, 0
+	for i := range findings.Items {
+		if findings.Items[i].IsEditorial() {
+			findings.Items[i].Class = types.FindingClassEditorial
+			findings.Items[i].Action = types.ActionNoOp
+			editorial++
+			continue
+		}
+		findings.Items[i].Class = findings.Items[i].ClassOrDefault()
+		gating++
+	}
+	return findings, editorial, gating
+}
+
+// correctionOnlyFindings records a correction whose round found nothing left
+// to report, so the corrected files still reach the run history and the pull
+// request. It returns "" when no correction was applied, which leaves the
+// outcome exactly as it was before.
+func correctionOnlyFindings(correction documentCorrection) string {
+	if len(correction.Paths) == 0 {
+		return ""
+	}
+	return string(mustMarshalFindings(Findings{
+		Summary:        "documentation corrected",
+		CorrectedPaths: correction.Paths,
+	}))
+}
+
+// mustMarshalFindings serializes findings for the step outcome. json.Marshal
+// cannot fail for this type - every field is a string, int, bool, or a slice
+// of those - and the pre-existing call site already discarded the error, so
+// this keeps that one behavior in one named place instead of repeating a bare
+// underscore at each use.
+func mustMarshalFindings(findings Findings) []byte {
+	raw, err := json.Marshal(findings)
+	if err != nil {
+		return []byte(`{"findings":[],"summary":""}`)
+	}
+	return raw
 }
 
 // buildPrompt assembles the document (or combined document+lint) prompt: the
 // placement policy, scope discipline, trusted repository-specific policy,
 // the task, and - in combined mode - the lint duty.
-func (s *DocumentStep) buildPrompt(sctx *pipeline.StepContext, baseSHA, ignorePatterns string, combinedLint bool) string {
+func (s *DocumentStep) buildPrompt(sctx *pipeline.StepContext, baseSHA, ignorePatterns string, classPatterns []string, combinedLint bool) string {
 	historySection := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx)
 
 	intro := "Review the project documentation for accuracy after this change. This is a read-only review: do not edit any file."
@@ -266,6 +431,9 @@ Context:
 - target commit: %s
 - default branch: %s
 - ignore patterns: %s
+- documentation-and-records paths this pipeline may correct inside the run: %s
+
+%s
 
 %s
 
@@ -280,10 +448,11 @@ Task:
    - For each fact or contract the change altered, locate its one authoritative owner document (README, docs/, doc comments, config examples, etc.). Changed user-facing behavior must leave its authoritative user documentation accurate.
    - Locate existing duplicates of those facts that are now stale.
 
-3. Report every defect; fix none of them
-   - This is a read-only review: do not edit, create, or delete any file.
+3. Report every defect and classify it; fix none of them
+   - This is a read-only review: do not edit, create, or delete any file. Correcting an accepted finding is a separate, bounded turn the pipeline runs afterwards.
    - Return a finding for every stale, missing, or incorrect statement this change left behind - including ones the placement policy above would call a stale duplicate - naming the file and line number.
-   - Also report judgment calls (e.g. ambiguous intent or conflicting docs) and any out-of-scope consolidation worth a follow-up.
+   - Give every documentation finding a "class" using the classification contract above, and name the file it concerns: a finding with no file cannot be corrected inside this run.
+   - Also report judgment calls (e.g. ambiguous intent or conflicting docs) and any out-of-scope consolidation worth a follow-up. Those are usually editorial.
    - If nothing is stale, return an empty findings array.%s
 
 Rules:
@@ -296,8 +465,10 @@ Rules:
 		sctx.Run.HeadSHA,
 		sctx.Repo.DefaultBranch,
 		ignorePatterns,
+		strings.Join(classPatterns, ", "),
 		documentPlacementPolicy,
 		documentScopeDiscipline,
+		documentClassPolicy,
 		trustedDocumentPolicySection(sctx),
 		lintDutySection(combinedLint),
 		editRule,
@@ -353,63 +524,32 @@ func splitHousekeepingFindings(findings Findings) (doc Findings, lint Findings) 
 }
 
 // documentWorktreeFingerprint captures the worktree's dirty state precisely
-// enough to attribute a change to the read-only agent. It returns the raw
-// porcelain status and a fingerprint that adds each dirty path's content hash,
-// because a status line alone does not move when an agent edits a file that was
-// already dirty - the exact case an earlier step's uncommitted work creates.
-// Deletions, renames, and unreadable paths fall back to the status line, which
-// already records them.
+// enough to attribute a change to the read-only analysis turn. It returns the
+// raw porcelain status and a fingerprint that adds each dirty path's content
+// hash, because a status line alone does not move when an agent edits a file
+// that was already dirty - the exact case an earlier step's uncommitted work
+// creates. documentWorktreeEntries owns the reading and the `-z` /
+// --untracked-files=all rationale; this is the flattened view of the same
+// snapshot the bounded correction compares path by path, so the two can never
+// disagree about what changed.
 func documentWorktreeFingerprint(ctx context.Context, workDir string) (string, string, error) {
-	// --untracked-files=all matters: git's default collapses a wholly untracked
-	// directory to one "?? dir/" line, and a file the agent adds inside it would
-	// leave that line - and so the fingerprint - byte-identical.
-	//
-	// -z is used to read the records: without it, git's default core.quotepath
-	// escapes any path containing non-ASCII bytes, backslashes, or double quotes
-	// into a C-style quoted string, which would then fail to open at that literal
-	// path and silently fall back to the (unmoving) status line alone.
-	rawZ, err := git.RunRaw(ctx, workDir, "status", "--porcelain", "-z", "--untracked-files=all")
+	entries, err := documentWorktreeEntries(ctx, workDir)
 	if err != nil {
-		return "", "", fmt.Errorf("check worktree status for the read-only document pass: %w", err)
+		return "", "", err
 	}
-	records := strings.Split(strings.TrimSuffix(string(rawZ), "\x00"), "\x00")
-	if len(records) == 1 && records[0] == "" {
+	if len(entries) == 0 {
 		return "", "", nil
 	}
-	var statusLines []string
-	var entries []string
-	for i := 0; i < len(records); i++ {
-		record := records[i]
-		if len(record) < 4 {
-			continue
-		}
-		code := record[:2]
-		path := record[3:]
-		statusLines = append(statusLines, code+" "+path)
-		entry := code + " " + path
-		// A rename/copy (R/C) emits the destination record followed by a second
-		// NUL-terminated record holding the source path, rather than the
-		// "old -> new" arrow the non-`-z` format uses.
-		if strings.ContainsAny(code, "RC") && i+1 < len(records) {
-			i++
-			entry += " <- " + records[i]
-		}
-		if strings.Contains(code, "D") {
-			entries = append(entries, entry)
-			continue
-		}
-		hash, herr := git.Run(ctx, workDir, "hash-object", "--", path)
-		if herr != nil {
-			entries = append(entries, entry)
-			continue
-		}
-		entries = append(entries, entry+" "+strings.TrimSpace(hash))
+	statusLines := make([]string, 0, len(entries))
+	fingerprintLines := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		// The status view is the porcelain line git printed: the two-character
+		// code and the path, without the rename source or the content hash the
+		// fingerprint adds on top.
+		statusLines = append(statusLines, entry.Code+" "+entry.Path)
+		fingerprintLines = append(fingerprintLines, entry.Line)
 	}
-	status := strings.Join(statusLines, "\n")
-	if status == "" {
-		return "", "", nil
-	}
-	return status, strings.Join(entries, "\n"), nil
+	return strings.Join(statusLines, "\n"), strings.Join(fingerprintLines, "\n"), nil
 }
 
 // documentMutationDetail reports what the read-only pass changed: fingerprint

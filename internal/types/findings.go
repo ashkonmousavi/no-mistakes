@@ -89,6 +89,50 @@ const (
 	FindingCategoryLint          = "lint"
 )
 
+// Finding class constants for the document step. The class answers "what does
+// correcting this actually protect", which is a different question from
+// severity ("how bad does the analyzer feel about it") and from the file's
+// extension. It is required on every documentation finding.
+//
+// FindingClassEditorial is a preference: optional wording, cosmetic
+// formatting, a suggested rephrasing. It is recorded as a note and NEVER
+// gates - a reviewer's taste must not become a release blocker.
+//
+// FindingClassSubstantive is a documentation defect that misinforms: a
+// contradiction between the implementation and a required specification, a
+// misleading operator instruction, missing required evidence, or a false
+// completion claim. It gates.
+//
+// FindingClassBehavioural is a substantive defect in a file that influences
+// executable behaviour, generated output, or delivery authority - whatever its
+// extension, `.md` included. It gates AND requires the project's own test
+// command to be re-run against any correction, because the correction can
+// change what the product does rather than only what it says.
+const (
+	FindingClassEditorial   = "editorial"
+	FindingClassSubstantive = "substantive"
+	FindingClassBehavioural = "behavioural"
+)
+
+var knownFindingClasses = []string{FindingClassEditorial, FindingClassSubstantive, FindingClassBehavioural}
+
+// NormalizeFindingClass trims and lower-cases one class so equivalent
+// spellings compare equal. It does not check membership; see
+// IsKnownFindingClass.
+func NormalizeFindingClass(class string) string {
+	return strings.ToLower(strings.TrimSpace(class))
+}
+
+// IsKnownFindingClass reports whether class, once normalized, is part of the
+// documentation finding class vocabulary.
+func IsKnownFindingClass(class string) bool {
+	return slices.Contains(knownFindingClasses, NormalizeFindingClass(class))
+}
+
+// KnownFindingClasses returns the class vocabulary, for error messages and
+// prompts that have to name what they accept.
+func KnownFindingClasses() []string { return slices.Clone(knownFindingClasses) }
+
 // Test scenario result constants: the vocabulary the test step's evidence
 // prompt instructs the agent to use for each derived scenario.
 //
@@ -160,7 +204,31 @@ type Finding struct {
 	// Category separates the combined document+lint housekeeping pass's
 	// findings into their owning gates. Empty everywhere else.
 	Category string `json:"category,omitempty"`
+	// Class is the document step's editorial/substantive/behavioural
+	// classification. It decides whether the finding gates and whether a
+	// correction owes a test re-run. Empty on every other step's findings, and
+	// on documentation findings recorded before the classification existed -
+	// which is why readers use ClassOrDefault rather than reading it raw.
+	Class string `json:"class,omitempty"`
 }
+
+// ClassOrDefault resolves a finding's effective document class, defaulting an
+// empty/unknown class to substantive (gates). Fail-safe in the same direction
+// as ActionOrDefault: an unclassified documentation finding must reach a human,
+// never be silently demoted to a non-blocking editorial note. A pre-contract
+// findings payload replayed from an older run therefore keeps its old gating
+// behaviour instead of quietly losing it.
+func (f Finding) ClassOrDefault() string {
+	normalized := NormalizeFindingClass(f.Class)
+	if !IsKnownFindingClass(normalized) {
+		return FindingClassSubstantive
+	}
+	return normalized
+}
+
+// IsEditorial reports whether this finding is a recorded, non-gating editorial
+// note.
+func (f Finding) IsEditorial() bool { return f.ClassOrDefault() == FindingClassEditorial }
 
 // TestScenario is one named end-to-end scenario the test step derived from the
 // user intent and the change, and the result of driving it.
@@ -228,6 +296,7 @@ type findingWire struct {
 	UserInstructions    string `json:"user_instructions,omitempty"`
 	ReviewScope         string `json:"review_scope,omitempty"`
 	Category            string `json:"category,omitempty"`
+	Class               string `json:"class,omitempty"`
 	RequiresHumanReview *bool  `json:"requires_human_review,omitempty"`
 }
 
@@ -249,6 +318,13 @@ type Findings struct {
 	RiskLevel      string         `json:"risk_level"`
 	RiskRationale  string         `json:"risk_rationale"`
 	RiskScope      string         `json:"risk_scope,omitempty"`
+	// CorrectedPaths names the files a document-step bounded correction
+	// actually committed in this round, in the order git reported them. It is
+	// the durable, per-round record of what the pipeline changed on the
+	// branch, so the PR body can state the correction rather than leave a
+	// reader to infer it from "Fix applied". Empty on every other step and on
+	// every round that applied no correction.
+	CorrectedPaths []string `json:"corrected_paths,omitempty"`
 }
 
 type findingsWire struct {
@@ -264,6 +340,7 @@ type findingsWire struct {
 	RiskLevel      string         `json:"risk_level"`
 	RiskRationale  string         `json:"risk_rationale"`
 	RiskScope      string         `json:"risk_scope"`
+	CorrectedPaths []string       `json:"corrected_paths"`
 }
 
 // ParseFindingsJSON decodes findings JSON, accepting current and legacy item
@@ -289,6 +366,7 @@ func ParseFindingsJSON(raw string) (Findings, error) {
 		RiskLevel:      wire.RiskLevel,
 		RiskRationale:  wire.RiskRationale,
 		RiskScope:      wire.RiskScope,
+		CorrectedPaths: wire.CorrectedPaths,
 	}, nil
 }
 
@@ -521,6 +599,7 @@ func (f *Finding) UnmarshalJSON(data []byte) error {
 	f.UserInstructions = wire.UserInstructions
 	f.ReviewScope = wire.ReviewScope
 	f.Category = wire.Category
+	f.Class = wire.Class
 	if f.Action == "" && wire.RequiresHumanReview != nil {
 		if *wire.RequiresHumanReview {
 			f.Action = ActionAskUser

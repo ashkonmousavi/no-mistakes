@@ -155,24 +155,50 @@ Local Test is never a repository-wide regression-suite substitute; broad regress
 
 ## Document
 
-Reviews documentation for accuracy after a code change and reports every gap it finds. The step is read-only: it never edits or commits documentation.
+Reviews documentation for accuracy after a code change, classifies every gap it finds, and - when the repository allows it - corrects the accepted ones inside the same run.
+
+The analysis turn is always read-only. Correcting is a separate, bounded turn that may edit only the files the accepted findings name, and only inside the documentation-and-records path class.
+
+**Finding classes.** Every documentation finding carries a required `class`, assigned by what correcting it protects rather than by file extension or severity:
+
+| Class | What it means | Gate |
+| --- | --- | --- |
+| `editorial` | A preference: optional wording, cosmetic formatting, a suggested rephrasing | Never blocks. Recorded as a note in the step summary and the pull-request body |
+| `substantive` | The documentation misinforms: it contradicts a required specification or the implementation, gives an operator an instruction that would not work, omits required evidence, or claims work is complete that is not | Blocks until corrected or accepted |
+| `behavioural` | A substantive defect in a file that influences executable behaviour, generated output, or delivery authority - a specification a validator or generator reads, a contract or records file a check verifies, a policy file that steers a gate - whatever its extension, `.md` included | Blocks, and the correction additionally re-runs the project's own [`commands.test`](/no-mistakes/reference/repo-config/#commandstest) |
+
+An omitted or unknown class fails the analyzer output; a class recorded before this contract existed reads as `substantive`, so an older payload keeps gating rather than being demoted.
 
 **Behavior:**
 
 - Diffs the base commit against head and skips the step if there are no non-ignored changed files to document
-- Asks the agent to find every documentation gap the change left behind and report each one with its file and line, under the placement policy. The agent is told not to modify, create, or delete any file
-- Fingerprints the worktree before the agent runs and again after it returns, and compares the two. Any change the agent made, tracked or untracked, fails the step with an error naming the paths; the changes are discarded as post-failure cleanup, never as a silent pass. Uncommitted work an earlier step left behind (the test step's new test files, for example) is preserved, excluded from the comparison, and never discarded - when it is present the step fails without discarding anything, because a path-scoped discard cannot separate the agent's change from work it did not make
+- In a fix round, applies the bounded correction first, so every later part of the step - the changed-file scan, the analyzer prompt, the read-only verdict - describes the corrected tree. The re-check is the step's own next round, not a separate pass
+- Asks the agent to find every documentation gap the change left behind and report each one with its file, line, and class, under the placement policy. The analysis agent is told not to modify, create, or delete any file
+- Fingerprints the worktree before the analysis agent runs and again after it returns, and compares the two. Any change that agent made, tracked or untracked, fails the step with an error naming the paths; the changes are discarded as post-failure cleanup, never as a silent pass. Uncommitted work an earlier step left behind (the test step's new test files, for example) is preserved, excluded from the comparison, and never discarded - when it is present the step fails without discarding anything, because a path-scoped discard cannot separate the agent's change from work it did not make
 - The placement policy gives each fact one authoritative owner, prefers removing stale duplicates or replacing them with pointers, avoids new documentation surfaces for perceived gaps, and keeps durable incident lessons near their owner instead of in `AGENTS.md`
-- `document.instructions` can add trusted default-branch ownership rules for the repository
-- When `commands.lint` is empty, performs documentation and agent-driven lint in one combined read-only housekeeping invocation, categorizing findings for the document or lint gate; if that pass is skipped, its structured output is unusable, or a daemon restart loses the in-memory result, lint runs its own agent pass instead
+- `document.instructions` can add trusted default-branch ownership rules for the repository, and [`document.correction_paths`](/no-mistakes/reference/repo-config/#documentcorrection_paths) can narrow or widen the documentation-and-records path class
+- When `commands.lint` is empty, performs documentation and agent-driven lint in one combined invocation whose analysis half is read-only, categorizing findings for the document or lint gate (lint-category findings carry no class); if that pass is skipped, its structured output is unusable, or a daemon restart loses the in-memory result, lint runs its own agent pass instead
 - Includes user intent when available
 - Returns a finding for every stale, missing, or incorrect statement, plus human judgment calls
-- Requires approval whenever any unresolved documentation finding is returned, including `info` findings
+- Requires approval whenever any unresolved `substantive` or `behavioural` finding is returned, including `info` severity. Editorial findings never require approval
 - Bounds the documentation (and combined housekeeping) agent with [`agent_timeout`](/no-mistakes/reference/global-config/#agent_timeout): an expired budget cancels the agent and fails the step with a timeout diagnostic rather than leaving the run active indefinitely
 
-**Auto-fix:** the document step never edits documentation, so there is no document fix loop. Findings pause for approval and the author resolves them in an ordinary commit. If you manually trigger a fix from the TUI or AXI interface, the agent receives the selected previous findings plus any per-finding user notes, any selected user-authored findings, and the shared [finding decision history](#finding-decision-history).
+**Bounded correction.** When [`auto_fix.document`](/no-mistakes/reference/repo-config/#auto_fix) is above `0` and a round is asked to fix, the correction turn:
 
-**Default auto-fix limit:** not used for automatic document follow-up loops.
+- Edits only the files the accepted findings name, intersected with the documentation-and-records path class. A finding whose file falls outside that class is reported and stays open rather than corrected
+- Must not commit. A fixer that advances `HEAD` itself fails the round, because the pipeline's own commit is what applies the path-class refusal, the [`protected_paths`](/no-mistakes/reference/repo-config/#protected_paths) check, and the [`commit.fix_message`](/no-mistakes/reference/global-config/#commitfix_message) template
+- Commits exactly the corrected paths, never `git add -A`, so an earlier step's uncommitted work is neither swept into the correction nor misattributed to it
+- Fails the round visibly, naming the paths, if it touched anything else or left an uncommitted change behind
+- Records the corrected files on the round, so the pull-request body states which files the run changed
+- Is limited to one correcting round per run. Later rounds re-check and report without editing
+
+Set `auto_fix.document: 0` to keep the step strictly report-only: findings are reported and the author resolves them outside the run.
+
+**Head handling after a correction.** A correction advances `HEAD` past the review-approved commit. Because its whole diff is inside the documentation-and-records class, the run does not repeat Review - see [Push](#push) - and instead continues from Test, so `commands.test`, lint, the exact-head attestation, and the CI battery all run against the corrected head.
+
+**Auto-fix:** `action: auto-fix` findings inside the correctable path set start one bounded correction round. `ask-user` findings pause for a decision; `no-op` and editorial findings are informational. If you trigger a fix from the TUI or AXI interface, the correction agent receives the selected previous findings plus any per-finding user notes, any selected user-authored findings, and the shared [finding decision history](#finding-decision-history).
+
+**Default auto-fix limit:** `3` (the correcting rounds themselves are capped at one).
 
 ## Lint
 
@@ -190,7 +216,7 @@ Runs linters and static analysis.
 Combined-pass lint findings use the same gate: `error` and `warning` findings pause for a decision, while `info` findings do not.
 
 **Auto-fix:** when `commands.lint` is configured, the lint step follows the same pattern as test - the agent fixes `action: auto-fix` issues using the previous findings plus any per-finding user notes, any selected user-authored findings from the TUI or AXI interface, and the shared [finding decision history](#finding-decision-history), including earlier fix summaries for this step, then lint re-runs.
-When `commands.lint` is empty, findings from the combined pass pause for approval instead of starting another automatic lint/fix loop; the housekeeping pass is read-only and reports issues rather than fixing them.
+When `commands.lint` is empty, findings from the combined pass pause for approval instead of starting another automatic lint/fix loop; the housekeeping pass's lint duty is read-only and reports issues rather than fixing them.
 
 **Default auto-fix limit:** `3`.
 
@@ -204,7 +230,8 @@ Pushes the validated branch to the configured push target.
 - Commits any uncommitted changes left by pipeline agents or the formatter with message `no-mistakes: apply agent fixes`
 - Without fork routing, successful run-start validation selects the upstream URL from the working clone; when it matches the gate worktree's `origin`, the worktree URL is used so embedded credentials retained outside the database can authenticate. If validation fails, the run continues with its prior routing.
 - With GitHub fork routing, the push target is `repos.fork_url`
-- After Test, Document, or Lint advances the head past the review-approved commit, restarts immediately at Review with the durable `final_head_rereview` reason. Push repeats the same check after formatter and leftover-change preparation, before any remote mutation. Three final-head rereviews is the convergence limit, after which the run fails with `final_head_rereview_limit_exceeded`
+- After Test, Document, or Lint advances the head past the review-approved commit, inspects the diff between the two commits. An advance that touched anything outside the documentation-and-records path class restarts immediately at Review with the durable `final_head_rereview` reason. Push repeats the same check after formatter and leftover-change preparation, before any remote mutation. Three final-head rereviews is the convergence limit, after which the run fails with `final_head_rereview_limit_exceeded`
+- An advance whose entire diff is inside that class ([`document.correction_paths`](/no-mistakes/reference/repo-config/#documentcorrection_paths)) carries the review approval forward to the corrected head instead, and restarts at Test with the durable `documentation_head_recheck` reason, so the corrected head still receives `commands.test`, lint, the exact-head attestation, and the full CI battery. Review already read every source file in the candidate and none of them changed. The exact file list is logged. One source file anywhere in the advance sends the whole advance back through Review, so the rule cannot be used to publish unreviewed code behind a `.md` file. Two documentation rechecks is the convergence limit, after which the run fails with `documentation_head_recheck_limit_exceeded`
 - Immediately before remote mutation, reloads the durable review-approved commit and requires live `HEAD` to equal it exactly, so the commit published is the commit reviewed. A descendant is preserved locally and restarts at Review; a missing, malformed, unreachable, backward, or divergent approval refuses publication
 - A CI repair published without revalidation (`ci.revalidate_repairs: false`, the default) is the one path that still publishes a proven descendant of the reviewed commit without another Review; set `ci.revalidate_repairs: true` to require one
 - Re-reads the push target via `git ls-remote` before pushing
