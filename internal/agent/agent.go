@@ -61,6 +61,30 @@ type RunOpts struct {
 	OnAttempt func(Attempt)
 }
 
+// IsStructuredOutputRejected reports whether an invocation completed but its
+// final structured response was absent, malformed, or rejected by the requested
+// schema. Callers may use this distinction to ask the same agent to correct its
+// response without treating provider, process, or timeout failures as bad JSON.
+func IsStructuredOutputRejected(err error) bool {
+	var rejection interface {
+		StructuredOutputRejected() bool
+	}
+	return errors.As(err, &rejection) && rejection.StructuredOutputRejected()
+}
+
+type structuredOutputRejection struct{ err error }
+
+func (e *structuredOutputRejection) Error() string                { return e.err.Error() }
+func (e *structuredOutputRejection) Unwrap() error                { return e.err }
+func (*structuredOutputRejection) StructuredOutputRejected() bool { return true }
+
+func rejectStructuredOutput(err error) error {
+	if err == nil || IsStructuredOutputRejected(err) {
+		return err
+	}
+	return &structuredOutputRejection{err: err}
+}
+
 // Attempt describes one completed concrete adapter attempt for an agent
 // invocation. An Agent may make several attempts when it retries transient
 // failures or moves to a fallback provider.
@@ -278,7 +302,11 @@ type Options struct {
 
 func finalizeTextResult(agentName, text string, schema json.RawMessage, usage TokenUsage) (*Result, error) {
 	if text == "" {
-		return nil, fmt.Errorf("%s returned no text output", agentName)
+		err := fmt.Errorf("%s returned no text output", agentName)
+		if len(schema) > 0 {
+			return nil, rejectStructuredOutput(err)
+		}
+		return nil, err
 	}
 	if len(schema) == 0 {
 		return &Result{Text: text, Usage: usage, UsageReported: usage.Reported, CacheCreationReported: usage.CacheCreationReported}, nil
@@ -286,7 +314,7 @@ func finalizeTextResult(agentName, text string, schema json.RawMessage, usage To
 
 	output, err := parseStructuredTextOutput(text, schema, strings.HasPrefix(agentName, "acp:"))
 	if err != nil {
-		return nil, fmt.Errorf("%s output parse: %w (output snippet: %q)", agentName, err, outputSnippet(text))
+		return nil, rejectStructuredOutput(fmt.Errorf("%s output parse: %w (output snippet: %q)", agentName, err, outputSnippet(text)))
 	}
 
 	return &Result{Output: output, Text: text, Usage: usage, UsageReported: usage.Reported, CacheCreationReported: usage.CacheCreationReported}, nil
