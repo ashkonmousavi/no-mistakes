@@ -316,8 +316,10 @@ func assertReviewApprovedPushHead(sctx *pipeline.StepContext, proposedHead strin
 // reviewApprovedPushHeadDecision reports whether the proposed head still needs
 // a Review round before it may be published. It delegates to the pipeline-level
 // owner of that decision so the Push step and the executor's post-review head
-// binding apply one rule, and passes the step-scoped git runner so a step-local
-// PATH and credential environment stay in effect.
+// binding share the same review-approval equality check; the documentation-and-records
+// path-class carry-forward belongs to bindPostReviewHead alone, and Push
+// deliberately does not have it. Passes the step-scoped git runner so a
+// step-local PATH and credential environment stay in effect.
 func reviewApprovedPushHeadDecision(sctx *pipeline.StepContext, proposedHead string) (bool, error) {
 	return pipeline.ReviewHeadNeedsRereview(sctx.DB, sctx.Run.ID, proposedHead, stepGitRunner(sctx))
 }
