@@ -1294,7 +1294,7 @@ func (h *Host) classifyArtifactRun(ctx context.Context, run githubWorkflowRun, j
 				return classification, err
 			}
 			classification.evidence.LogJobIDs = append(classification.evidence.LogJobIDs, int64(job.databaseID()))
-			if disposition, ok := artifactFailureDisposition(job, logs); ok {
+			if disposition, ok := artifactFailureDisposition(job, logs, joinedTopology); ok {
 				initiatingNames[strings.TrimSpace(job.Name)] = true
 				pinnedInitiatingActions = pinnedInitiatingActions && disposition.PinnedActions
 				dependentSteps = append(dependentSteps, disposition.DependentSteps...)
@@ -1758,6 +1758,9 @@ func joinedXAUArtifactRetryTopology(event string, jobs []githubRunJob) bool {
 		if conclusion != "success" && conclusion != "failure" {
 			return false
 		}
+		if conclusion == "success" && !joinedXAUSuccessfulJobSteps(job) {
+			return false
+		}
 		guardCount := 0
 		for _, step := range job.Steps {
 			if strings.TrimSpace(step.Name) == boundedInfrastructureRetryStep && strings.EqualFold(strings.TrimSpace(step.Conclusion), "success") {
@@ -1776,6 +1779,69 @@ func joinedXAUArtifactRetryTopology(event string, jobs []githubRunJob) bool {
 	return false
 }
 
+const (
+	joinedXAURetainedBundleStep = "Digest-bind and extract the retained Dashboard V2 distribution"
+	joinedXAURetainedProofStep  = "Digest-bind and extract retained shard and journey evidence"
+)
+
+// joinedXAUAttemptOneOmittedStep is the complete set of conditional steps the
+// joined workflow intentionally skips on attempt one. These exact owner/name
+// pairs are structural evidence only: callers also require the complete joined
+// topology, and dispatch separately requires a reviewed workflow/verifier blob
+// identity before this model can authorize a provider mutation.
+func joinedXAUAttemptOneOmittedStep(jobName, stepName string) bool {
+	jobName = strings.TrimSpace(jobName)
+	stepName = strings.TrimSpace(stepName)
+	switch stepName {
+	case joinedXAURetainedBundleStep:
+		switch jobName {
+		case "journey smoke (chromium / desktop)",
+			"journey smoke (firefox / desktop)",
+			"journey smoke (webkit / desktop)",
+			"journey smoke (chromium / touch390)",
+			"journey smoke (webkit / touch390)",
+			"repository shard 1 of 4",
+			"repository shard 2 of 4",
+			"repository shard 3 of 4",
+			"repository shard 4 of 4":
+			return true
+		}
+	case joinedXAURetainedProofStep:
+		return jobName == "repository"
+	case "Print verify log tail on failure", "Upload verify log artifact on failure":
+		switch jobName {
+		case "repository checks",
+			"repository shard 1 of 4",
+			"repository shard 2 of 4",
+			"repository shard 3 of 4",
+			"repository shard 4 of 4":
+			return true
+		}
+	}
+	return false
+}
+
+// joinedXAUSuccessfulJobSteps prevents an otherwise successful producer from
+// hiding skipped required work. Only lifecycle bookkeeping and the exact
+// attempt-one omissions above may be non-successful in a successful job.
+func joinedXAUSuccessfulJobSteps(job githubRunJob) bool {
+	for _, step := range job.Steps {
+		if jobLifecycleStep(step.Name) {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(step.Conclusion)) {
+		case "success":
+			continue
+		case "skipped":
+			if joinedXAUAttemptOneOmittedStep(job.Name, step.Name) {
+				continue
+			}
+		}
+		return false
+	}
+	return true
+}
+
 type artifactJobDisposition struct {
 	Initiating     bool
 	PinnedActions  bool
@@ -1790,15 +1856,6 @@ const (
 func jobLifecycleStep(name string) bool {
 	name = strings.ToLower(strings.TrimSpace(name))
 	return name == "set up job" || name == "set up runner" || name == "complete runner" || name == "complete job" || strings.HasPrefix(name, "post ")
-}
-
-func artifactFailureOnlyStep(name string) bool {
-	switch strings.TrimSpace(name) {
-	case "Print verify log tail on failure", "Upload verify log artifact on failure":
-		return true
-	default:
-		return false
-	}
 }
 
 func artifactActionOperation(action string) string {
@@ -1833,7 +1890,7 @@ func consequentialNoFilesFailure(text string) bool {
 // that initiating error, plus the narrowly recognized no-files artifact
 // consequence, is recorded as recovery-dependent. An executed test failure at
 // any point still refuses the infrastructure class.
-func artifactFailureDisposition(job githubRunJob, logs string) (artifactJobDisposition, bool) {
+func artifactFailureDisposition(job githubRunJob, logs string, joinedTopology bool) (artifactJobDisposition, bool) {
 	var disposition artifactJobDisposition
 	if !isFailedJob(job) || len(job.Steps) == 0 {
 		return disposition, false
@@ -1863,7 +1920,7 @@ func artifactFailureDisposition(job githubRunJob, logs string) (artifactJobDispo
 		case "success":
 			continue
 		case "skipped":
-			if artifactFailureOnlyStep(step.Name) {
+			if joinedTopology && joinedXAUAttemptOneOmittedStep(job.Name, step.Name) {
 				continue
 			}
 			if !initiated {
@@ -1977,7 +2034,7 @@ func actionLogSegments(logs string) []actionLogSegment {
 }
 
 func logsProveArtifactInfrastructureFailure(job githubRunJob, logs string) bool {
-	disposition, ok := artifactFailureDisposition(job, logs)
+	disposition, ok := artifactFailureDisposition(job, logs, false)
 	return ok && disposition.Initiating
 }
 

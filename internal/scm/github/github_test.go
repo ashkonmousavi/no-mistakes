@@ -1526,7 +1526,7 @@ func observedShardThreeLogs() string {
 func TestArtifactFailureDisposition_ObservedDownloadFailureMarksLaterRequiredStepsAsDependents(t *testing.T) {
 	t.Parallel()
 
-	disposition, ok := artifactFailureDisposition(observedShardThreeFailure(), observedShardThreeLogs())
+	disposition, ok := artifactFailureDisposition(observedShardThreeFailure(), observedShardThreeLogs(), false)
 	if !ok || !disposition.Initiating {
 		t.Fatalf("observed job disposition = %+v, %v; want initiating infrastructure failure", disposition, ok)
 	}
@@ -1563,7 +1563,7 @@ func TestArtifactFailureDisposition_RealTestFailureAfterInitiatingErrorRefuses(t
 		"##[group]Run pytest -q\n##[error]test suite failed\n##[group]Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
 		1,
 	)
-	if got, ok := artifactFailureDisposition(job, logs); ok {
+	if got, ok := artifactFailureDisposition(job, logs, false); ok {
 		t.Fatalf("real test failure admitted after artifact error: %+v", got)
 	}
 }
@@ -1633,6 +1633,42 @@ func TestJoinedXAUArtifactRetryTopology_AcceptsFiveCellsAndRejectsPopulationDrif
 	}
 	if joinedXAUArtifactRetryTopology("schedule", push) {
 		t.Fatal("an unsupported event was admitted by the joined topology")
+	}
+	withUnknownSkip := append([]githubRunJob(nil), valid...)
+	withUnknownSkip[2].Steps = append([]githubJobStep(nil), valid[2].Steps...)
+	withUnknownSkip[2].Steps = append(withUnknownSkip[2].Steps, githubJobStep{Name: "Skip a required journey assertion", Number: 3, Conclusion: "skipped"})
+	if joinedXAUArtifactRetryTopology("pull_request", withUnknownSkip) {
+		t.Fatal("successful retained producer with an unknown skipped step was admitted")
+	}
+}
+
+func TestJoinedXAUAttemptOneOmittedStep_AllowsOnlyExactStepOwnerPairs(t *testing.T) {
+	t.Parallel()
+
+	for _, pair := range [][2]string{
+		{"journey smoke (chromium / desktop)", joinedXAURetainedBundleStep},
+		{"journey smoke (webkit / touch390)", joinedXAURetainedBundleStep},
+		{"repository shard 1 of 4", joinedXAURetainedBundleStep},
+		{"repository shard 4 of 4", joinedXAURetainedBundleStep},
+		{"repository", joinedXAURetainedProofStep},
+		{"repository checks", "Print verify log tail on failure"},
+		{"repository shard 3 of 4", "Upload verify log artifact on failure"},
+	} {
+		if !joinedXAUAttemptOneOmittedStep(pair[0], pair[1]) {
+			t.Errorf("expected attempt-one omission was refused: job=%q step=%q", pair[0], pair[1])
+		}
+	}
+
+	for _, pair := range [][2]string{
+		{"repository", joinedXAURetainedBundleStep},
+		{"repository shard 1 of 4", joinedXAURetainedProofStep},
+		{"journey smoke (chromium / desktop)", "Print verify log tail on failure"},
+		{"repository checks", joinedXAURetainedBundleStep},
+		{"repository shard 3 of 4", "Skip a required journey assertion"},
+	} {
+		if joinedXAUAttemptOneOmittedStep(pair[0], pair[1]) {
+			t.Errorf("unknown or wrongly owned omission was admitted: job=%q step=%q", pair[0], pair[1])
+		}
 	}
 }
 
@@ -1798,11 +1834,20 @@ func TestArtifactInfrastructureFailures_JoinedFiveCellDependencyFamilyIsOneSafeG
 	}
 	jobs[10] = failedShard("repository shard 3 of 4", 11)
 	jobs[11] = failedShard("repository shard 4 of 4", 12)
+	jobs[2].Steps = []githubJobStep{
+		{Name: boundedInfrastructureRetryStep, Number: 2, Conclusion: "success"},
+		{Name: "Download the sealed Dashboard V2 distribution", Number: 3, Conclusion: "success"},
+		{Name: "Digest-bind and extract the retained Dashboard V2 distribution", Number: 4, Conclusion: "skipped"},
+		{Name: "Verify the downloaded distribution before any test runs", Number: 5, Conclusion: "success"},
+		{Name: "Run the core dashboard journeys and classify retained browser errors", Number: 6, Conclusion: "success"},
+		{Name: "Upload retained journey evidence", Number: 7, Conclusion: "success"},
+	}
 	jobs[13] = githubRunJob{ID: 14, HeadSHA: "head-1", Name: "repository", Status: "completed", Conclusion: "failure", Steps: []githubJobStep{
 		{Name: boundedInfrastructureRetryStep, Number: 2, Conclusion: "success"},
 		{Name: "Download every shard's manifest and log", Number: 3, Conclusion: "success"},
-		{Name: "Prove every shard ran and together covered the battery", Number: 4, Conclusion: "failure"},
-		{Name: "Upload full-lane proof artifact", Number: 5, Conclusion: "skipped"},
+		{Name: "Digest-bind and extract retained shard and journey evidence", Number: 4, Conclusion: "skipped"},
+		{Name: "Prove every shard ran and together covered the battery", Number: 5, Conclusion: "success"},
+		{Name: "Upload full-lane proof artifact", Number: 6, Conclusion: "failure"},
 	}}
 	jobsJSON, err := json.Marshal(jobs)
 	if err != nil {
@@ -1836,7 +1881,7 @@ func TestArtifactInfrastructureFailures_JoinedFiveCellDependencyFamilyIsOneSafeG
 		"gh api --method GET repos/test/repo/actions/runs/1/attempts/1/jobs -f per_page=100 --paginate --slurp": {stdout: `[{"total_count":14,"jobs":` + string(jobsJSON) + `}]`},
 		"gh api --method GET repos/test/repo/actions/jobs/11/logs":                                              {stdout: shardLogs},
 		"gh api --method GET repos/test/repo/actions/jobs/12/logs":                                              {stdout: shardLogs},
-		"gh api --method GET repos/test/repo/actions/jobs/14/logs":                                              {stdout: "##[group]Run retry guard\n##[group]Run actions/download-artifact@v4\n##[group]Run fan-in proof\n"},
+		"gh api --method GET repos/test/repo/actions/jobs/14/logs":                                              {stdout: "##[group]Run retry guard\n##[group]Run actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093\n##[group]Run fan-in proof\n##[group]Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02\n" + uploadArtifact503Record + "\n"},
 		"gh api --method GET repos/test/repo/actions/runs/1/artifacts -f per_page=100 --paginate --slurp":       {stdout: githubArtifactPages(retainedArtifacts)},
 		"gh api --method GET repos/test/repo/contents/.github/workflows/xau-ci.yml -f ref=base-1":               {stdout: `{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"file"}`},
 		"gh api --method GET repos/test/repo/contents/.github/workflows/xau-ci.yml -f ref=head-1":               {stdout: `{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"file"}`},
@@ -1857,7 +1902,7 @@ func TestArtifactInfrastructureFailures_JoinedFiveCellDependencyFamilyIsOneSafeG
 		t.Fatalf("PR-only reuse omission = %+v, want group-bound omission", got[7])
 	}
 	receipt := got[10].Evidence
-	if len(receipt.LogJobIDs) != 3 || len(receipt.DependentJobs) != 1 || receipt.DependentJobs[0] != 14 || len(receipt.DependentSteps) != 10 {
+	if len(receipt.LogJobIDs) != 3 || len(receipt.DependentJobs) != 0 || len(receipt.DependentSteps) != 8 {
 		t.Fatalf("dependency-family receipt = %+v", receipt)
 	}
 	if len(receipt.Artifacts) != 8 || receipt.Artifacts[0].Digest == "" || receipt.Artifacts[0].ProviderRunID != 1 || receipt.Artifacts[0].HeadSHA != "head-1" {
