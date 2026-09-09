@@ -378,6 +378,7 @@ func cleanReviewScenario(t *testing.T) string {
         - severity: warning
           description: "README missing new CLI flag"
           action: auto-fix
+          class: substantive
       summary: "README needs updating"
   - match: "stale or incorrect statement.\n\nContext:\n- branch: document-legacy-finding"
     text: "documentation legacy finding"
@@ -386,6 +387,7 @@ func cleanReviewScenario(t *testing.T) string {
         - severity: warning
           description: "README missing new CLI flag"
           requires_human_review: false
+          class: substantive
       summary: "README needs updating"
   - match: "stale or incorrect statement.\n\nContext:\n- branch: document-malformed-finding"
     text: "documentation malformed finding"
@@ -411,6 +413,7 @@ func cleanReviewScenario(t *testing.T) string {
           line: 1
           description: "README should mention the new flag"
           action: auto-fix
+          class: substantive
       summary: "README needs updating"
       risk_level: low
       risk_rationale: "documentation-only follow-up"
