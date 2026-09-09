@@ -1670,6 +1670,24 @@ func TestJoinedXAUAttemptOneOmittedStep_AllowsOnlyExactStepOwnerPairs(t *testing
 			t.Errorf("unknown or wrongly owned omission was admitted: job=%q step=%q", pair[0], pair[1])
 		}
 	}
+
+	dependentFanIn := func(omittedStep string) githubRunJob {
+		return githubRunJob{ID: 14, HeadSHA: "head-1", Name: "repository", Status: "completed", Conclusion: "failure", Steps: []githubJobStep{
+			{Name: boundedInfrastructureRetryStep, Number: 2, Conclusion: "success"},
+			{Name: "Download every shard's manifest and log", Number: 3, Conclusion: "success"},
+			{Name: omittedStep, Number: 4, Conclusion: "skipped"},
+			{Name: "Prove every shard ran and together covered the battery", Number: 5, Conclusion: "failure"},
+			{Name: "Upload full-lane proof artifact", Number: 6, Conclusion: "skipped"},
+		}}
+	}
+	if dependent, ok := joinedXAURepositoryDependencyFailure(dependentFanIn(joinedXAURetainedProofStep), "fan-in failed"); !ok || len(dependent) != 2 {
+		t.Fatalf("dependent fan-in with expected attempt-one omission = %+v, %v; want fan-in and upload obligations", dependent, ok)
+	}
+	for _, omittedStep := range []string{joinedXAURetainedBundleStep, "Check out exact event head", "Skip an unknown repository assertion"} {
+		if dependent, ok := joinedXAURepositoryDependencyFailure(dependentFanIn(omittedStep), "fan-in failed"); ok {
+			t.Errorf("dependent fan-in admitted wrong-owner or required-work omission %q: %+v", omittedStep, dependent)
+		}
+	}
 }
 
 func joinedXAUAttemptOneArtifacts(headSHA string) []scm.InfrastructureArtifactReceipt {
@@ -1813,8 +1831,47 @@ func TestArtifactInfrastructureFailures_BuildOutageMarksEverySkippedConsumerAsDe
 	}
 }
 
+func classifyJoinedXAUAttemptOne(t *testing.T, jobs []githubRunJob, logsByJobID map[int]string, artifacts []scm.InfrastructureArtifactReceipt) []scm.InfrastructureFailure {
+	t.Helper()
+
+	jobsJSON, err := json.Marshal(jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := make([]scm.Check, len(jobs))
+	for i, job := range jobs {
+		bucket := scm.CheckBucketPass
+		state := "SUCCESS"
+		switch job.Conclusion {
+		case "failure":
+			bucket, state = scm.CheckBucketFail, "FAILURE"
+		case "skipped":
+			bucket, state = scm.CheckBucketSkip, "SKIPPED"
+		}
+		checks[i] = scm.Check{Name: job.Name, Bucket: bucket, State: state, Link: fmt.Sprintf("https://github.com/test/repo/actions/runs/1/job/%d", job.ID)}
+	}
+	responses := map[string]githubTestResponse{
+		"gh api --method GET repos/test/repo/actions/runs/1":                                                    {stdout: `{"id":1,"event":"pull_request","head_sha":"head-1","run_attempt":1,"pull_requests":[{"number":42,"head":{"sha":"head-1"},"base":{"ref":"main","sha":"base-1"}}]}`},
+		"gh api --method GET repos/test/repo/actions/runs/1/attempts/1/jobs -f per_page=100 --paginate --slurp": {stdout: `[{"total_count":14,"jobs":` + string(jobsJSON) + `}]`},
+		"gh api --method GET repos/test/repo/actions/runs/1/artifacts -f per_page=100 --paginate --slurp":       {stdout: githubArtifactPages(artifacts)},
+		"gh api --method GET repos/test/repo/contents/.github/workflows/xau-ci.yml -f ref=base-1":               {stdout: `{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"file"}`},
+		"gh api --method GET repos/test/repo/contents/.github/workflows/xau-ci.yml -f ref=head-1":               {stdout: `{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"file"}`},
+		"gh api --method GET repos/test/repo/contents/scripts/ci_check_infrastructure_retry.py -f ref=base-1":   {stdout: `{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","type":"file"}`},
+		"gh api --method GET repos/test/repo/contents/scripts/ci_check_infrastructure_retry.py -f ref=head-1":   {stdout: `{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","type":"file"}`},
+	}
+	for jobID, logs := range logsByJobID {
+		responses[fmt.Sprintf("gh api --method GET repos/test/repo/actions/jobs/%d/logs", jobID)] = githubTestResponse{stdout: logs}
+	}
+	host := New(githubTestCmdFactory(responses), nil, "", "test/repo")
+	got, err := host.ArtifactInfrastructureFailures(context.Background(), &scm.PR{Number: "42", HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, checks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
 // The joined contract classifies the two initiating shard failures and the
-// always-running repository fan-in as one retry set. GitHub then reruns those
+// genuinely failed repository fan-in as one retry set. GitHub then reruns those
 // failed jobs and their dependents; successful producers remain untouched and
 // their attempt-one artifacts carry immutable provenance into the receipt.
 func TestArtifactInfrastructureFailures_JoinedFiveCellDependencyFamilyIsOneSafeGroup(t *testing.T) {
@@ -1846,25 +1903,9 @@ func TestArtifactInfrastructureFailures_JoinedFiveCellDependencyFamilyIsOneSafeG
 		{Name: boundedInfrastructureRetryStep, Number: 2, Conclusion: "success"},
 		{Name: "Download every shard's manifest and log", Number: 3, Conclusion: "success"},
 		{Name: "Digest-bind and extract retained shard and journey evidence", Number: 4, Conclusion: "skipped"},
-		{Name: "Prove every shard ran and together covered the battery", Number: 5, Conclusion: "success"},
-		{Name: "Upload full-lane proof artifact", Number: 6, Conclusion: "failure"},
+		{Name: "Prove every shard ran and together covered the battery", Number: 5, Conclusion: "failure"},
+		{Name: "Upload full-lane proof artifact", Number: 6, Conclusion: "skipped"},
 	}}
-	jobsJSON, err := json.Marshal(jobs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	checks := make([]scm.Check, len(jobs))
-	for i, job := range jobs {
-		bucket := scm.CheckBucketPass
-		state := "SUCCESS"
-		switch job.Conclusion {
-		case "failure":
-			bucket, state = scm.CheckBucketFail, "FAILURE"
-		case "skipped":
-			bucket, state = scm.CheckBucketSkip, "SKIPPED"
-		}
-		checks[i] = scm.Check{Name: job.Name, Bucket: bucket, State: state, Link: fmt.Sprintf("https://github.com/test/repo/actions/runs/1/job/%d", job.ID)}
-	}
 	shardLogs := strings.Join([]string{
 		"##[group]Run retry guard",
 		"##[group]Run install tools",
@@ -1876,37 +1917,57 @@ func TestArtifactInfrastructureFailures_JoinedFiveCellDependencyFamilyIsOneSafeG
 	allArtifacts := joinedXAUAttemptOneArtifacts("head-1")
 	retainedArtifacts := append([]scm.InfrastructureArtifactReceipt(nil), allArtifacts[:3]...)
 	retainedArtifacts = append(retainedArtifacts, allArtifacts[5:]...)
-	host := New(githubTestCmdFactory(map[string]githubTestResponse{
-		"gh api --method GET repos/test/repo/actions/runs/1":                                                    {stdout: `{"id":1,"event":"pull_request","head_sha":"head-1","run_attempt":1,"pull_requests":[{"number":42,"head":{"sha":"head-1"},"base":{"ref":"main","sha":"base-1"}}]}`},
-		"gh api --method GET repos/test/repo/actions/runs/1/attempts/1/jobs -f per_page=100 --paginate --slurp": {stdout: `[{"total_count":14,"jobs":` + string(jobsJSON) + `}]`},
-		"gh api --method GET repos/test/repo/actions/jobs/11/logs":                                              {stdout: shardLogs},
-		"gh api --method GET repos/test/repo/actions/jobs/12/logs":                                              {stdout: shardLogs},
-		"gh api --method GET repos/test/repo/actions/jobs/14/logs":                                              {stdout: "##[group]Run retry guard\n##[group]Run actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093\n##[group]Run fan-in proof\n##[group]Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02\n" + uploadArtifact503Record + "\n"},
-		"gh api --method GET repos/test/repo/actions/runs/1/artifacts -f per_page=100 --paginate --slurp":       {stdout: githubArtifactPages(retainedArtifacts)},
-		"gh api --method GET repos/test/repo/contents/.github/workflows/xau-ci.yml -f ref=base-1":               {stdout: `{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"file"}`},
-		"gh api --method GET repos/test/repo/contents/.github/workflows/xau-ci.yml -f ref=head-1":               {stdout: `{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"file"}`},
-		"gh api --method GET repos/test/repo/contents/scripts/ci_check_infrastructure_retry.py -f ref=base-1":   {stdout: `{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","type":"file"}`},
-		"gh api --method GET repos/test/repo/contents/scripts/ci_check_infrastructure_retry.py -f ref=head-1":   {stdout: `{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","type":"file"}`},
-	}), nil, "", "test/repo")
-
-	got, err := host.ArtifactInfrastructureFailures(context.Background(), &scm.PR{Number: "42", HeadSHA: "head-1", BaseBranch: "main", BaseSHA: "base-1"}, checks)
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := classifyJoinedXAUAttemptOne(t, jobs, map[int]string{
+		11: shardLogs,
+		12: shardLogs,
+		14: "##[group]Run retry guard\n##[group]Run actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093\n##[group]Run python -B scripts/ci_check_shard_fanin.py\n##[error]required repository shard jobs did not conclude successfully\n",
+	}, retainedArtifacts)
 	for _, index := range []int{10, 11, 13} {
 		if !got[index].Retryable || got[index].RerunSafe || got[index].Group != "github-actions-run:1" || !strings.Contains(got[index].Reason, "identity is not reviewed") {
-			t.Fatalf("failure %q disposition = %+v, want one complete but identity-gated group", checks[index].Name, got[index])
+			t.Fatalf("failure %q disposition = %+v, want one complete but identity-gated group", jobs[index].Name, got[index])
 		}
 	}
 	if !got[7].RerunOmission || got[7].Group != "github-actions-run:1" {
 		t.Fatalf("PR-only reuse omission = %+v, want group-bound omission", got[7])
 	}
 	receipt := got[10].Evidence
-	if len(receipt.LogJobIDs) != 3 || len(receipt.DependentJobs) != 0 || len(receipt.DependentSteps) != 8 {
+	if len(receipt.LogJobIDs) != 3 || len(receipt.DependentJobs) != 1 || receipt.DependentJobs[0] != 14 || len(receipt.DependentSteps) != 10 {
 		t.Fatalf("dependency-family receipt = %+v", receipt)
 	}
 	if len(receipt.Artifacts) != 8 || receipt.Artifacts[0].Digest == "" || receipt.Artifacts[0].ProviderRunID != 1 || receipt.Artifacts[0].HeadSHA != "head-1" {
 		t.Fatalf("producer provenance receipt = %+v", receipt.Artifacts)
+	}
+}
+
+// A final proof upload can initiate the same bounded infrastructure family
+// only after every required producer and fan-in succeeded. This case keeps all
+// ten attempt-one producer receipts and no dependent recovery obligations.
+func TestArtifactInfrastructureFailures_FinalProofUploadAfterExpectedAttemptOneSkipIsOneSafeGroup(t *testing.T) {
+	t.Parallel()
+
+	jobs := joinedXAUJobPopulation()
+	jobs[13] = githubRunJob{ID: 14, HeadSHA: "head-1", Name: "repository", Status: "completed", Conclusion: "failure", Steps: []githubJobStep{
+		{Name: boundedInfrastructureRetryStep, Number: 2, Conclusion: "success"},
+		{Name: "Download every shard's manifest and log", Number: 3, Conclusion: "success"},
+		{Name: joinedXAURetainedProofStep, Number: 4, Conclusion: "skipped"},
+		{Name: "Prove every shard ran and together covered the battery", Number: 5, Conclusion: "success"},
+		{Name: "Upload full-lane proof artifact", Number: 6, Conclusion: "failure"},
+	}}
+	logs := strings.Join([]string{
+		"##[group]Run retry guard",
+		"##[group]Run actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+		"##[group]Run python -B scripts/ci_check_shard_fanin.py",
+		"##[group]Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+		uploadArtifact503Record,
+	}, "\n") + "\n"
+	got := classifyJoinedXAUAttemptOne(t, jobs, map[int]string{14: logs}, joinedXAUAttemptOneArtifacts("head-1"))
+
+	if !got[13].Retryable || got[13].RerunSafe || got[13].Group != "github-actions-run:1" || !strings.Contains(got[13].Reason, "identity is not reviewed") {
+		t.Fatalf("final proof upload disposition = %+v, want one complete but identity-gated group", got[13])
+	}
+	receipt := got[13].Evidence
+	if len(receipt.LogJobIDs) != 1 || receipt.LogJobIDs[0] != 14 || len(receipt.DependentJobs) != 0 || len(receipt.DependentSteps) != 0 || len(receipt.Artifacts) != 10 {
+		t.Fatalf("final proof upload receipt = %+v, want one log, ten producers, and no dependents", receipt)
 	}
 }
 

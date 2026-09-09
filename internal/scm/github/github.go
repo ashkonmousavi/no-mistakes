@@ -1530,6 +1530,9 @@ func joinedXAURepositoryDependencyFailure(job githubRunJob, logs string) ([]scm.
 			dependent = append(dependent, scm.InfrastructureStepReceipt{JobID: int64(job.databaseID()), Number: step.Number, Name: strings.TrimSpace(step.Name)})
 		case "skipped":
 			if !failed {
+				if joinedXAUAttemptOneOmittedStep(job.Name, step.Name) {
+					continue
+				}
 				return nil, false
 			}
 			dependent = append(dependent, scm.InfrastructureStepReceipt{JobID: int64(job.databaseID()), Number: step.Number, Name: strings.TrimSpace(step.Name)})
