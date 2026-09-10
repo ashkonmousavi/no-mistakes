@@ -720,6 +720,133 @@ func TestTestStep_ValidMixedPayloadDoesNotRetry(t *testing.T) {
 	}
 }
 
+// TestTestStep_EmptyPlaceholderScenarioMapRefused reproduces the
+// test-analyzer-empty-scenario-map heal finding verbatim: a single scenario
+// literally named "test" (the step's own name), reported untested with a
+// verdict of inconclusive. Before the scenario-map-shape check this payload
+// satisfied every per-field contract check and reached verdictFindings as a
+// legitimate "inconclusive" ask-user finding. It must instead be refused as
+// degenerate output and, since the analyzer keeps returning the same
+// placeholder, fail the step after the bounded correction attempts rather
+// than parking as inconclusive.
+func TestTestStep_EmptyPlaceholderScenarioMapRefused(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	const degenerateSingleScenarioJSON = `{
+	  "findings": [],
+	  "summary": "",
+	  "tested": ["test"],
+	  "testing_summary": "test",
+	  "artifacts": [],
+	  "scenarios": [{"name":"test","result":"untested","live":false,"evidence":"","reason":"could not derive scenarios"}],
+	  "verdict": "inconclusive"
+	}`
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+			return &agent.Result{Output: json.RawMessage(degenerateSingleScenarioJSON)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.UserIntent = "Show users a success screen after checkout"
+
+	outcome, err := (&TestStep{}).Execute(sctx)
+	if err == nil {
+		t.Fatalf("a placeholder-only scenario map must be refused, not ruled inconclusive; outcome: %+v", outcome)
+	}
+	if outcome != nil {
+		t.Fatalf("Execute() outcome = %+v, want no outcome once refusal exhausts the correction bound", outcome)
+	}
+	got := err.Error()
+	for _, want := range []string{
+		fmt.Sprintf("after %d attempts", testAnalyzerMaxAttempts),
+		"parsed scenario map shape: 1 scenario(s) total, 1 placeholder name(s) (test)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("error = %q, want it to name the parsed shape including %q", got, want)
+		}
+	}
+	if len(ag.calls) != testAnalyzerMaxAttempts {
+		t.Fatalf("agent calls = %d, want %d: the analyzer must be asked to re-derive the map before the step fails", len(ag.calls), testAnalyzerMaxAttempts)
+	}
+}
+
+// TestTestStep_PlaceholderScenarioNameRefused proves the placeholder check is
+// a general mechanism, not a hardcoded match on the literal word "test": any
+// generic label that carries no scenario content is refused the same way,
+// even when mixed alongside a well-formed scenario.
+func TestTestStep_PlaceholderScenarioNameRefused(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	const placeholderAmongRealJSON = `{
+	  "findings": [],
+	  "summary": "",
+	  "tested": ["npm run e2e -- checkout"],
+	  "testing_summary": "drove checkout end to end",
+	  "artifacts": [],
+	  "scenarios": [
+	    {"name":"user reaches the success screen","result":"pass","live":true,"evidence":"checkout.png","reason":""},
+	    {"name":"scenario","result":"untested","live":false,"evidence":"","reason":"placeholder"}
+	  ],
+	  "verdict": "inconclusive"
+	}`
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+			return &agent.Result{Output: json.RawMessage(placeholderAmongRealJSON)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.UserIntent = "Show users a success screen after checkout"
+
+	outcome, err := (&TestStep{}).Execute(sctx)
+	if err == nil {
+		t.Fatalf("a scenario map containing a placeholder name must be refused; outcome: %+v", outcome)
+	}
+	if outcome != nil {
+		t.Fatalf("Execute() outcome = %+v, want no outcome once refusal exhausts the correction bound", outcome)
+	}
+	got := err.Error()
+	if !strings.Contains(got, "parsed scenario map shape: 2 scenario(s) total, 1 placeholder name(s) (scenario)") {
+		t.Fatalf("error = %q, want it to name the parsed shape naming the placeholder scenario", got)
+	}
+}
+
+// TestTestStep_WellFormedScenarioMapStillRulesNormally proves the new
+// placeholder check does not disturb a legitimate, intent-derived scenario
+// map: it must still reach a normal verdict without hitting the scenario-map
+// refusal, exactly as it did before the check existed.
+func TestTestStep_WellFormedScenarioMapStillRulesNormally(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+			return &agent.Result{Output: json.RawMessage(mixedLivePassAndUntestedFindingsJSON)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.UserIntent = "Show users a success screen after checkout"
+
+	outcome, err := (&TestStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatalf("a well-formed scenario map must not be refused: %v", err)
+	}
+	if len(ag.calls) != 1 {
+		t.Fatalf("agent calls = %d, want 1: a well-formed map must not trigger a correction round", len(ag.calls))
+	}
+	if outcome.NeedsApproval {
+		t.Fatalf("a well-formed passing map must not park, findings: %s", outcome.Findings)
+	}
+	findings, err := types.ParseFindingsJSON(outcome.Findings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findings.Verdict != types.TestVerdictGo || len(findings.Scenarios) != 2 {
+		t.Fatalf("well-formed map was not retained: %+v", findings)
+	}
+}
+
 func commitCIWorkflowOnlyChange(t *testing.T, dir, baseSHA string) string {
 	t.Helper()
 	gitCmd(t, dir, "checkout", "-B", "feature", baseSHA)

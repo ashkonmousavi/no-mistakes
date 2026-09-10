@@ -144,6 +144,7 @@ func unmarshalRequiredTestFindings(raw []byte, findings *Findings) error {
 	for i, scenario := range *payload.Scenarios {
 		issues = append(issues, scenarioContractIssues(i, scenario)...)
 	}
+	issues = append(issues, scenarioMapShapeIssues(*payload.Scenarios)...)
 	if payload.Verdict == nil {
 		issues = append(issues, "missing verdict - set verdict to "+strings.Join(types.KnownTestVerdicts(), ", "))
 	} else if !types.IsKnownTestVerdict(*payload.Verdict) {
@@ -177,6 +178,54 @@ func unmarshalRequiredTestFindings(raw []byte, findings *Findings) error {
 		return fmt.Errorf("%s", strings.Join(issues, "\n"))
 	}
 	return nil
+}
+
+// scenarioMapPlaceholderNames are generic labels that restate the step's own
+// name, or otherwise carry no scenario content. A scenario map that names one
+// of these instead of a concrete user action was not derived from the run
+// intent at all - it is degenerate analyzer output, not evidence, and must be
+// refused rather than allowed to reach a verdict the caller treats as
+// legitimate (see the test-analyzer-empty-scenario-map heal finding: a single
+// scenario literally named "test" reached an "inconclusive" verdict).
+var scenarioMapPlaceholderNames = map[string]bool{
+	"test":        true,
+	"tests":       true,
+	"testing":     true,
+	"scenario":    true,
+	"scenarios":   true,
+	"placeholder": true,
+	"todo":        true,
+	"tbd":         true,
+	"n/a":         true,
+	"na":          true,
+	"unknown":     true,
+	"unnamed":     true,
+}
+
+// scenarioMapShapeIssues rejects a scenario map that names a placeholder
+// instead of a scenario drawn from the run intent. It is independent of
+// scenarioContractIssues (which validates each scenario's own fields) so the
+// resulting error can state the parsed shape - how many scenarios were parsed
+// and which of their names were placeholders - rather than only a per-field
+// complaint.
+func scenarioMapShapeIssues(scenarios []testScenarioContractFields) []string {
+	var placeholders []string
+	for _, scenario := range scenarios {
+		if scenario.Name == nil {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(*scenario.Name))
+		if scenarioMapPlaceholderNames[name] {
+			placeholders = append(placeholders, strings.TrimSpace(*scenario.Name))
+		}
+	}
+	if len(placeholders) == 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"parsed scenario map shape: %d scenario(s) total, %d placeholder name(s) (%s) - a placeholder restates the step's own name or carries no content instead of a scenario drawn from the run intent; name a concrete user action and observable result instead",
+		len(scenarios), len(placeholders), strings.Join(placeholders, ", "),
+	)}
 }
 
 type testScenarioContractFields struct {
