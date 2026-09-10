@@ -2330,7 +2330,7 @@ func TestRecoverRebasedPreservedHeadRefusesConcurrentGateBranchMove(t *testing.T
 
 	f := newRebasedRecoverFixtureGateBehind(t, types.RunCancelled)
 	tree := mustRun(t, f.gate, "rev-parse", f.submitted+"^{tree}")
-	racingHead := mustRun(t, f.gate, "commit-tree", "-m", "concurrent gate push", "-p", f.submitted, tree)
+	racingHead := mustRun(t, f.gate, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", "-m", "concurrent gate push", "-p", f.submitted, tree)
 	f.service.beforeGateReset = func() {
 		mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", racingHead, f.submitted)
 	}
@@ -2364,7 +2364,7 @@ func TestRecoverRebasedPreservedHeadRefusesDivergedGateBranch(t *testing.T) {
 
 	f := newRebasedRecoverFixtureGateBehind(t, types.RunCancelled)
 	tree := mustRun(t, f.gate, "rev-parse", f.submitted+"^{tree}")
-	divergedHead := mustRun(t, f.gate, "commit-tree", "-m", "independent gate push", "-p", f.submitted, tree)
+	divergedHead := mustRun(t, f.gate, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", "-m", "independent gate push", "-p", f.submitted, tree)
 	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", divergedHead, f.submitted)
 
 	state := f.service.Recover(f.ctx, false)
