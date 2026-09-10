@@ -1120,7 +1120,7 @@ func (s *Service) recoverFastForward(ctx context.Context, run *db.Run, state Sta
 		state.NextAction = &NextAction{Code: "inspect_worktree", Command: "git status"}
 		return state
 	}
-	if blocked, ok := s.settleGateBranchToAdoptedHead(ctx, state, run.ID, finalHead); !ok {
+	if blocked, ok := s.settleGateBranchToAdoptedHead(ctx, state, run, finalHead); !ok {
 		return blocked
 	}
 	return s.finishRecover(ctx, run, true)
@@ -1285,7 +1285,7 @@ func (s *Service) recoverAdoptPreserved(ctx context.Context, run *db.Run, state 
 		state.NextAction = &NextAction{Code: "inspect_worktree", Command: "git status"}
 		return state
 	}
-	if blocked, ok := s.settleGateBranchToAdoptedHead(ctx, state, run.ID, finalHead); !ok {
+	if blocked, ok := s.settleGateBranchToAdoptedHead(ctx, state, run, finalHead); !ok {
 		return blocked
 	}
 	return s.finishRecover(ctx, run, true)
@@ -1319,7 +1319,8 @@ func (s *Service) anchorReachablePreserved(ctx context.Context, state State, run
 // that observed value; a concurrent gate push in between makes the swap
 // refuse instead of clobbering it, mirroring the same irreducible race
 // --keep-local already accepts and reports.
-func (s *Service) settleGateBranchToAdoptedHead(ctx context.Context, state State, runID, adopted string) (State, bool) {
+func (s *Service) settleGateBranchToAdoptedHead(ctx context.Context, state State, run *db.Run, adopted string) (State, bool) {
+	runID := run.ID
 	gateDir := strings.TrimSpace(s.GateDir)
 	if gateDir == "" {
 		return blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_unavailable", "no local gate is configured for this repository, so the gate branch could not be settled to the adopted head; the local branch and worktree already reached it; custody was not recorded"), false
@@ -1343,6 +1344,18 @@ func (s *Service) settleGateBranchToAdoptedHead(ctx context.Context, state State
 	// independent work instead of merely catching the gate ref up.
 	if exists && isAncestor(ctx, gateDir, adopted, gateHead) {
 		return state, true
+	}
+	// A gate branch that is neither the adopted head nor already ahead of it
+	// is only safe to overwrite when it still sits at exactly the head this
+	// very run submitted: that is the stale-behind C7.8 shape this function
+	// exists to fast-forward (a rebase can legitimately break ancestry
+	// between the submitted head and the adopted one, so ancestry alone
+	// cannot distinguish "stale" from "diverged"). A gate branch sitting
+	// anywhere else - moved by another run or an operator since this run
+	// went terminal - carries commits of its own and must not be silently
+	// detached from the branch ref with no anchor preserving them.
+	if exists && (run.SubmittedHeadSHA == nil || gateHead != *run.SubmittedHeadSHA) {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_diverged", fmt.Sprintf("the gate branch %s has diverged from the head this run submitted; the local branch and worktree already reached the adopted head; reconcile the gate branch manually before retrying", state.Local.Branch)), false
 	}
 	oldValue := gateHead
 	if !exists {

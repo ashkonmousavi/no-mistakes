@@ -2352,6 +2352,39 @@ func TestRecoverRebasedPreservedHeadRefusesConcurrentGateBranchMove(t *testing.T
 		t.Fatal("raced settlement stamped custody")
 	}
 }
+
+// TestRecoverRebasedPreservedHeadRefusesDivergedGateBranch proves recovery
+// never overwrites a gate branch that moved onto its own independent commit
+// before recovery ran at all (not a mid-call race, and not the submitted
+// head the run itself left behind): another run or an operator could have
+// pushed there after this run went terminal, and settleGateBranchToAdoptedHead
+// must not silently detach that commit from the branch ref.
+func TestRecoverRebasedPreservedHeadRefusesDivergedGateBranch(t *testing.T) {
+	t.Parallel()
+
+	f := newRebasedRecoverFixtureGateBehind(t, types.RunCancelled)
+	tree := mustRun(t, f.gate, "rev-parse", f.submitted+"^{tree}")
+	divergedHead := mustRun(t, f.gate, "commit-tree", "-m", "independent gate push", "-p", f.submitted, tree)
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", divergedHead, f.submitted)
+
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered || state.Changed {
+		t.Fatalf("recovery overwrote a diverged gate branch: %#v", state)
+	}
+	if state.Safety != "blocked_recover_gate_diverged" {
+		t.Fatalf("diverged-gate-branch refusal = %s", state.Safety)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("HEAD = %s, want the already-adopted preserved head %s left in place", got, f.preserved)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != divergedHead {
+		t.Fatalf("gate branch = %s, want the independent push %s left untouched", got, divergedHead)
+	}
+	if f.custodyReturned() {
+		t.Fatal("diverged gate branch overwrite stamped custody")
+	}
+}
+
 // the over-escalating custody return: a cancelled validation whose preserved
 // pipeline head is the operator's own work rebased onto a newer base loses
 // nothing by adopting it, so recovery must succeed instead of refusing as
