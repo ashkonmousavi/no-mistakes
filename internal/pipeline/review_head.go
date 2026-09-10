@@ -21,7 +21,10 @@ const maxFinalHeadRereviews = 3
 // maxDocumentationHeadRechecks bounds how many times one run may restart at
 // Test because a documentation-and-records-only correction advanced the head.
 // Two, because at most two post-review steps can produce such an advance in
-// one pass (Document's bounded correction, then Lint's own fix round); a third
+// one pass (Document's bounded correction, then Lint's own fix round), and it
+// is also the run-wide cap on Document's corrections: each Document pass may
+// correct once, and DocumentationHeadRecheckBudget lets the step refuse a
+// correction whose head this budget could no longer re-validate. A third
 // means something is rewriting documentation on every pass and the run is
 // looping. TestExecutor_DocumentationHeadRecheckLoopIsBounded pins convergence
 // against this value, so raising it here without raising that bound turns a
@@ -248,9 +251,32 @@ func (e *Executor) enforceRestartBound(runID string, outcome *StepOutcome) error
 // enforceRestartReasonBound counts the rounds target already started because of
 // reason and refuses once budget is spent.
 func (e *Executor) enforceRestartReasonBound(runID string, target types.StepName, reason RestartReason, budget int, limitFormat string) error {
-	steps, err := e.db.GetStepsByRun(runID)
+	count, err := countRestartRounds(e.db, runID, target, reason)
 	if err != nil {
-		return fmt.Errorf("count %s restarts: %w", reason, err)
+		return err
+	}
+	if count >= budget {
+		return fmt.Errorf(limitFormat, count)
+	}
+	return nil
+}
+
+// DocumentationHeadRecheckBudget reports how many documentation_head_recheck
+// restarts this run has already started and how many it may start in total.
+// It reads the exact count enforceRestartBound refuses on, so a step that
+// consults it before advancing the head never produces an advance the executor
+// would then refuse to re-validate.
+func DocumentationHeadRecheckBudget(database *db.DB, runID string) (started, limit int, err error) {
+	started, err = countRestartRounds(database, runID, types.StepTest, RestartReasonDocumentationHeadRecheck)
+	return started, maxDocumentationHeadRechecks, err
+}
+
+// countRestartRounds counts the rounds target already started because of
+// reason.
+func countRestartRounds(database *db.DB, runID string, target types.StepName, reason RestartReason) (int, error) {
+	steps, err := database.GetStepsByRun(runID)
+	if err != nil {
+		return 0, fmt.Errorf("count %s restarts: %w", reason, err)
 	}
 	count := 0
 	for _, step := range steps {
@@ -261,9 +287,9 @@ func (e *Executor) enforceRestartReasonBound(runID string, target types.StepName
 		if step.StepName != target {
 			continue
 		}
-		rounds, err := e.db.GetRoundsByStep(step.ID)
+		rounds, err := database.GetRoundsByStep(step.ID)
 		if err != nil {
-			return fmt.Errorf("count %s restarts for %s: %w", reason, step.StepName, err)
+			return 0, fmt.Errorf("count %s restarts for %s: %w", reason, step.StepName, err)
 		}
 		for _, round := range rounds {
 			if round.Trigger == string(reason) {
@@ -271,8 +297,5 @@ func (e *Executor) enforceRestartReasonBound(runID string, target types.StepName
 			}
 		}
 	}
-	if count >= budget {
-		return fmt.Errorf(limitFormat, count)
-	}
-	return nil
+	return count, nil
 }

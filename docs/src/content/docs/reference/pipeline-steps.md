@@ -193,7 +193,9 @@ An omitted or unknown class fails the analyzer output; a class recorded before t
 - Commits exactly the corrected paths, never `git add -A`, so an earlier step's uncommitted work is neither swept into the correction nor misattributed to it
 - Fails the round visibly, naming the paths, if it touched anything else or left an uncommitted change behind
 - Records the corrected files on the round, so the pull-request body states which files the run changed
-- Is limited to one correcting round per run. Later rounds re-check and report without editing
+- Is limited to one correcting round per Document pass. A pass ends when its correction's documentation-only head advance restarts the run at Test, and the re-entered Document step starts a fresh pass with its own correcting round. Across the run, corrections are capped by the documentation recheck limit (two), so a correction whose head could no longer be re-validated is refused. Later rounds of a pass, and every round once that limit is spent, re-check and report without editing
+
+**Spent correction budget.** When the budget is spent and findings still gate, the step never presents a fix as one that will apply: it relabels the remaining `auto-fix` documentation findings `ask-user` and adds a `document-correction-budget-spent` finding that states why. A fix response then edits nothing; approve to accept the findings as they stand, or abort and correct them outside the run.
 
 Set `auto_fix.document: 0` to keep the step strictly report-only: findings are reported and the author resolves them outside the run.
 
@@ -201,7 +203,7 @@ Set `auto_fix.document: 0` to keep the step strictly report-only: findings are r
 
 **Auto-fix:** `action: auto-fix` findings inside the correctable path set start one bounded correction round. `ask-user` findings pause for a decision; `no-op` and editorial findings are informational. If you trigger a fix from the TUI or AXI interface, the correction agent receives the selected previous findings plus any per-finding user notes, any selected user-authored findings, and the shared [finding decision history](#finding-decision-history).
 
-**Default auto-fix limit:** `3` (the correcting rounds themselves are capped at one).
+**Default auto-fix limit:** `3` (the correcting rounds themselves are capped at one per Document pass).
 
 ## Lint
 

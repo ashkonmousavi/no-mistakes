@@ -39,7 +39,7 @@ The pipeline is opinionated so that "passed the gate" has a stable meaning:
 | 2 | **Rebase** | Fetch fresh remote upstream and the configured branch target, then rebase your branch onto them | `3` |
 | 3 | **Review** | AI code review of your diff | `0` (requires approval) |
 | 4 | **Test** | Targeted local validation of the change and intent (not a full CI suite), plus evidence when intent is available | `3` |
-| 5 | **Document** | Review docs for accuracy, classify each gap, and correct accepted ones in a bounded turn | `3` (corrections capped at one round) |
+| 5 | **Document** | Review docs for accuracy, classify each gap, and correct accepted ones in a bounded turn | `3` (corrections capped at one round per pass) |
 | 6 | **Lint** | Run lint/static analysis; shares the document step's housekeeping pass when no lint command is configured | `3` |
 | 7 | **Push** | Safely push the validated branch to the configured target | n/a |
 | 8 | **PR** | Create or update the pull request | n/a |
