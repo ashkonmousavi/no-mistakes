@@ -298,6 +298,27 @@ func TestCIRepairParkOutcome_RelabelsEveryFindingAskUser(t *testing.T) {
 	}
 }
 
+// TestCITerminalMonitorOutcomePreservesDeferredFindingsAfterPublishedRepair
+// proves a terminal provider/read/target exit cannot erase the ask-user half
+// of the mixed observation whose auto-fix half was just published.
+func TestCITerminalMonitorOutcomePreservesDeferredFindingsAfterPublishedRepair(t *testing.T) {
+	t.Parallel()
+	outcome := ciTerminalMonitorOutcome(
+		ciFailureOutcome([]scm.CheckTarget{{Name: "unsafe", ProviderID: "github-check-run:42"}}, false, "provider target moved"),
+		`{"findings":[{"id":"deferred-review","severity":"warning","description":"review decision still required","action":"ask-user","category":"ci-review-bot","check":"review"}]}`,
+	)
+	findings, err := types.ParseFindingsJSON(outcome.Findings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.NeedsApproval || outcome.AutoFixable || len(findings.Items) != 2 {
+		t.Fatalf("outcome = %+v findings = %+v, want the terminal issue plus deferred decision parked", outcome, findings.Items)
+	}
+	if findings.Items[0].CheckID != "github-check-run:42" || findings.Items[1].ID != "deferred-review" {
+		t.Fatalf("findings = %+v, want exact terminal check and deferred decision", findings.Items)
+	}
+}
+
 // The first concrete case of the findings model: a red Greptile check is the
 // bot's opinion, not a verdict, so it parks as ask-user findings anchored to
 // each comment and never spends an auto_fix.ci round, even with budget left.

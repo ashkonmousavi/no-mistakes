@@ -420,7 +420,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 		} else {
 			outcome = ciMonitoringTimeoutOutcome()
 		}
-		return ciTerminalRepairOutcome(outcome, Findings{}, sctx.DeferredFindings), nil
+		return ciTerminalMonitorOutcome(outcome, sctx.DeferredFindings), nil
 	}
 	waitForPoll := func() error {
 		interval := s.pollIntervalOverride
@@ -556,7 +556,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 			// already for merged/closed, so reaching here means the PR is open.
 			if consecutiveCheckErrs >= consecutiveCheckErrorLimit {
 				sctx.Log(fmt.Sprintf("CI checks could not be read %d consecutive times, parking for a decision", consecutiveCheckErrs))
-				return ciTerminalRepairOutcome(ciCheckReadFailureOutcome(err), Findings{}, sctx.DeferredFindings), nil
+				return ciTerminalMonitorOutcome(ciCheckReadFailureOutcome(err), sctx.DeferredFindings), nil
 			}
 		} else {
 			consecutiveCheckErrs = 0
@@ -571,7 +571,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					invalidateInfrastructurePRTarget(pr)
 				} else if mismatch != "" {
 					clearCIMonitorReady(sctx)
-					return ciFailureOutcome(terminalCheckTargetsForNames(checks, failingCheckNames(checks)), false, mismatch), nil
+					return ciTerminalMonitorOutcome(ciFailureOutcome(terminalCheckTargetsForNames(checks, failingCheckNames(checks)), false, mismatch), sctx.DeferredFindings), nil
 				}
 			}
 			// A failure the provider produced before the repository's own steps
@@ -629,20 +629,21 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					// commit whose checks were observed: nothing here may leave
 					// a ready-to-merge signal behind on the way out.
 					clearCIMonitorReady(sctx)
-					return rerunOutcome, nil
+					return ciTerminalMonitorOutcome(rerunOutcome, sctx.DeferredFindings), nil
 				}
 				rerunIssued = issued
 				if !rerunIssued {
 					if unsafe := infrastructureFailuresWithoutExactRerun(checks); len(unsafe) > 0 {
 						clearCIMonitorReady(sctx)
-						return ciFailureOutcome(terminalCheckTargetsForNames(checks, unsafe), false, "provider retry scope includes work outside the proven failed-job population; infrastructure rerun remains disabled"), nil
+						findings := ciUnsafeInfrastructureFindings(checks, unsafe, mergeConflict)
+						return ciObservationOutcomeWithDeferred(findings, sctx.DeferredFindings), nil
 					}
 				}
 				if !rerunIssued {
 					issued, rerunOutcome = s.rerunTransientChecks(sctx, host, pr, checks)
 					if rerunOutcome != nil {
 						clearCIMonitorReady(sctx)
-						return rerunOutcome, nil
+						return ciTerminalMonitorOutcome(rerunOutcome, sctx.DeferredFindings), nil
 					}
 					rerunIssued = issued
 				}

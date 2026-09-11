@@ -918,23 +918,33 @@ func TestInfrastructureFailureWithoutExactRerunBecomesUnifiedCIFinding(t *testin
 	t.Parallel()
 	checks := []scm.Check{
 		{Name: "artifact", ProviderID: "github-check-run:42", Bucket: scm.CheckBucketFail, State: "FAILURE", InfrastructureFailure: true, InfrastructureRerunSafe: false},
-		{Name: "green", Bucket: scm.CheckBucketPass, State: "SUCCESS"},
+		{Name: "artifact", ProviderID: "github-check-run:43", Bucket: scm.CheckBucketFail, State: "FAILURE"},
+		{Name: "unit", ProviderID: "github-check-run:44", Bucket: scm.CheckBucketFail, State: "FAILURE"},
 	}
 	got := infrastructureFailuresWithoutExactRerun(checks)
-	if len(got) != 1 || got[0] != "artifact" {
-		t.Fatalf("unsafe infrastructure failures = %v, want artifact", got)
+	if len(got) != 1 || got[0].ProviderID != "github-check-run:42" {
+		t.Fatalf("unsafe infrastructure failures = %+v, want only github-check-run:42", got)
 	}
-	outcome := ciFailureOutcome(terminalCheckTargetsForNames(checks, got), false, "provider retry scope is unsafe")
+	outcome := ciObservationOutcomeWithDeferred(
+		ciUnsafeInfrastructureFindings(checks, got, false),
+		`{"findings":[{"id":"deferred-review","severity":"warning","action":"ask-user","category":"ci-review-bot","check":"review","description":"deferred review decision"}]}`,
+	)
 	var findings Findings
 	if err := json.Unmarshal([]byte(outcome.Findings), &findings); err != nil {
 		t.Fatal(err)
 	}
-	if !outcome.NeedsApproval || len(findings.Items) != 1 {
-		t.Fatalf("outcome = %+v findings = %+v, want one parked finding", outcome, findings.Items)
+	if !outcome.NeedsApproval || !outcome.AutoFixable || len(findings.Items) != 4 {
+		t.Fatalf("outcome = %+v findings = %+v, want one exact infrastructure park, two fixable failures, and one deferred decision", outcome, findings.Items)
 	}
-	item := findings.Items[0]
-	if item.Action != types.ActionAskUser || item.Category != types.FindingCategoryCICheck || item.Check != "artifact" || item.CheckID != "github-check-run:42" {
-		t.Fatalf("finding = %+v, want provider-identified unified CI finding", item)
+	actions := map[string]string{}
+	for _, item := range findings.Items {
+		actions[item.CheckID] = item.Action
+	}
+	if actions["github-check-run:42"] != types.ActionAskUser || actions["github-check-run:43"] != types.ActionAutoFix || actions["github-check-run:44"] != types.ActionAutoFix {
+		t.Fatalf("finding actions by exact provider id = %+v", actions)
+	}
+	if findings.Items[3].ID != "deferred-review" || findings.Items[3].Action != types.ActionAskUser {
+		t.Fatalf("deferred finding = %+v, want preserved ask-user decision", findings.Items[3])
 	}
 }
 

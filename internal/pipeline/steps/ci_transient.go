@@ -741,15 +741,23 @@ func infrastructureRerunCandidates(checks []scm.Check, budget *infrastructureRer
 	return []scm.Check{*candidate}
 }
 
-func infrastructureFailuresWithoutExactRerun(checks []scm.Check) []string {
-	var names []string
+func infrastructureFailuresWithoutExactRerun(checks []scm.Check) []scm.Check {
+	var unsafe []scm.Check
 	for _, check := range checks {
 		if checkFailedTerminally(check) && check.InfrastructureFailure && !check.InfrastructureRerunSafe {
-			names = append(names, check.Name)
+			unsafe = append(unsafe, check)
 		}
 	}
-	sort.Strings(names)
-	return names
+	sort.Slice(unsafe, func(i, j int) bool {
+		if unsafe[i].Name != unsafe[j].Name {
+			return unsafe[i].Name < unsafe[j].Name
+		}
+		if unsafe[i].ProviderID != unsafe[j].ProviderID {
+			return unsafe[i].ProviderID < unsafe[j].ProviderID
+		}
+		return unsafe[i].Link < unsafe[j].Link
+	})
+	return unsafe
 }
 
 // mergeCheckNames appends the names in extra that base does not already carry.

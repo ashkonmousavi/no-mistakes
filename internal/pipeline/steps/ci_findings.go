@@ -126,12 +126,101 @@ func ciObservationFindings(issues ciIssues) Findings {
 // auto-fix findings, and it is false when nothing here is one, so a poll
 // with only ask-user findings never starts a round.
 func ciObservationOutcome(findings Findings) *pipeline.StepOutcome {
+	return ciObservationOutcomeWithDeferred(findings, "")
+}
+
+// ciObservationOutcomeWithDeferred combines a new settled observation with
+// findings a preceding repair deliberately left unselected. Unlike
+// ciTerminalRepairOutcome, it preserves each finding's action: a genuine code
+// failure in the new observation must remain auto-fixable while an unsafe
+// infrastructure failure and the older deferred findings remain ask-user.
+func ciObservationOutcomeWithDeferred(findings Findings, deferredRaw string) *pipeline.StepOutcome {
+	if deferred, err := types.ParseFindingsJSON(deferredRaw); err == nil {
+		findings = mergeCIFindings(findings, deferred)
+	}
 	encoded, _ := json.Marshal(findings)
 	return &pipeline.StepOutcome{
 		NeedsApproval: hasBlockingFindings(findings.Items),
 		AutoFixable:   hasAutoFixFindings(findings.Items),
 		Findings:      string(encoded),
 	}
+}
+
+func mergeCIFindings(base, extra Findings) Findings {
+	seenIDs := make(map[string]bool, len(base.Items))
+	seenItems := make(map[Finding]bool, len(base.Items))
+	for _, item := range base.Items {
+		if item.ID != "" {
+			seenIDs[item.ID] = true
+		}
+		seenItems[item] = true
+	}
+	for _, item := range extra.Items {
+		if item.ID != "" && seenIDs[item.ID] || seenItems[item] {
+			continue
+		}
+		base.Items = append(base.Items, item)
+		if item.ID != "" {
+			seenIDs[item.ID] = true
+		}
+		seenItems[item] = true
+	}
+	if strings.TrimSpace(extra.Summary) != "" && !strings.Contains(base.Summary, extra.Summary) {
+		if strings.TrimSpace(base.Summary) != "" {
+			base.Summary += "; "
+		}
+		base.Summary += extra.Summary
+	}
+	return base
+}
+
+// ciUnsafeInfrastructureFindings parks only the exact provider observations
+// whose retry scope is unsafe. Every other failed check is classified through
+// the normal settled-observation path, so same-named or differently named code
+// failures keep their independent provider identity and auto-fix action.
+func ciUnsafeInfrastructureFindings(checks, unsafe []scm.Check, mergeConflict bool) Findings {
+	unsafeKeys := make(map[string]bool, len(unsafe))
+	for _, check := range unsafe {
+		unsafeKeys[checkObservationKey(check)] = true
+	}
+	ordinary := make([]scm.Check, 0, len(checks)-len(unsafe))
+	for _, check := range checks {
+		if !unsafeKeys[checkObservationKey(check)] {
+			ordinary = append(ordinary, check)
+		}
+	}
+	findings := ciObservationFindings(ciIssues{
+		checks:        ordinary,
+		failing:       failingCheckNames(ordinary),
+		mergeConflict: mergeConflict,
+	})
+	for _, check := range unsafe {
+		findings.Items = append(findings.Items, Finding{
+			Severity:    types.FindingSeverityWarning,
+			Action:      types.ActionAskUser,
+			Category:    types.FindingCategoryCICheck,
+			Check:       check.Name,
+			CheckID:     check.ProviderID,
+			Description: ciCheckDescription(check) + " - provider retry scope includes work outside the proven failed-job population",
+		})
+	}
+	failureNoun := "failure"
+	if len(unsafe) != 1 {
+		failureNoun = "failures"
+	}
+	unsafeSummary := fmt.Sprintf("%d infrastructure %s cannot be rerun with exact scope", len(unsafe), failureNoun)
+	if findings.Summary != "" {
+		findings.Summary += "; "
+	}
+	findings.Summary += unsafeSummary
+	return findings
+}
+
+func checkObservationKey(check scm.Check) string {
+	if strings.TrimSpace(check.ProviderID) != "" {
+		return "id:" + check.ProviderID
+	}
+	return "observation:" + check.Name + "\x00" + check.Link
 }
 
 func hasAutoFixFindings(items []Finding) bool {
@@ -448,4 +537,11 @@ func ciTerminalRepairOutcome(outcome *pipeline.StepOutcome, selected Findings, d
 	outcome.AutoFixable = false
 	outcome.Findings = string(encoded)
 	return outcome
+}
+
+// ciTerminalMonitorOutcome is the single exit for monitor failures after a CI
+// repair may already have been published. Until a fresh settled observation or
+// proven-clean result supersedes them, deferred findings must remain visible.
+func ciTerminalMonitorOutcome(outcome *pipeline.StepOutcome, deferredRaw string) *pipeline.StepOutcome {
+	return ciTerminalRepairOutcome(outcome, Findings{}, deferredRaw)
 }
