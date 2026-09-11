@@ -442,7 +442,7 @@ Override auto-fix attempt limits for specific steps. Fields not set here inherit
 | `auto_fix.ci` | `int` | Inherits from global (default `3`) |
 
 Set to `0` to disable the follow-up auto-fix loop for a step (findings require manual approval).
-`auto_fix.document` is also the switch for the document step's [bounded in-run correction](/no-mistakes/reference/pipeline-steps/#document): above `0`, an accepted documentation finding is corrected and committed inside the run (at most one correcting round, restricted to [`document.correction_paths`](#documentcorrection_paths)); at `0` the step stays strictly report-only and findings are resolved outside the run.
+`auto_fix.document` is also the switch for the document step's [bounded in-run correction](/no-mistakes/reference/pipeline-steps/#document): above `0`, an accepted documentation finding is corrected and committed inside the run (one correcting round per Document pass, capped run-wide by the documentation recheck limit, restricted to [`document.correction_paths`](#documentcorrection_paths)); at `0` the step stays strictly report-only and findings are resolved outside the run.
 For empty `commands.lint`, the document step's combined housekeeping pass also assesses lint, and the lint step consumes its result; unresolved blocking lint findings pause for approval instead of starting another automatic fix loop.
 
 `auto_fix.ci` covers the CI step's CI failure and merge-conflict auto-fix attempts.

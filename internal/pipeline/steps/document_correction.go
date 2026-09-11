@@ -13,12 +13,25 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
-// maxDocumentCorrectionRounds bounds how many rounds of one document step may
-// edit the worktree. One: a correction that did not land in a single pass is
-// not converging, and the whole point of the bound is that a documentation
-// correction can never become another multi-round edit/review chain. Rounds
-// beyond it still re-check and still report; they simply do not edit.
-const maxDocumentCorrectionRounds = 1
+// maxDocumentCorrectionRoundsPerPass bounds how many rounds of one Document
+// pass may edit the worktree. One: a correction that did not land in a single
+// round is not converging, and the whole point of the bound is that a
+// documentation correction can never become another multi-round edit/review
+// chain. A pass ends when its correction's documentation-only head advance
+// restarts the run at Test. The re-entered Document step starts a fresh pass,
+// because it checks a head that has itself been re-validated, and a finding
+// against that head is new work rather than a correction that failed to
+// converge. pipeline.DocumentationHeadRecheckBudget is the run-wide cap: a
+// correction whose head the run could no longer re-validate is refused. Rounds
+// beyond either bound still re-check and still report; they do not edit, and
+// their gate says so (refuseFurtherDocumentCorrection).
+const maxDocumentCorrectionRoundsPerPass = 1
+
+// documentCorrectionBudgetFindingID identifies the structured refusal a gate
+// carries once no further correction can apply. It is a stable wire value, so
+// an operator or an agent driving the gate can tell "a fix would not edit
+// anything" apart from an ordinary documentation finding.
+const documentCorrectionBudgetFindingID = "document-correction-budget-spent"
 
 // documentCorrection records what one bounded correction round committed.
 type documentCorrection struct {
@@ -39,32 +52,108 @@ func documentCorrectionEnabled(sctx *pipeline.StepContext) bool {
 	return sctx.Config != nil && sctx.Config.AutoFix.Document > 0
 }
 
-// documentCorrectionRoundsSpent counts how many earlier rounds of this step
-// already committed a correction, read from the durable round history rather
-// than from memory so a resumed run cannot spend the budget twice.
-func documentCorrectionRoundsSpent(sctx *pipeline.StepContext) int {
+// documentCorrectionBudget says whether a correction may run, and why not when
+// it may not.
+type documentCorrectionBudget struct {
+	Allowed bool
+	Reason  string
+}
+
+// readDocumentCorrectionBudget reads the correction budget from the durable
+// round history rather than from memory, so a resumed run cannot spend it
+// twice.
+//
+// Two bounds apply. Per pass: the executor writes the restart reason on the
+// round that requested the restart, so a Document round triggered
+// documentation_head_recheck closes a pass, and only corrections after the
+// most recent such round count against the current one. Per run: a correction
+// advances the head, and that head is only publishable after a restart at
+// Test, so a correction is refused once the run has no documentation recheck
+// left to spend on it.
+func readDocumentCorrectionBudget(sctx *pipeline.StepContext) documentCorrectionBudget {
 	if sctx.DB == nil || sctx.StepResultID == "" {
-		return 0
+		return documentCorrectionBudget{Allowed: true}
 	}
 	rounds, err := sctx.DB.GetRoundsByStep(sctx.StepResultID)
 	if err != nil {
 		// Fail closed: an unreadable history must not read as "budget unspent".
-		return maxDocumentCorrectionRounds
+		return documentCorrectionBudget{Reason: fmt.Sprintf("the correction history could not be read (%v)", err)}
 	}
-	spent := 0
+	spentInPass := 0
 	for _, round := range rounds {
-		if round.FindingsJSON == nil {
-			continue
+		if round.FindingsJSON != nil {
+			if parsed, err := types.ParseFindingsJSON(*round.FindingsJSON); err == nil && len(parsed.CorrectedPaths) > 0 {
+				spentInPass++
+			}
 		}
-		parsed, err := types.ParseFindingsJSON(*round.FindingsJSON)
-		if err != nil {
-			continue
-		}
-		if len(parsed.CorrectedPaths) > 0 {
-			spent++
+		if round.Trigger == string(pipeline.RestartReasonDocumentationHeadRecheck) {
+			// This round's head advance restarted the run at Test; its own
+			// correction belongs to the pass it closed.
+			spentInPass = 0
 		}
 	}
-	return spent
+	if spentInPass >= maxDocumentCorrectionRoundsPerPass {
+		return documentCorrectionBudget{Reason: passCorrectionSpentReason(spentInPass)}
+	}
+	started, limit, err := pipeline.DocumentationHeadRecheckBudget(sctx.DB, sctx.Run.ID)
+	if err != nil {
+		return documentCorrectionBudget{Reason: fmt.Sprintf("the run's documentation recheck count could not be read (%v)", err)}
+	}
+	if started >= limit {
+		return documentCorrectionBudget{Reason: fmt.Sprintf("the run has already re-validated %d documentation-only head advances from Test (limit %d), so the head another correction produced could not be re-validated", started, limit)}
+	}
+	return documentCorrectionBudget{Allowed: true}
+}
+
+// nextDocumentCorrectionBudget is the budget the round after this one will
+// see. The round being completed is not persisted yet, so a correction it just
+// applied is invisible to the durable read and is counted here instead.
+// Without that, the executor would start one more round that could only
+// re-check and report.
+func nextDocumentCorrectionBudget(sctx *pipeline.StepContext, correction documentCorrection) documentCorrectionBudget {
+	if correction.Applied {
+		return documentCorrectionBudget{Reason: passCorrectionSpentReason(maxDocumentCorrectionRoundsPerPass)}
+	}
+	return readDocumentCorrectionBudget(sctx)
+}
+
+// passCorrectionSpentReason states the per-pass bound in the refusal text.
+func passCorrectionSpentReason(spent int) string {
+	return fmt.Sprintf("this Document pass already committed its correction (%d/%d)", spent, maxDocumentCorrectionRoundsPerPass)
+}
+
+// refuseFurtherDocumentCorrection makes a gate whose correction budget is spent
+// say so instead of offering a fix that would not apply. Every finding still
+// labelled auto-fix is relabelled ask-user, because "the pipeline corrects it
+// inside this run" is no longer true of it, and the structured refusal is
+// appended so whoever answers the gate reads why. Without it, run
+// 01M26NQXH7F4KJ7N0DZG1TZ6B4 answered fix four times against a spent budget,
+// each round re-checked without editing, and the run had to be aborted.
+func refuseFurtherDocumentCorrection(findings Findings, reason string) Findings {
+	relabelled := 0
+	kept := findings.Items[:0]
+	for _, item := range findings.Items {
+		// An analyzer that echoed an earlier refusal back must not leave a
+		// second finding with the same stable ID beside the fresh one.
+		if item.ID == documentCorrectionBudgetFindingID {
+			continue
+		}
+		if item.ActionOrDefault() == types.ActionAutoFix {
+			item.Action = types.ActionAskUser
+			relabelled++
+		}
+		kept = append(kept, item)
+	}
+	findings.Items = append(kept, types.Finding{
+		ID:       documentCorrectionBudgetFindingID,
+		Severity: "warning",
+		Description: fmt.Sprintf(
+			"Document correction budget spent: %s. A fix response will not edit any file in this run, so %d documentation finding(s) labelled auto-fix are now ask-user. Approve to accept the remaining documentation findings as they stand, or abort and correct them outside the run.",
+			reason, relabelled),
+		Action: types.ActionAskUser,
+		Class:  types.FindingClassSubstantive,
+	})
+	return findings
 }
 
 // correctableDocumentPaths returns the files the accepted findings name that
@@ -95,8 +184,8 @@ func correctableDocumentPaths(findings Findings, classPatterns []string) (allowe
 	return allowed, outside
 }
 
-// applyBoundedDocumentCorrection performs the one in-run correction the
-// document step is allowed: an agent turn restricted to the files the accepted
+// applyBoundedDocumentCorrection performs the one correction a Document pass
+// is allowed: an agent turn restricted to the files the accepted
 // findings name, followed by a single path-scoped commit the pipeline itself
 // authors.
 //
@@ -113,8 +202,8 @@ func applyBoundedDocumentCorrection(sctx *pipeline.StepContext, classPatterns []
 		sctx.Log("document correction is disabled for this repository (auto_fix.document: 0); this round re-checks the documentation without editing anything")
 		return documentCorrection{}, nil
 	}
-	if spent := documentCorrectionRoundsSpent(sctx); spent >= maxDocumentCorrectionRounds {
-		sctx.Log(fmt.Sprintf("document correction budget spent (%d/%d rounds); this round re-checks the documentation without editing anything", spent, maxDocumentCorrectionRounds))
+	if budget := readDocumentCorrectionBudget(sctx); !budget.Allowed {
+		sctx.Log(fmt.Sprintf("document correction budget spent: %s; this round re-checks the documentation without editing anything", budget.Reason))
 		return documentCorrection{}, nil
 	}
 	accepted, err := types.ParseFindingsJSON(sctx.PreviousFindings)

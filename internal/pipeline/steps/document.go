@@ -326,17 +326,12 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 	// correctable file belonging to some other finding can never be mistaken
 	// for work that round could do.
 	correctable, _ := correctableDocumentPaths(types.AutoFixableFindings(docFindings), classPatterns)
-	// The round this step is completing has not been persisted yet, so a
-	// correction it just applied is invisible to the durable budget read.
-	// Counting it here is what stops the executor from starting one more
-	// round that could only re-check and report.
-	spent := documentCorrectionRoundsSpent(sctx)
-	if correction.Applied {
-		spent++
+	next := nextDocumentCorrectionBudget(sctx, correction)
+	autoFixable := documentCorrectionEnabled(sctx) && next.Allowed && len(correctable) > 0
+	if gating > 0 && documentCorrectionEnabled(sctx) && !next.Allowed {
+		docFindings = refuseFurtherDocumentCorrection(docFindings, next.Reason)
+		sctx.Log(fmt.Sprintf("document correction budget spent: %s; a fix response will not edit anything, so the gate relabels auto-fix findings ask-user", next.Reason))
 	}
-	autoFixable := documentCorrectionEnabled(sctx) &&
-		spent < maxDocumentCorrectionRounds &&
-		len(correctable) > 0
 
 	findingsJSON := mustMarshalFindings(docFindings)
 

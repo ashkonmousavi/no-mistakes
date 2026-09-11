@@ -523,6 +523,21 @@ func PushWithOptions(ctx context.Context, dir, remote, ref, expectedSHA string, 
 }
 
 func pushSourceWithOptions(ctx context.Context, dir, remote, source, ref, expectedSHA string, forceWithLease bool, pushOptions []string) error {
+	// git's send-pack writes push options even when no ref needs updating
+	// (send-pack.c, unchanged from v2.43.0 through master), but receive-pack
+	// reads them only after a non-empty command list. On an up-to-date push it
+	// can therefore exit while send-pack is still writing, and git push dies of
+	// SIGPIPE ("signal: broken pipe") - a scheduling race that surfaced as a
+	// macOS-only CI failure. A push whose remote ref already names the source
+	// commit updates nothing and runs no hook, so its options can reach no one:
+	// skipping it returns exactly what a surviving no-op push returns, as if the
+	// push ran at the moment of the check. Force-with-lease is left to git,
+	// because its lease can still reject a push that would otherwise be a no-op.
+	if len(pushOptions) > 0 && !forceWithLease {
+		if upToDate, err := remoteRefNamesSource(ctx, dir, remote, source, ref); err == nil && upToDate {
+			return nil
+		}
+	}
 	args := []string{"push"}
 	for _, option := range pushOptions {
 		args = append(args, "-o", option)
@@ -538,6 +553,27 @@ func pushSourceWithOptions(ctx context.Context, dir, remote, source, ref, expect
 	args = append(args, source+":"+ref)
 	_, err := Run(ctx, dir, args...)
 	return err
+}
+
+// remoteRefNamesSource reports whether remote's ref already names the commit
+// source resolves to in dir, which is exactly when a push of source to ref has
+// nothing to update. It matches the ref name exactly, because ls-remote's
+// pattern also matches longer refs that merely end in the same path.
+func remoteRefNamesSource(ctx context.Context, dir, remote, source, ref string) (bool, error) {
+	local, err := Run(ctx, dir, "rev-parse", "--verify", source+"^{commit}")
+	if err != nil {
+		return false, err
+	}
+	out, err := Run(ctx, dir, "ls-remote", remote, ref)
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if fields := strings.Fields(line); len(fields) == 2 && fields[1] == ref {
+			return fields[0] == local, nil
+		}
+	}
+	return false, nil
 }
 
 // LsRemote returns the SHA of a ref on a remote. Returns empty string if the ref doesn't exist.
