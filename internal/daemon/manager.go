@@ -48,11 +48,20 @@ type RunManager struct {
 	dones        map[string]chan struct{}           // runID → closed when goroutine exits
 	wg           sync.WaitGroup                     // tracks background run goroutines
 	shuttingDown atomic.Bool                        // prevents new runs during shutdown
+	shutdownCtx  context.Context                    // cancels setup not yet owned by an executor
+	stopSetup    context.CancelFunc
 	db           *db.DB
 	paths        *paths.Paths
 	steps        StepFactory
 
 	branchLocks sync.Map // repoID+"/"+branch → *sync.Mutex
+	// worktreeLocks serializes Git worktree administration mutations for one
+	// bare gate repository. Pipelines on different branches still execute in
+	// parallel; only their short worktree add/remove operations are ordered.
+	worktreeLocks         sync.Map // repoID → chan struct{}
+	worktreeAdd           func(context.Context, string, string, string) error
+	worktreeRemove        func(context.Context, string, string) error
+	worktreeRemoveTimeout time.Duration
 
 	// evalCaptureMu serializes automatic eval collection. Concurrent runs
 	// finishing together would otherwise write the same per-repository object
@@ -83,16 +92,22 @@ func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory) *Ru
 	if stepFactory == nil {
 		stepFactory = func() []pipeline.Step { return steps.AllSteps() }
 	}
+	shutdownCtx, stopSetup := context.WithCancel(context.Background())
 	return &RunManager{
-		executors:     make(map[string]*pipeline.Executor),
-		cancels:       make(map[string]context.CancelCauseFunc),
-		dones:         make(map[string]chan struct{}),
-		db:            database,
-		paths:         p,
-		steps:         stepFactory,
-		subscribers:   make(map[string][]*eventMailbox),
-		stateRevs:     make(map[string]int64),
-		completedRuns: make(map[string]bool),
+		executors:             make(map[string]*pipeline.Executor),
+		cancels:               make(map[string]context.CancelCauseFunc),
+		dones:                 make(map[string]chan struct{}),
+		shutdownCtx:           shutdownCtx,
+		stopSetup:             stopSetup,
+		db:                    database,
+		paths:                 p,
+		steps:                 stepFactory,
+		worktreeAdd:           git.WorktreeAdd,
+		worktreeRemove:        git.WorktreeRemove,
+		worktreeRemoveTimeout: 30 * time.Second,
+		subscribers:           make(map[string][]*eventMailbox),
+		stateRevs:             make(map[string]int64),
+		completedRuns:         make(map[string]bool),
 	}
 }
 
@@ -629,9 +644,32 @@ func (m *RunManager) removeRunWorktree(repoID, runID, gateDir, wtDir, reason str
 		slog.Warn("preserving run worktree", "run_id", runID, "path", wtDir, "reason", refusal)
 		return
 	}
-	if err := git.WorktreeRemove(context.Background(), gateDir, wtDir); err != nil {
+	removeCtx, cancel := context.WithTimeout(context.Background(), m.worktreeRemoveTimeout)
+	defer cancel()
+	if err := m.withGateWorktreeLock(removeCtx, repoID, func() error {
+		return m.worktreeRemove(removeCtx, gateDir, wtDir)
+	}); err != nil {
 		slog.Warn("failed to remove run worktree", "reason", reason, "run_id", runID, "path", wtDir, "error", err)
 	}
+}
+
+// withGateWorktreeLock keeps mutations of one gate's shared worktrees
+// administration directory from overlapping. A run's terminal DB status is
+// visible before its goroutine performs deferred cleanup, so a successor can
+// otherwise start while removal of the last prior worktree deletes the shared
+// directory Git is concurrently using for the new worktree.
+func (m *RunManager) withGateWorktreeLock(ctx context.Context, repoID string, action func() error) error {
+	candidate := make(chan struct{}, 1)
+	candidate <- struct{}{}
+	lockVal, _ := m.worktreeLocks.LoadOrStore(repoID, candidate)
+	gate := lockVal.(chan struct{})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gate:
+	}
+	defer func() { gate <- struct{}{} }()
+	return action()
 }
 
 // closeSubscribers soft-closes every subscriber for a run and marks the run
@@ -1192,6 +1230,12 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		trackStartFailure("daemon_shutdown")
 		return "", fmt.Errorf("daemon is shutting down")
 	}
+	ctx, cancelSetup := context.WithCancel(ctx)
+	stopShutdownPropagation := context.AfterFunc(m.shutdownCtx, cancelSetup)
+	defer func() {
+		stopShutdownPropagation()
+		cancelSetup()
+	}()
 
 	// Best-effort only: a clone's remotes may change after init. Refresh the
 	// registered URLs before constructing any run-owned Git operation, but keep
@@ -1271,7 +1315,9 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		trackStartFailure("record_worktree_placement")
 		return "", fmt.Errorf("record worktree placement: %w", err)
 	}
-	if err := git.WorktreeAdd(ctx, gateDir, wtDir, headSHA); err != nil {
+	if err := m.withGateWorktreeLock(ctx, repo.ID, func() error {
+		return m.worktreeAdd(ctx, gateDir, wtDir, headSHA)
+	}); err != nil {
 		m.db.UpdateRunError(run.ID, fmt.Sprintf("create worktree: %s", err))
 		trackStartFailure("create_worktree")
 		return "", fmt.Errorf("create worktree: %w", err)
@@ -1421,16 +1467,23 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 	// Track executor.
 	done := make(chan struct{})
 	m.mu.Lock()
+	if m.shuttingDown.Load() {
+		m.mu.Unlock()
+		cancel(nil)
+		_ = ag.Close()
+		trackStartFailure("daemon_shutdown")
+		return "", fmt.Errorf("daemon is shutting down")
+	}
 	m.executors[run.ID] = executor
 	m.cancels[run.ID] = cancel
 	m.dones[run.ID] = done
+	m.wg.Add(1)
 	m.mu.Unlock()
 
 	// Background goroutine now owns worktree cleanup.
 	bgOwnsWorktree = true
 
 	// Launch pipeline in background.
-	m.wg.Add(1)
 	go func() {
 		startedAt := time.Now()
 		defer m.wg.Done()
@@ -1722,9 +1775,9 @@ func (m *RunManager) HandleRespondWithOverrides(runID string, step types.StepNam
 // Shutdown cancels all active runs. Called during daemon shutdown to prevent
 // orphaned goroutines from continuing agent calls and git operations.
 func (m *RunManager) Shutdown() {
-	m.shuttingDown.Store(true)
-
 	m.mu.Lock()
+	m.shuttingDown.Store(true)
+	m.stopSetup()
 	cancels := make(map[string]context.CancelCauseFunc, len(m.cancels))
 	for id, cancel := range m.cancels {
 		cancels[id] = cancel
