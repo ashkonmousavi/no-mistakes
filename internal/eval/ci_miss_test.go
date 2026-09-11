@@ -257,6 +257,54 @@ func TestCIFalseNegativesFromRun_IncludesFindingAfterRepairWasRereviewed(t *test
 	}
 }
 
+func TestCIFalseNegativesFromRun_ExcludesFindingAfterApprovedNonGreenRereview(t *testing.T) {
+	ctx := context.Background()
+	_, sourceDB, run, _ := setupRunWithGreenReviewAndCI(t, ctx, "", "")
+	defer sourceDB.Close()
+
+	steps, err := sourceDB.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewStep := steps[0]
+	ciStep := steps[len(steps)-1]
+	if _, err := sourceDB.InsertStepRoundWithRepair(ciStep.ID, 2, "auto_fix", nil, nil, true, 40); err != nil {
+		t.Fatal(err)
+	}
+	nonGreen := `{"findings":[{"id":"review-1","severity":"warning","action":"ask-user","description":"operator-approved concern"}]}`
+	if _, err := sourceDB.InsertReviewStepRound(reviewStep.ID, 3, "final_head_rereview", &nonGreen, nil, "first-repaired-head", 20); err != nil {
+		t.Fatal(err)
+	}
+	postReview := `{"findings":[{"id":"ci-1","severity":"error","action":"auto-fix","category":"ci-check","check":"post-review-test","check_id":"gh:post-review:1","description":"approved repair still fails a CI check"}]}`
+	third, err := sourceDB.InsertStepRound(ciStep.ID, 3, "initial", &postReview, nil, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := `["ci-1"]`
+	if err := sourceDB.SetStepRoundSelection(third.ID, &selected, db.RoundSelectionSourceAutoFix); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceDB.InsertStepRoundWithRepair(ciStep.ID, 4, "auto_fix", nil, nil, true, 40); err != nil {
+		t.Fatal(err)
+	}
+	clean := `{"findings":[],"risk_level":"low","risk_rationale":"clean","risk_scope":"source-or-external"}`
+	if _, err := sourceDB.InsertReviewStepRound(reviewStep.ID, 4, "final_head_rereview", &clean, nil, "second-repaired-head", 20); err != nil {
+		t.Fatal(err)
+	}
+	finalCI := `{"findings":[]}`
+	if _, err := sourceDB.InsertStepRound(ciStep.ID, 5, "initial", &finalCI, nil, 30); err != nil {
+		t.Fatal(err)
+	}
+
+	gold, err := CIFalseNegativesFromRun(sourceDB, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gold) != 0 {
+		t.Fatalf("gold = %#v, want none from a head whose Review was non-green", gold)
+	}
+}
+
 func TestCIFalseNegativesFromRun_IngestsPublishedRepairWithEmptySummary(t *testing.T) {
 	ctx := context.Background()
 	_, sourceDB, run, _ := setupRunWithCIRepairEvidence(t, ctx, `["ci-2"]`, "", true, "", true, false)

@@ -141,7 +141,10 @@ func ciReviewMissCandidates(rounds, reviewRounds []*db.StepRound) map[string]boo
 	reviewIndex := 0
 	for _, round := range rounds {
 		for reviewIndex < len(reviewRounds) && reviewRounds[reviewIndex].ID < round.ID {
-			reviewed = reviewRounds[reviewIndex].ReviewedHeadSHA != nil && strings.TrimSpace(*reviewRounds[reviewIndex].ReviewedHeadSHA) != ""
+			reviewRound := reviewRounds[reviewIndex]
+			reviewed = reviewRound.ReviewedHeadSHA != nil &&
+				strings.TrimSpace(*reviewRound.ReviewedHeadSHA) != "" &&
+				reviewRound.FindingsJSON != nil && reviewPassedGreen(*reviewRound.FindingsJSON)
 			reviewIndex++
 		}
 		if round.RepairPublished {
