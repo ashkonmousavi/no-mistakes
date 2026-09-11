@@ -286,6 +286,64 @@ func TestPushWithOptionsForwardsPushOptions(t *testing.T) {
 	}
 }
 
+// TestPushWithOptionsNeverStartsANoOpPushButStillDeliversRealUpdates pins the
+// fix for a CI-only "signal: broken pipe" from git push. git's send-pack writes
+// the push options even when no ref needs updating, but receive-pack reads them
+// only after a non-empty command list, so on an up-to-date push it can exit
+// while send-pack is still writing and send-pack dies of SIGPIPE. A push whose
+// remote ref already names the source commit updates nothing and runs no hook,
+// so it must not start receive-pack at all; a real update must still push and
+// still deliver its options.
+func TestPushWithOptionsNeverStartsANoOpPushButStillDeliversRealUpdates(t *testing.T) {
+	ctx := context.Background()
+	src := initTestRepo(t)
+	bare := filepath.Join(t.TempDir(), "dest.git")
+	if err := InitBare(ctx, bare); err != nil {
+		t.Fatal(err)
+	}
+	run(t, bare, "git", "config", "receive.advertisePushOptions", "true")
+	run(t, src, "git", "remote", "add", "dest", bare)
+	run(t, src, "git", "push", "dest", "HEAD:refs/heads/main")
+
+	started := filepath.Join(t.TempDir(), "receive-pack-started.txt")
+	run(t, src, "git", "config", "remote.dest.receivepack", "echo started >> "+shellSingleQuote(started)+"; git receive-pack")
+	marker := filepath.Join(t.TempDir(), "push-options.txt")
+	hook := "#!/bin/sh\nprintf '%s:%s\n' \"$GIT_PUSH_OPTION_COUNT\" \"$GIT_PUSH_OPTION_0\" > " + shellSingleQuote(marker) + "\n"
+	if err := os.WriteFile(filepath.Join(bare, "hooks", "post-receive"), []byte(hook), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	upToDate := run(t, src, "git", "rev-parse", "HEAD")
+	if err := PushWithOptions(ctx, src, "dest", "refs/heads/main", "", false, []string{"no-mistakes.intent=eA=="}); err != nil {
+		t.Fatalf("no-op PushWithOptions failed: %v", err)
+	}
+	if _, err := os.Stat(started); err == nil {
+		t.Fatal("a push whose remote ref already names the source commit started receive-pack; its push options can race receive-pack's exit and kill git push with SIGPIPE")
+	}
+	if got := run(t, bare, "git", "rev-parse", "refs/heads/main"); got != upToDate {
+		t.Fatalf("remote main = %s, want it left at %s", got, upToDate)
+	}
+
+	run(t, src, "git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "real update")
+	advanced := run(t, src, "git", "rev-parse", "HEAD")
+	if err := PushWithOptions(ctx, src, "dest", "refs/heads/main", "", false, []string{"no-mistakes.intent=eA=="}); err != nil {
+		t.Fatalf("PushWithOptions of a real update failed: %v", err)
+	}
+	if _, err := os.Stat(started); err != nil {
+		t.Fatal("a real update never started receive-pack")
+	}
+	if got := run(t, bare, "git", "rev-parse", "refs/heads/main"); got != advanced {
+		t.Fatalf("remote main = %s, want the pushed update %s", got, advanced)
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.TrimSpace(string(data)), "1:no-mistakes.intent=eA=="; got != want {
+		t.Fatalf("push options marker = %q, want the real update's options delivered", got)
+	}
+}
+
 func TestPushForceWithLease(t *testing.T) {
 	ctx := context.Background()
 	src := initTestRepo(t)
