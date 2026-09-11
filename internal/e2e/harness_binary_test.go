@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -41,13 +42,17 @@ func TestSuppliedNoMistakesBinary(t *testing.T) {
 		assertSuppliedBinaryRejected(t, "must be an absolute path")
 	})
 
-	t.Run("rejects_non_executable_file", func(t *testing.T) {
+	t.Run("applies_host_executable_rules", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "not-executable")
 		if err := os.WriteFile(path, []byte("not a binary\n"), 0o644); err != nil {
 			t.Fatalf("write non-executable fixture: %v", err)
 		}
 		t.Setenv(e2eNoMistakesBinEnv, path)
-		assertSuppliedBinaryRejected(t, "not executable")
+		if runtime.GOOS == "windows" {
+			assertSuppliedBinaryRejected(t, "with --version")
+		} else {
+			assertSuppliedBinaryRejected(t, "not executable")
+		}
 	})
 
 	t.Run("rejects_wrong_executable", func(t *testing.T) {

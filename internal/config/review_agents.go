@@ -16,30 +16,43 @@ type ReviewAgent struct {
 	Effort agentcfg.Effort `yaml:"effort"`
 }
 
-func validateReviewAgents(roles map[string]ReviewAgent) error {
+func normalizeReviewAgent(entry ReviewAgent) ReviewAgent {
+	entry.Model = strings.TrimSpace(entry.Model)
+	entry.Effort = agentcfg.Effort(strings.TrimSpace(string(entry.Effort)))
+	return entry
+}
+
+func parseReviewAgents(roles map[string]ReviewAgent) (map[string]ReviewAgent, error) {
+	if roles == nil {
+		return nil, nil
+	}
+	normalized := make(map[string]ReviewAgent, len(roles))
 	for role, entry := range roles {
 		if role != "reviewer" && role != "fixer" {
-			return fmt.Errorf("invalid review_agents role %q (valid: reviewer, fixer)", role)
+			return nil, fmt.Errorf("invalid review_agents role %q (valid: reviewer, fixer)", role)
 		}
+		entry = normalizeReviewAgent(entry)
 		if !agentcfg.Known(entry.Agent) {
-			return fmt.Errorf("review_agents.%s.agent must name an explicit harness, got %q", role, entry.Agent)
+			return nil, fmt.Errorf("review_agents.%s.agent must name an explicit harness, got %q", role, entry.Agent)
 		}
-		if err := agentcfg.Validate(entry.Agent, agentcfg.Profile{Model: strings.TrimSpace(entry.Model), Effort: entry.Effort}); err != nil {
-			return fmt.Errorf("invalid review_agents.%s: %w", role, err)
+		if err := agentcfg.Validate(entry.Agent, agentcfg.Profile{Model: entry.Model, Effort: entry.Effort}); err != nil {
+			return nil, fmt.Errorf("invalid review_agents.%s: %w", role, err)
 		}
+		normalized[role] = entry
 	}
-	return nil
+	return normalized, nil
 }
 
 // ForReviewAgent returns an isolated configuration for a role without mutating
 // shared per-harness profiles (both roles may use the same harness).
 func (c *Config) ForReviewAgent(entry ReviewAgent) *Config {
+	entry = normalizeReviewAgent(entry)
 	role := *c
 	role.Agent = entry.Agent
 	role.Agents = []types.AgentName{entry.Agent}
 	profile := c.AgentProfileFor(entry.Agent)
 	if entry.Model != "" {
-		profile.Model = strings.TrimSpace(entry.Model)
+		profile.Model = entry.Model
 	}
 	if entry.Effort != "" {
 		profile.Effort = entry.Effort

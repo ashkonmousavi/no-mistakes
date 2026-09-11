@@ -17,8 +17,8 @@ import (
 
 // goldSourceCIFalseNegative marks false-negative gold auto-ingested from a CI
 // finding that a green Review missed and the pipeline then fixed in-run. Any
-// real code defect CI surfaces, that is confirmed and fixed, is by definition a
-// Review false negative: Review passed green and missed it.
+// real code defect CI surfaces on a reviewed head, that is confirmed and fixed,
+// is by definition a Review false negative: Review passed green and missed it.
 const goldSourceCIFalseNegative = "recorded-ci-false-negative"
 
 // isCIFalseNegativeCategory reports whether a CI finding category names a real
@@ -38,7 +38,7 @@ func isCIFalseNegativeCategory(category string) bool {
 
 // CIFalseNegativesFromRun reads a finished run's persisted CI findings and
 // returns false-negative gold for every ci-check / ci-review-bot finding the
-// run surfaced, confirmed, and fixed.
+// run surfaced on a reviewed head, confirmed, and fixed.
 //
 // The CI step already persists its structured findings on each round
 // (FindingsJSON), the IDs selected for repair (SelectedFindingIDs), and whether
@@ -71,14 +71,16 @@ func CIFalseNegativesFromRun(database *db.DB, runID string) ([]FindingGold, erro
 	if err != nil {
 		return nil, fmt.Errorf("read source steps: %w", err)
 	}
-	var ciStep *db.StepResult
+	var reviewStep, ciStep *db.StepResult
 	for _, step := range steps {
-		if step.StepName == types.StepCI {
+		switch step.StepName {
+		case types.StepReview:
+			reviewStep = step
+		case types.StepCI:
 			ciStep = step
-			break
 		}
 	}
-	if ciStep == nil || ciStep.Status != types.StepStatusCompleted {
+	if reviewStep == nil || ciStep == nil || ciStep.Status != types.StepStatusCompleted {
 		return nil, nil
 	}
 	if ciStep.OverrideReason != nil && strings.TrimSpace(*ciStep.OverrideReason) != "" {
@@ -88,6 +90,11 @@ func CIFalseNegativesFromRun(database *db.DB, runID string) ([]FindingGold, erro
 	if err != nil {
 		return nil, fmt.Errorf("read CI rounds: %w", err)
 	}
+	reviewRounds, err := database.GetRoundsByStep(reviewStep.ID)
+	if err != nil {
+		return nil, fmt.Errorf("read Review rounds: %w", err)
+	}
+	reviewMissCandidates := ciReviewMissCandidates(rounds, reviewRounds)
 	var gold []FindingGold
 	seen := map[string]bool{}
 	for i, round := range rounds {
@@ -109,6 +116,10 @@ func CIFalseNegativesFromRun(database *db.DB, runID string) ([]FindingGold, erro
 			if !isCIFalseNegativeCategory(finding.Category) {
 				continue
 			}
+			candidateID := ciFalseNegativeID(finding)
+			if !reviewMissCandidates[candidateID] {
+				continue
+			}
 			id := strings.TrimSpace(finding.ID)
 			if id == "" || !selected[id] {
 				continue
@@ -122,6 +133,34 @@ func CIFalseNegativesFromRun(database *db.DB, runID string) ([]FindingGold, erro
 		}
 	}
 	return gold, nil
+}
+
+func ciReviewMissCandidates(rounds, reviewRounds []*db.StepRound) map[string]bool {
+	candidates := map[string]bool{}
+	reviewed := false
+	reviewIndex := 0
+	for _, round := range rounds {
+		for reviewIndex < len(reviewRounds) && reviewRounds[reviewIndex].ID < round.ID {
+			reviewed = reviewRounds[reviewIndex].ReviewedHeadSHA != nil && strings.TrimSpace(*reviewRounds[reviewIndex].ReviewedHeadSHA) != ""
+			reviewIndex++
+		}
+		if round.RepairPublished {
+			reviewed = false
+		}
+		if !reviewed || round.FindingsJSON == nil {
+			continue
+		}
+		findings, err := types.ParseFindingsJSON(*round.FindingsJSON)
+		if err != nil {
+			continue
+		}
+		for _, finding := range findings.Items {
+			if isCIFalseNegativeCategory(finding.Category) {
+				candidates[ciFalseNegativeID(finding)] = true
+			}
+		}
+	}
+	return candidates
 }
 
 func repairLandedAfter(rounds []*db.StepRound, selectedIndex int) bool {

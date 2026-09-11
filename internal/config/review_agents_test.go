@@ -28,6 +28,31 @@ review_agents:
 	}
 }
 
+func TestReviewAgentsNormalizeProfilesBeforeAssignment(t *testing.T) {
+	global := writeGlobalConfig(t, `agent_config:
+  pi: {model: inherited-model, effort: high}
+review_agents:
+  reviewer: {agent: pi, model: "   ", effort: " max "}
+  fixer: {agent: pi, model: " fix-model ", effort: "   "}
+`)
+	cfg := Merge(global, &RepoConfig{})
+
+	reviewerEntry := cfg.ReviewAgents["reviewer"]
+	fixerEntry := cfg.ReviewAgents["fixer"]
+	if reviewerEntry.Model != "" || reviewerEntry.Effort != agentcfg.EffortMax {
+		t.Fatalf("normalized reviewer entry = %+v", reviewerEntry)
+	}
+	if fixerEntry.Model != "fix-model" || fixerEntry.Effort != "" {
+		t.Fatalf("normalized fixer entry = %+v", fixerEntry)
+	}
+	if got := cfg.ForReviewAgent(reviewerEntry).AgentProfile(); got != (agentcfg.Profile{Model: "inherited-model", Effort: agentcfg.EffortMax}) {
+		t.Fatalf("reviewer profile = %+v", got)
+	}
+	if got := cfg.ForReviewAgent(fixerEntry).AgentProfile(); got != (agentcfg.Profile{Model: "fix-model", Effort: agentcfg.EffortHigh}) {
+		t.Fatalf("fixer profile = %+v", got)
+	}
+}
+
 func TestReviewAgentsRejectInvalidConfig(t *testing.T) {
 	for _, input := range []string{
 		"review_agents: {other: {agent: pi}}",

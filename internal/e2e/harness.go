@@ -825,8 +825,8 @@ func buildTarget(repoRoot, output, pkg string) {
 
 // suppliedNoMistakesBinary validates the opt-in consumer binary before any
 // E2E daemon can execute it. An empty setting preserves the normal source-tree
-// build; a relative path, non-regular file, non-executable file, or executable
-// that is not no-mistakes fails closed rather than falling back to the checkout.
+// build; a relative path, non-regular file, file without required host execute
+// permissions, or executable that is not no-mistakes fails closed.
 func suppliedNoMistakesBinary() (string, error) {
 	path := strings.TrimSpace(os.Getenv(e2eNoMistakesBinEnv))
 	if path == "" {
@@ -842,7 +842,7 @@ func suppliedNoMistakesBinary() (string, error) {
 	if !info.Mode().IsRegular() {
 		return "", fmt.Errorf("verify %s %q: not a regular file", e2eNoMistakesBinEnv, path)
 	}
-	if info.Mode().Perm()&0o111 == 0 {
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o111 == 0 {
 		return "", fmt.Errorf("verify %s %q: not executable", e2eNoMistakesBinEnv, path)
 	}
 	cmd := exec.Command(path, "--version")

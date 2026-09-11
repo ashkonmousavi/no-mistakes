@@ -177,6 +177,86 @@ func TestCIFalseNegativesFromRun_ExcludesProviderInfrastructureFinding(t *testin
 	}
 }
 
+func TestCIFalseNegativesFromRun_ExcludesFindingIntroducedByUnreviewedCIRepair(t *testing.T) {
+	ctx := context.Background()
+	_, sourceDB, run, _ := setupRunWithGreenReviewAndCI(t, ctx, "", "")
+	defer sourceDB.Close()
+
+	steps, err := sourceDB.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciStep := steps[len(steps)-1]
+	rounds, err := sourceDB.GetRoundsByStep(ciStep.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectedInitial := `["ci-1"]`
+	if err := sourceDB.SetStepRoundSelection(rounds[0].ID, &selectedInitial, db.RoundSelectionSourceAutoFix); err != nil {
+		t.Fatal(err)
+	}
+	postRepair := `{"findings":[{"id":"ci-1","severity":"error","action":"auto-fix","category":"ci-check","check":"post-repair-test","check_id":"gh:post-repair:1","description":"CI repair introduced a new failing test"}]}`
+	second, err := sourceDB.InsertStepRoundWithRepair(ciStep.ID, 2, "auto_fix", &postRepair, nil, true, 40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectedPostRepair := `["ci-1"]`
+	if err := sourceDB.SetStepRoundSelection(second.ID, &selectedPostRepair, db.RoundSelectionSourceAutoFix); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceDB.InsertStepRoundWithRepair(ciStep.ID, 3, "auto_fix", nil, nil, true, 40); err != nil {
+		t.Fatal(err)
+	}
+
+	gold, err := CIFalseNegativesFromRun(sourceDB, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gold) != 1 || gold[0].Description != "CI check failing: build - provider reported failure" {
+		t.Fatalf("gold = %#v, want only the defect present on the reviewed head", gold)
+	}
+}
+
+func TestCIFalseNegativesFromRun_IncludesFindingAfterRepairWasRereviewed(t *testing.T) {
+	ctx := context.Background()
+	_, sourceDB, run, _ := setupRunWithGreenReviewAndCI(t, ctx, "", "")
+	defer sourceDB.Close()
+
+	steps, err := sourceDB.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewStep := steps[0]
+	ciStep := steps[len(steps)-1]
+	if _, err := sourceDB.InsertStepRoundWithRepair(ciStep.ID, 2, "auto_fix", nil, nil, true, 40); err != nil {
+		t.Fatal(err)
+	}
+	clean := `{"findings":[],"risk_level":"low","risk_rationale":"clean","risk_scope":"source-or-external"}`
+	if _, err := sourceDB.InsertReviewStepRound(reviewStep.ID, 3, "final_head_rereview", &clean, nil, "repaired-head", 20); err != nil {
+		t.Fatal(err)
+	}
+	postReview := `{"findings":[{"id":"ci-1","severity":"error","action":"auto-fix","category":"ci-check","check":"post-review-test","check_id":"gh:post-review:1","description":"reviewed repair still fails a CI check"}]}`
+	third, err := sourceDB.InsertStepRound(ciStep.ID, 3, "initial", &postReview, nil, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := `["ci-1"]`
+	if err := sourceDB.SetStepRoundSelection(third.ID, &selected, db.RoundSelectionSourceAutoFix); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceDB.InsertStepRoundWithRepair(ciStep.ID, 4, "auto_fix", nil, nil, true, 40); err != nil {
+		t.Fatal(err)
+	}
+
+	gold, err := CIFalseNegativesFromRun(sourceDB, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gold) != 1 || gold[0].Description != "reviewed repair still fails a CI check" {
+		t.Fatalf("gold = %#v, want the defect emitted after the repaired head was reviewed", gold)
+	}
+}
+
 func TestCIFalseNegativesFromRun_IngestsPublishedRepairWithEmptySummary(t *testing.T) {
 	ctx := context.Background()
 	_, sourceDB, run, _ := setupRunWithCIRepairEvidence(t, ctx, `["ci-2"]`, "", true, "", true, false)

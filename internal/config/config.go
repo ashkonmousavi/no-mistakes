@@ -2024,10 +2024,11 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 		}
 		cfg.AgentConfig = profiles
 	}
-	if err := validateReviewAgents(raw.ReviewAgents); err != nil {
+	reviewAgents, err := parseReviewAgents(raw.ReviewAgents)
+	if err != nil {
 		return nil, err
 	}
-	cfg.ReviewAgents = raw.ReviewAgents
+	cfg.ReviewAgents = reviewAgents
 	if raw.WorktreeRoots != nil {
 		if err := ValidateWorktreeRoots(raw.WorktreeRoots); err != nil {
 			return nil, err
