@@ -1,17 +1,23 @@
 # Contributing
 
-Thanks for wanting to contribute. One rule up front:
+Thanks for wanting to contribute.
 
-**All pull requests to this repository must be raised through `no-mistakes`.**
+Pull requests may be opened directly or through `no-mistakes`, according to the
+maintainer's current delivery route. In either case, preserve the branch's
+actual test, build, generated-source, and repository CI evidence.
 
-This repo _is_ no-mistakes. Contributions should be done using the tool itself, which reduces the maintainer's burden of reviewing and merging contributions.
-The `Require no-mistakes` GitHub Actions workflow runs on every PR and fails if the body is missing the deterministic signature and structured pipeline step attestation that no-mistakes writes. PRs without them will not be reviewed or merged.
-If you revise the PR description after no-mistakes creates it, preserve the generated `## Pipeline` section. Replacing the whole body removes the signature or attestation and makes the required check fail until no-mistakes writes the section again.
+This repository retains the reusable `require-no-mistakes` composite action for
+downstream repositories that deliberately choose that policy, but it does not
+self-enforce an automatic no-mistakes review or attestation workflow. If a PR
+was created by no-mistakes, keep its generated `## Pipeline` section intact so
+the body remains an honest record of that run; do not fabricate one for a
+direct PR.
 
-Every `opened` or `edited` event gets an independent run, including first-time-fork runs that become actionable through GitHub's normal approval process. The integration contract for consumers such as Wheelhouse is:
+The integration contract for downstream consumers such as Wheelhouse that do
+enable the reusable action is:
 
 - The stable check name is `PR must be raised via no-mistakes`.
-- The reusable check implementation is the shared composite action in [`.github/actions/require-no-mistakes`](.github/actions/require-no-mistakes/README.md). Consumers pin it to a release tag or commit SHA rather than copying the enforcement shell. This repository uses the same action through a thin workflow caller.
+- The reusable check implementation is the shared composite action in [`.github/actions/require-no-mistakes`](.github/actions/require-no-mistakes/README.md). Consumers pin it to a release tag or commit SHA rather than copying the enforcement shell.
 - The workflow run's `display_title` identifies the PR number, event action, `run_number`, and immutable `run_id`. For a PR, increasing `run_number` orders distinct events; a re-run retains that event identity and increments `run_attempt`.
 - The run's `head_sha` binds the evidence to the reviewed commit. After the latest `opened` or `edited` run reaches `status: completed`, `conclusion: success` means that event's body contained the signature and a parseable v1 pipeline attestation whose `head_sha` matches `github.event.pull_request.head.sha` and whose `review`, `test`, and `document` steps are `completed`. `conclusion: failure` means it did not. `action_required` or `cancelled` is not compliance evidence and must be handled conservatively.
 - Fork runs stay on the `pull_request` boundary with read-only contents permission, no repository secrets, and no checkout or execution of fork code. Approval permits only this body check; it does not grant write authority.
@@ -20,16 +26,16 @@ Every `opened` or `edited` event gets an independent run, including first-time-f
 
 1. Fork the repo, then clone the parent repo or set your local `origin` back to the parent repo (`git@github.com:kunchenguid/no-mistakes.git`).
 2. Create a branch and make your changes.
-3. Initialize or refresh the gate with your fork as the push target: `no-mistakes init --fork-url git@github.com:<you>/no-mistakes.git`.
+3. When the selected delivery route uses no-mistakes, initialize or refresh the gate with your fork as the push target: `no-mistakes init --fork-url git@github.com:<you>/no-mistakes.git`.
 4. Commit your changes.
-5. Push through the gate instead of pushing to `origin`:
+5. For a no-mistakes delivery, push through the gate instead of pushing to `origin`:
 
    ```sh
    git push no-mistakes
    ```
 
-6. Run `no-mistakes` to attach to the pipeline, watch findings, and auto-fix or review as needed.
-7. Once the pipeline passes, it pushes the branch to your fork and opens the PR against the parent repo for you.
+6. Follow the selected review route. When no-mistakes is authorized, run it to attach to the pipeline and handle its findings. Otherwise use the maintainer-approved direct-PR route and do not manufacture pipeline evidence.
+7. Publish to your fork and open the PR against the parent repository. Require the real repository checks at that exact head before merge.
 
 See the [quick start](https://kunchenguid.github.io/no-mistakes/start-here/quick-start/) for the full first-run walkthrough.
 
