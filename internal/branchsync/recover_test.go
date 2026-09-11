@@ -2195,7 +2195,196 @@ func (f *recoverFixture) localAnchorRef() string {
 	return "refs/no-mistakes/recover-local/" + f.run.ID
 }
 
-// TestRecoverRebasedPreservedHeadAdoptsWithoutEscalating is the regression for
+// newRebasedRecoverFixtureGateBehind reproduces the exact shape in G3
+// evidence-supplement C7.8 (row C7.8, executions/c7-execution.log): a
+// pipeline rebase moves the preserved head, and terminalization anchors it in
+// the gate under the run-specific recovery ref rather than by pushing -
+// refs/heads/feature/recover in the gate never advances past the submitted
+// head, because no push step ever ran before the run went terminal. This
+// differs from newRebasedRecoverFixture, whose pipeline clone force-pushes
+// the rebased head straight onto the gate branch and so never exhibits the
+// gap.
+func newRebasedRecoverFixtureGateBehind(t *testing.T, status types.RunStatus) *recoverFixture {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "upstream.git")
+	mustRun(t, root, "init", "--bare", remote)
+
+	local := filepath.Join(root, "operator")
+	mustRun(t, root, "init", "-b", "main", local)
+	configureIdentity(t, local)
+	mustWrite(t, filepath.Join(local, "file.txt"), "base\n")
+	mustRun(t, local, "add", "file.txt")
+	mustRun(t, local, "commit", "-m", "base")
+	base := mustRun(t, local, "rev-parse", "HEAD")
+
+	mustRun(t, local, "checkout", "-b", "feature/recover")
+	mustWrite(t, filepath.Join(local, "feature.txt"), "feature one\n")
+	mustRun(t, local, "add", "feature.txt")
+	mustRun(t, local, "commit", "-m", "feature one")
+	mustWrite(t, filepath.Join(local, "feature.txt"), "feature one\nfeature two\n")
+	mustRun(t, local, "commit", "-am", "feature two")
+	submitted := mustRun(t, local, "rev-parse", "HEAD")
+
+	// The default branch advances after submission; that is what makes the
+	// pipeline rebase produce new SHAs for the same logical commits.
+	mustRun(t, local, "checkout", "main")
+	mustWrite(t, filepath.Join(local, "upstream.txt"), "upstream advance\n")
+	mustRun(t, local, "add", "upstream.txt")
+	mustRun(t, local, "commit", "-m", "upstream advance")
+	mustRun(t, local, "checkout", "feature/recover")
+
+	gate := filepath.Join(root, "gate.git")
+	mustRun(t, root, "init", "--bare", gate)
+	mustRun(t, local, "push", gate, "refs/heads/main:refs/heads/main", "refs/heads/feature/recover:refs/heads/feature/recover")
+
+	pipeline := filepath.Join(root, "pipeline")
+	mustRun(t, root, "-c", "core.autocrlf=false", "clone", gate, pipeline)
+	configureIdentity(t, pipeline)
+	mustRun(t, pipeline, "checkout", "feature/recover")
+	mustRun(t, pipeline, "rebase", "origin/main")
+	preserved := mustRun(t, pipeline, "rev-parse", "HEAD")
+
+	database, err := db.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	repo, err := database.InsertRepo(local, remote, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := database.InsertRun(repo.ID, "feature/recover", submitted, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Terminalization anchors the rebased head under the run-specific
+	// recovery ref; unlike newRebasedRecoverFixture, the gate's own branch
+	// ref is never force-pushed and so stays exactly at the submitted head.
+	mustRun(t, pipeline, "push", "origin", preserved+":"+custody.RecoveryRef(run.ID))
+	if err := database.UpdateRunHeadSHA(run.ID, preserved); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunStatusWithVerifiedHead(run.ID, status, preserved); err != nil {
+		t.Fatal(err)
+	}
+	run, _ = database.GetRun(run.ID)
+	return &recoverFixture{
+		t: t, ctx: ctx, db: database, repo: repo, run: run,
+		service: &Service{DB: database, Repo: repo, WorkDir: local, GateDir: gate},
+		local:   local, gate: gate, remote: remote,
+		base: base, submitted: submitted, preserved: preserved,
+	}
+}
+
+// TestRecoverRebasedPreservedHeadSettlesGateBranchForFreshRun is the
+// regression for G3 evidence-supplement C7.8: after a pipeline-moved head,
+// plain `axi sync --recover` (no --keep-local) must settle the gate's own
+// branch ref to the adopted preserved head, atomically, so the very next
+// follow-up commit's fresh run can push without a raw Git non-fast-forward.
+// It independently proves recovery no longer leaves the gate ref behind the
+// branch it just recovered.
+func TestRecoverRebasedPreservedHeadSettlesGateBranchForFreshRun(t *testing.T) {
+	t.Parallel()
+
+	f := newRebasedRecoverFixtureGateBehind(t, types.RunCancelled)
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.submitted {
+		t.Fatalf("fixture gate branch = %s, want submitted %s before recovery", got, f.submitted)
+	}
+
+	state := f.service.Recover(f.ctx, false)
+	if !state.Recovered || !state.Changed {
+		t.Fatalf("recovery did not adopt the preserved head: %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("HEAD = %s, want preserved %s", got, f.preserved)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+		t.Fatalf("gate branch = %s, want it settled to the adopted head %s", got, f.preserved)
+	}
+	if !f.custodyReturned() {
+		t.Fatal("custody not stamped")
+	}
+
+	// The exact downstream failure the evidence names: a follow-up commit's
+	// fresh run must push cleanly to the gate, not hit a raw non-fast-forward.
+	mustWrite(t, filepath.Join(f.local, "followup.txt"), "follow-up\n")
+	mustRun(t, f.local, "add", "followup.txt")
+	mustRun(t, f.local, "commit", "-m", "follow-up commit")
+	if _, err := gitpkg.Run(f.ctx, f.local, "push", f.gate, "refs/heads/feature/recover:refs/heads/feature/recover"); err != nil {
+		t.Fatalf("fresh push after recovery was rejected: %v", err)
+	}
+}
+
+// TestRecoverRebasedPreservedHeadRefusesConcurrentGateBranchMove is the
+// concurrency counterpart the correction explicitly asked for: if the gate
+// branch moves away from its observed pre-settle value between observation
+// and the settling compare-and-swap, recovery must refuse with a structured,
+// re-run-able next action instead of clobbering whatever now sits there. The
+// local branch and worktree, already moved to the preserved head, are left
+// exactly as they are; only the gate settlement and the custody stamp are
+// withheld.
+func TestRecoverRebasedPreservedHeadRefusesConcurrentGateBranchMove(t *testing.T) {
+	t.Parallel()
+
+	f := newRebasedRecoverFixtureGateBehind(t, types.RunCancelled)
+	tree := mustRun(t, f.gate, "rev-parse", f.submitted+"^{tree}")
+	racingHead := mustRun(t, f.gate, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", "-m", "concurrent gate push", "-p", f.submitted, tree)
+	f.service.beforeGateReset = func() {
+		mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", racingHead, f.submitted)
+	}
+
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered || state.Changed {
+		t.Fatalf("recovery raced a concurrent gate branch move: %#v", state)
+	}
+	if state.Safety != "blocked_recover_gate_race" {
+		t.Fatalf("concurrent-gate-move refusal = %s", state.Safety)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("HEAD = %s, want the already-adopted preserved head %s left in place", got, f.preserved)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != racingHead {
+		t.Fatalf("gate branch = %s, want the concurrent push %s left untouched", got, racingHead)
+	}
+	if f.custodyReturned() {
+		t.Fatal("raced settlement stamped custody")
+	}
+}
+
+// TestRecoverRebasedPreservedHeadRefusesDivergedGateBranch proves recovery
+// never overwrites a gate branch that moved onto its own independent commit
+// before recovery ran at all (not a mid-call race, and not the submitted
+// head the run itself left behind): another run or an operator could have
+// pushed there after this run went terminal, and settleGateBranchToAdoptedHead
+// must not silently detach that commit from the branch ref.
+func TestRecoverRebasedPreservedHeadRefusesDivergedGateBranch(t *testing.T) {
+	t.Parallel()
+
+	f := newRebasedRecoverFixtureGateBehind(t, types.RunCancelled)
+	tree := mustRun(t, f.gate, "rev-parse", f.submitted+"^{tree}")
+	divergedHead := mustRun(t, f.gate, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", "-m", "independent gate push", "-p", f.submitted, tree)
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", divergedHead, f.submitted)
+
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered || state.Changed {
+		t.Fatalf("recovery overwrote a diverged gate branch: %#v", state)
+	}
+	if state.Safety != "blocked_recover_gate_diverged" {
+		t.Fatalf("diverged-gate-branch refusal = %s", state.Safety)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("HEAD = %s, want the already-adopted preserved head %s left in place", got, f.preserved)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != divergedHead {
+		t.Fatalf("gate branch = %s, want the independent push %s left untouched", got, divergedHead)
+	}
+	if f.custodyReturned() {
+		t.Fatal("diverged gate branch overwrite stamped custody")
+	}
+}
+
 // the over-escalating custody return: a cancelled validation whose preserved
 // pipeline head is the operator's own work rebased onto a newer base loses
 // nothing by adopting it, so recovery must succeed instead of refusing as

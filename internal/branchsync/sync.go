@@ -589,14 +589,16 @@ func (s *Service) BindRecoveryArchive(ctx context.Context, archiveRef string) St
 //	relation   worktree  default                        --keep-local
 //	equal      any       anchor locally; return custody same
 //	ahead      any       anchor locally; return custody same
-//	behind     clean     strict fast-forward to P,      custody at local head;
-//	                     then return custody            gate reset to it (CAS)
+//	behind     clean     strict fast-forward to P, then  custody at local head;
+//	                     settle the gate branch to P     gate reset to it (CAS)
+//	                     (CAS); return custody
 //	behind     dirty     refuse (commit/stash first)    custody at local head;
 //	                                                    gate reset to it (CAS)
 //	diverged,  clean     anchor the pre-recovery local  custody at local head;
-//	P contains           head, then move to P with      gate reset to it (CAS)
-//	all local            fail-closed ops; return custody
-//	work
+//	P contains           head, move to P with           gate reset to it (CAS)
+//	all local            fail-closed ops, settle the
+//	work                 gate branch to P (CAS); return
+//	                     custody
 //	diverged,  dirty     refuse (commit/stash first)    custody at local head;
 //	P contains                                          gate reset to it (CAS)
 //	all local
@@ -617,6 +619,23 @@ func (s *Service) BindRecoveryArchive(ctx context.Context, archiveRef string) St
 // No-data-loss outranks convenience here: when nothing can distinguish a
 // deliberate pipeline fix from a dropped change, the operator decides.
 //
+// That same rebase is exactly what can leave the gate's own branch ref behind
+// P: terminalization anchors an unpublished pipeline head under its
+// run-specific recovery ref rather than by pushing it, so the gate branch can
+// still sit at the pre-recovery submitted head even once the local branch
+// reaches P. Left alone, the very first follow-up commit's fresh run would
+// then hit a raw non-fast-forward push against that stale gate branch (G3
+// evidence-supplement C7.8). So the two mutating rows - the clean
+// fast-forward and the containment-proven adoption - settle the gate branch
+// to P with the same guarded compare-and-swap --keep-local already uses for
+// its own kept head, before custody is stamped: a gate branch already at or
+// ahead of P (it advanced independently, not because it lagged) is left
+// untouched, and a concurrent gate push that changes the gate branch out from
+// under the swap makes settlement refuse and re-runnable rather than
+// clobbering it. The equal/ahead rows never mutate the worktree and still
+// need no gate access at all, so their gate branch ref may independently lag
+// or advance uninspected.
+//
 // Fail-safe rules, in the same spirit as Refresh/Apply:
 //   - An active run always refuses: only terminal runs are recoverable.
 //   - The preserved commits must be provably safe before custody moves: when
@@ -626,11 +645,18 @@ func (s *Service) BindRecoveryArchive(ctx context.Context, archiveRef string) St
 //     gate is available; otherwise the preserved head is verified through the
 //     gate's run-specific recovery ref and fetched into that anchor. Legacy terminal
 //     heads that still exist as unreferenced gate objects are anchored before
-//     recovery continues. The branch ref may independently lag or advance.
+//     recovery continues. For the equal/ahead rows, which never mutate
+//     anything, the gate branch ref may independently lag or advance
+//     uninspected.
 //   - The only possible worktree mutation is a guarded move of a clean checked-out
 //     branch: a strict fast-forward, or an anchored move to a proven-containing
 //     head performed by Git operations that refuse on their own rather than by a
-//     preceding observation (see recoverAdoptPreserved). When the operator explicitly keeps a behind or diverged local
+//     preceding observation (see recoverAdoptPreserved). Either mutating move is
+//     followed by settleGateBranchToAdoptedHead, which brings the gate's own
+//     branch ref to that same adopted head with the identical guarded
+//     compare-and-swap --keep-local already uses for its kept head, so the
+//     first fresh run after recovery pushes cleanly instead of racing a stale
+//     gate branch. When the operator explicitly keeps a behind or diverged local
 //     head instead of taking P, --keep-local never touches the worktree and moves
 //     the gate branch to the kept head with an atomic compare-and-swap, so a
 //     concurrent gate push wins and recovery refuses. An independently moved
@@ -1094,6 +1120,9 @@ func (s *Service) recoverFastForward(ctx context.Context, run *db.Run, state Sta
 		state.NextAction = &NextAction{Code: "inspect_worktree", Command: "git status"}
 		return state
 	}
+	if blocked, ok := s.settleGateBranchToAdoptedHead(ctx, state, run, finalHead); !ok {
+		return blocked
+	}
 	return s.finishRecover(ctx, run, true)
 }
 
@@ -1256,6 +1285,9 @@ func (s *Service) recoverAdoptPreserved(ctx context.Context, run *db.Run, state 
 		state.NextAction = &NextAction{Code: "inspect_worktree", Command: "git status"}
 		return state
 	}
+	if blocked, ok := s.settleGateBranchToAdoptedHead(ctx, state, run, finalHead); !ok {
+		return blocked
+	}
 	return s.finishRecover(ctx, run, true)
 }
 
@@ -1268,6 +1300,89 @@ func (s *Service) anchorReachablePreserved(ctx context.Context, state State, run
 		return blockedPlan(state, StatePipelineOwned, "blocked_recover_preserve_failed", "the preserved pipeline commits could not be anchored locally; no files or refs were changed"), false
 	}
 	return State{}, true
+}
+
+// settleGateBranchToAdoptedHead makes the gate's own branch ref match the
+// head plain recovery just adopted (a strict fast-forward or a
+// containment-proven adoption), using the same guarded compare-and-swap
+// --keep-local already uses to settle the gate branch. Terminalization
+// anchors an unpublished pipeline head under its run-specific recovery ref
+// rather than pushing it, so the gate branch itself can still sit at the
+// pre-recovery submitted head even after the local branch reaches the
+// adopted head; left alone, the very next follow-up commit's push is
+// rejected non-fast-forward against that stale gate branch (G3
+// evidence-supplement C7.8). This settles that gap without touching
+// --keep-local, whose own gate compare-and-swap targets the kept local head,
+// never the adopted preserved head.
+//
+// The compare-and-swap reads the gate branch once and swaps from exactly
+// that observed value; a concurrent gate push in between makes the swap
+// refuse instead of clobbering it, mirroring the same irreducible race
+// --keep-local already accepts and reports.
+func (s *Service) settleGateBranchToAdoptedHead(ctx context.Context, state State, run *db.Run, adopted string) (State, bool) {
+	runID := run.ID
+	gateDir := strings.TrimSpace(s.GateDir)
+	if gateDir == "" {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_unavailable", "no local gate is configured for this repository, so the gate branch could not be settled to the adopted head; the local branch and worktree already reached it; custody was not recorded"), false
+	}
+	if _, err := os.Stat(gateDir); err != nil {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_unavailable", "the local gate became unavailable while the gate branch was being settled to the adopted head; the local branch and worktree already reached it; custody was not recorded"), false
+	}
+	branchRef := "refs/heads/" + state.Local.Branch
+	gateHead, exists, err := git.ExactRefTarget(ctx, gateDir, branchRef)
+	if err != nil {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_unavailable", fmt.Sprintf("the local gate branch %s could not be inspected while settling it to the adopted head; the local branch and worktree already reached it; custody was not recorded", state.Local.Branch)), false
+	}
+	if exists && gateHead == adopted {
+		return state, true
+	}
+	// A gate branch that already reaches the adopted head - because it
+	// independently advanced further, not because it lagged behind it - is
+	// left exactly as it is. Only a gate branch the adopted head does not
+	// already descend from is the C7.8 shape this settles; rewriting a
+	// branch that has since moved ahead on its own would discard that
+	// independent work instead of merely catching the gate ref up.
+	if exists && isAncestor(ctx, gateDir, adopted, gateHead) {
+		return state, true
+	}
+	// A gate branch that is neither the adopted head nor already ahead of it
+	// is only safe to overwrite when it still sits at exactly the head this
+	// very run submitted: that is the stale-behind C7.8 shape this function
+	// exists to fast-forward (a rebase can legitimately break ancestry
+	// between the submitted head and the adopted one, so ancestry alone
+	// cannot distinguish "stale" from "diverged"). A gate branch sitting
+	// anywhere else - moved by another run or an operator since this run
+	// went terminal - carries commits of its own and must not be silently
+	// detached from the branch ref with no anchor preserving them.
+	if exists && (run.SubmittedHeadSHA == nil || gateHead != *run.SubmittedHeadSHA) {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_diverged", fmt.Sprintf("the gate branch %s has diverged from the head this run submitted; the local branch and worktree already reached the adopted head; reconcile the gate branch manually before retrying", state.Local.Branch)), false
+	}
+	oldValue := gateHead
+	if !exists {
+		oldValue = strings.Repeat("0", len(adopted))
+	}
+	if s.beforeGateReset != nil {
+		s.beforeGateReset()
+	}
+	if !objectExists(ctx, gateDir, adopted) {
+		source, err := filepath.Abs(s.workDir())
+		if err != nil {
+			return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the invoking worktree path could not be resolved while settling the gate branch; the local branch and worktree already reached the adopted head; custody was not recorded"), false
+		}
+		stagingRef := "refs/no-mistakes/custody-return-settle/" + runID
+		if _, err := git.Run(ctx, gateDir, "fetch", "--no-tags", "--no-write-fetch-head", source, "+"+branchRef+":"+stagingRef); err != nil {
+			return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the adopted head could not be staged into the gate while settling the gate branch; the local branch and worktree already reached it; custody was not recorded"), false
+		}
+		staged, stageErr := git.Run(ctx, gateDir, "rev-parse", stagingRef+"^{commit}")
+		_, _ = git.Run(ctx, gateDir, "update-ref", "-d", stagingRef)
+		if stageErr != nil || staged != adopted {
+			return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the adopted head could not be verified in the gate after staging; the local branch and worktree already reached it; custody was not recorded"), false
+		}
+	}
+	if _, err := git.Run(ctx, gateDir, "update-ref", branchRef, adopted, oldValue); err != nil {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_race", "the gate branch changed while it was being settled to the adopted head; the local branch and worktree already reached it; re-run the recovery"), false
+	}
+	return state, true
 }
 
 // finishRecover stamps custody returned and reports the fresh post-recovery
