@@ -78,7 +78,7 @@ type RunManager struct {
 	subMu          sync.Mutex
 	subscribers    map[string][]*eventMailbox // runID → subscriber mailboxes
 	stateRevs      map[string]int64           // runID → monotonic state revision
-	completedRuns  map[string]bool            // runIDs whose goroutines have finished
+	completedRuns  map[string]bool            // runIDs whose subscriber streams have finished
 	completedOrder []string                   // insertion order for FIFO eviction
 }
 
@@ -500,11 +500,24 @@ func trustedConfigOverrideFields(pushed, effective *config.RepoConfig) []string 
 // subscribe-then-reconcile ordering rule. A run that has already completed
 // yields that one gap and then finishes.
 func (m *RunManager) Subscribe(runID string) (*Subscription, error) {
+	// The executor persists terminal state before its owner goroutine returns
+	// and calls closeSubscribers. A subscriber admitted in that interval needs
+	// only the initial gap so it can reconcile the authoritative terminal
+	// snapshot; keeping its stream open until owner cleanup makes closure depend
+	// on unrelated agent/process teardown latency. Read before subMu so the
+	// event fan-out critical section remains I/O-free. Terminal states never
+	// advance again, so a positive observation cannot become stale.
+	persistedTerminal := false
+	if m.db != nil {
+		run, err := m.db.GetRun(runID)
+		persistedTerminal = err == nil && run != nil && run.Status.Terminal()
+	}
+
 	m.subMu.Lock()
 	defer m.subMu.Unlock()
 
 	mb := newEventMailbox(runID, m.stateRevs[runID])
-	if m.completedRuns[runID] {
+	if persistedTerminal || m.completedRuns[runID] {
 		mb.close()
 		return &Subscription{mb: mb, unsub: func() {}}, nil
 	}
