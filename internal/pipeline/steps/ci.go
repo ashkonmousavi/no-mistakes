@@ -622,6 +622,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 			// excluded outright: no rerun can ever clear one, so it must reach
 			// the fix agent on its first observation.
 			rerunIssued := false
+			var unsafeInfrastructure []scm.Check
 			if !checksPending && !mergeConflict {
 				issued, rerunOutcome := s.rerunInfrastructureChecks(sctx, host, pr, checks)
 				if rerunOutcome != nil {
@@ -633,11 +634,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 				}
 				rerunIssued = issued
 				if !rerunIssued {
-					if unsafe := infrastructureFailuresWithoutExactRerun(checks); len(unsafe) > 0 {
-						clearCIMonitorReady(sctx)
-						findings := ciUnsafeInfrastructureFindings(checks, unsafe, mergeConflict)
-						return ciObservationOutcomeWithDeferred(findings, sctx.DeferredFindings), nil
-					}
+					unsafeInfrastructure = infrastructureFailuresWithoutExactRerun(checks)
 				}
 				if !rerunIssued {
 					issued, rerunOutcome = s.rerunTransientChecks(sctx, host, pr, checks)
@@ -684,16 +681,18 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					unresolvedCancelled = mergeCheckNames(unresolvedCancelled, s.transientReruns.cancelledWithoutRerun(checks))
 				}
 			}
-			failing := failingCheckNamesExcluding(checks, awaitingInfrastructure)
+			ordinaryChecks := checksWithoutObservations(checks, unsafeInfrastructure)
+			failing := failingCheckNamesExcluding(ordinaryChecks, awaitingInfrastructure)
 			sort.Strings(failing)
 			sort.Strings(unresolvedCancelled)
 			sort.Strings(awaitingRerun)
 			hasFailures := len(failing) > 0
-			hasIssues := hasFailures || mergeConflict || len(unresolvedCancelled) > 0
+			hasIssues := hasFailures || mergeConflict || len(unresolvedCancelled) > 0 || len(unsafeInfrastructure) > 0
 			// reportedIssues is what the step tells the user about; failing
 			// stays the set the fix agent is asked to repair.
 			reportedIssues := mergeCheckNames(failing, unresolvedCancelled)
-			timeoutFailingChecks = terminalCheckTargetsForNames(checks, mergeCheckNames(reportedIssues, awaitingRerun))
+			timeoutFailingChecks = terminalCheckTargetsForNames(ordinaryChecks, mergeCheckNames(reportedIssues, awaitingRerun))
+			timeoutFailingChecks = append(timeoutFailingChecks, checkTargets(unsafeInfrastructure)...)
 
 			if hasIssues || len(awaitingRerun) > 0 {
 				if err := setCIMonitorReadiness(sctx, false, false); err != nil {
@@ -740,14 +739,15 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					s.lastFixedCompletedAt = nil
 					sctx.DeferredFindings = ""
 					s.observedCompletedAt = terminalFailureCompletionTimes(checks)
-					findings := ciObservationFindings(ciIssues{
-						checks:              checks,
-						failing:             failing,
-						unresolvedCancelled: unresolvedCancelled,
-						mergeConflict:       mergeConflict,
-						reruns:              s.transientReruns.used,
-						botComments:         reviewBotComments(sctx, host, pr, checks),
-					})
+					findings := ciSettledObservationFindings(
+						checks,
+						unsafeInfrastructure,
+						failing,
+						unresolvedCancelled,
+						mergeConflict,
+						s.transientReruns.used,
+						reviewBotComments(sctx, host, pr, ordinaryChecks),
+					)
 					sctx.Log(fmt.Sprintf("issues detected: %s", findings.Summary))
 					return ciObservationOutcome(findings), nil
 				}

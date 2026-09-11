@@ -174,26 +174,14 @@ func mergeCIFindings(base, extra Findings) Findings {
 	return base
 }
 
-// ciUnsafeInfrastructureFindings parks only the exact provider observations
-// whose retry scope is unsafe. Every other failed check is classified through
-// the normal settled-observation path, so same-named or differently named code
-// failures keep their independent provider identity and auto-fix action.
-func ciUnsafeInfrastructureFindings(checks, unsafe []scm.Check, mergeConflict bool) Findings {
-	unsafeKeys := make(map[string]bool, len(unsafe))
-	for _, check := range unsafe {
-		unsafeKeys[checkObservationKey(check)] = true
+// appendUnsafeInfrastructureFindings adds the exact provider observations
+// whose retry scope is unsafe to the normal settled observation. The caller
+// has already classified ordinary failures, cancellations, merge conflicts,
+// and review-bot comments, so no issue family disappears behind this refusal.
+func appendUnsafeInfrastructureFindings(findings Findings, unsafe []scm.Check) Findings {
+	if len(unsafe) == 0 {
+		return findings
 	}
-	ordinary := make([]scm.Check, 0, len(checks)-len(unsafe))
-	for _, check := range checks {
-		if !unsafeKeys[checkObservationKey(check)] {
-			ordinary = append(ordinary, check)
-		}
-	}
-	findings := ciObservationFindings(ciIssues{
-		checks:        ordinary,
-		failing:       failingCheckNames(ordinary),
-		mergeConflict: mergeConflict,
-	})
 	for _, check := range unsafe {
 		findings.Items = append(findings.Items, Finding{
 			Severity:    types.FindingSeverityWarning,
@@ -214,6 +202,45 @@ func ciUnsafeInfrastructureFindings(checks, unsafe []scm.Check, mergeConflict bo
 	}
 	findings.Summary += unsafeSummary
 	return findings
+}
+
+// ciSettledObservationFindings is the complete issue-family join for a poll.
+// Unsafe infrastructure checks are removed only from ordinary failure
+// classification, then added back as exact ask-user findings after cancelled
+// checks and review-bot comments have been represented.
+func ciSettledObservationFindings(checks, unsafe []scm.Check, failing, unresolvedCancelled []string, mergeConflict bool, reruns func(string) int, botComments []scm.ReviewComment) Findings {
+	ordinary := checksWithoutObservations(checks, unsafe)
+	findings := ciObservationFindings(ciIssues{
+		checks:              ordinary,
+		failing:             failing,
+		unresolvedCancelled: unresolvedCancelled,
+		mergeConflict:       mergeConflict,
+		reruns:              reruns,
+		botComments:         botComments,
+	})
+	return appendUnsafeInfrastructureFindings(findings, unsafe)
+}
+
+func checksWithoutObservations(checks, excluded []scm.Check) []scm.Check {
+	excludedKeys := make(map[string]bool, len(excluded))
+	for _, check := range excluded {
+		excludedKeys[checkObservationKey(check)] = true
+	}
+	kept := make([]scm.Check, 0, len(checks)-len(excluded))
+	for _, check := range checks {
+		if !excludedKeys[checkObservationKey(check)] {
+			kept = append(kept, check)
+		}
+	}
+	return kept
+}
+
+func checkTargets(checks []scm.Check) []scm.CheckTarget {
+	targets := make([]scm.CheckTarget, 0, len(checks))
+	for _, check := range checks {
+		targets = append(targets, scm.CheckTarget{Name: check.Name, ProviderID: check.ProviderID})
+	}
+	return targets
 }
 
 func checkObservationKey(check scm.Check) string {
