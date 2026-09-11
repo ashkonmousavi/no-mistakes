@@ -13,6 +13,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -184,7 +185,7 @@ func ciFalseNegativeGroupsFromRun(database *db.DB, runID string) ([]ciFalseNegat
 }
 
 func roundAdvancedHead(round *db.StepRound) bool {
-	return round.FixSummary != nil && strings.TrimSpace(*round.FixSummary) == "changes applied"
+	return round.FixSummary != nil && strings.TrimSpace(*round.FixSummary) == pipeline.FixSummaryChangesApplied
 }
 
 func ciReviewMissCandidates(rounds, reviewRounds, authorityInvalidations []*db.StepRound, approvedHead string) map[string]map[string]string {

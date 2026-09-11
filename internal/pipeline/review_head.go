@@ -182,11 +182,16 @@ func (e *Executor) bindPostReviewHead(ctx context.Context, step Step, sctx *Step
 		return err
 	}
 	if documentationOnly {
-		return e.carryReviewApprovalToDocumentationHead(step, sctx, outcome, approvedHead, currentHead, changed)
+		if err := e.carryReviewApprovalToDocumentationHead(step, sctx, outcome, approvedHead, currentHead, changed); err != nil {
+			return err
+		}
+		outcome.FixSummary = FixSummaryChangesApplied
+		return nil
 	}
 
 	outcome.RestartFrom = types.StepReview
 	outcome.RestartReason = RestartReasonFinalHeadRereview
+	outcome.FixSummary = FixSummaryChangesApplied
 	sctx.Log("final_head_rereview: pipeline-authored changes advanced HEAD after review; restarting at Review before publication")
 	return nil
 }

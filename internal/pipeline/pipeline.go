@@ -156,6 +156,15 @@ type StepOutcome struct {
 	DurationOverrideMS int64
 }
 
+// Persisted fix summaries are shared evidence between step producers and
+// post-run consumers. A post-review head binder may discover an agent-created
+// descendant after the ordinary committer saw a clean tree, so it must be able
+// to upgrade that round to the same durable head-advance value.
+const (
+	FixSummaryNoChangesApplied = "no changes applied"
+	FixSummaryChangesApplied   = "changes applied"
+)
+
 // Step is the interface that each pipeline step implements.
 type Step interface {
 	// Name returns the step's identity in the fixed pipeline sequence.

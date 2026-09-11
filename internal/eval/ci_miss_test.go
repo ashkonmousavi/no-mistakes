@@ -2,12 +2,45 @@ package eval
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
+
+type directCommitProvenanceStep struct {
+	name      types.StepName
+	committed bool
+}
+
+func (s *directCommitProvenanceStep) Name() types.StepName { return s.name }
+
+func (s *directCommitProvenanceStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	if s.name != types.StepDocument || s.committed {
+		return &pipeline.StepOutcome{}, nil
+	}
+	s.committed = true
+	documentPath := filepath.Join(sctx.WorkDir, "README.md")
+	if err := os.WriteFile(documentPath, []byte("corrected documentation\n"), 0o644); err != nil {
+		return nil, err
+	}
+	if _, err := git.Run(sctx.Ctx, sctx.WorkDir, "add", "README.md"); err != nil {
+		return nil, err
+	}
+	if _, err := git.Run(sctx.Ctx, sctx.WorkDir, "commit", "-m", "agent committed documentation correction"); err != nil {
+		return nil, err
+	}
+	// This is the real direct-agent-commit shape: the ordinary committer sees a
+	// clean tree and reports no change, while the shared head binder discovers
+	// the descendant commit after Execute returns.
+	return &pipeline.StepOutcome{FixSummary: pipeline.FixSummaryNoChangesApplied}, nil
+}
 
 // ciObservationFindings is a settled CI observation carrying one finding of
 // every category the classifier emits: a failing check attributed to the job
@@ -742,6 +775,100 @@ func TestCIFalseNegativesFromRun_ExcludesDocumentationCarriedHead(t *testing.T) 
 	}
 	if len(gold) != 0 {
 		t.Fatalf("gold = %#v, want none from a head carried past Review", gold)
+	}
+}
+
+func TestExecutorDirectCommitCleanTreePersistsHeadAdvanceForRecoveredCIMissAttribution(t *testing.T) {
+	ctx := context.Background()
+	cleanReview := `{"findings":[],"risk_level":"low","risk_rationale":"clean","risk_scope":"source-or-external"}`
+	p, sourceDB, run, repo, _ := setupCapturedRunWithFindings(t, ctx, cleanReview)
+
+	steps, err := sourceDB.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].StepName != types.StepReview {
+		t.Fatalf("fixture steps = %#v, want only Review", steps)
+	}
+	if err := sourceDB.UpdateStepStatus(steps[0].ID, types.StepStatusCompleted); err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceDB.UpdateRunReviewApprovedHeadSHA(run.ID, run.HeadSHA); err != nil {
+		t.Fatal(err)
+	}
+	approvedHead := run.HeadSHA
+	run.ReviewApprovedHeadSHA = &approvedHead
+
+	testStep := &directCommitProvenanceStep{name: types.StepTest}
+	documentStep := &directCommitProvenanceStep{name: types.StepDocument}
+	executor := pipeline.NewExecutor(sourceDB, p, &config.Config{}, nil, []pipeline.Step{testStep, documentStep}, nil)
+	if err := executor.Execute(ctx, run, repo, repo.WorkingPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen the database before attribution so the assertion consumes only
+	// durable evidence, matching recovery and post-run ingestion.
+	if err := sourceDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sourceDB, err = db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sourceDB.Close()
+
+	steps, err = sourceDB.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persistedDocumentRound *db.StepRound
+	for _, step := range steps {
+		if step.StepName != types.StepDocument {
+			continue
+		}
+		rounds, err := sourceDB.GetRoundsByStep(step.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rounds) == 0 {
+			t.Fatal("Document produced no durable rounds")
+		}
+		persistedDocumentRound = rounds[0]
+		break
+	}
+	if persistedDocumentRound == nil {
+		t.Fatal("Document step not found after recovery")
+	}
+	if !roundAdvancedHead(persistedDocumentRound) {
+		t.Fatalf("direct-commit round fix summary = %#v, want durable head-advance evidence", persistedDocumentRound.FixSummary)
+	}
+
+	ciStep, err := sourceDB.InsertStepResult(run.ID, types.StepCI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newHeadFailure := `{"findings":[{"id":"ci-new-head","severity":"error","action":"auto-fix","category":"ci-check","check":"docs","check_id":"gh:docs:new-head","description":"new documentation head fails CI"}]}`
+	observed, err := sourceDB.InsertStepRound(ciStep.ID, 1, "initial", &newHeadFailure, nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := `["ci-new-head"]`
+	if err := sourceDB.SetStepRoundSelection(observed.ID, &selected, db.RoundSelectionSourceAutoFix); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceDB.InsertStepRoundWithRepair(ciStep.ID, 2, "auto_fix", nil, nil, true, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceDB.UpdateStepStatus(ciStep.ID, types.StepStatusCompleted); err != nil {
+		t.Fatal(err)
+	}
+
+	gold, err := CIFalseNegativesFromRun(sourceDB, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gold) != 0 {
+		t.Fatalf("gold = %#v, want no new-head CI failure attributed to the earlier Review", gold)
 	}
 }
 
