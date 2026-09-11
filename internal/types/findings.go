@@ -138,8 +138,9 @@ func KnownFindingClasses() []string { return slices.Clone(knownFindingClasses) }
 // half routes by this category: a check finding names its provider check in
 // Finding.Check, a merge-conflict finding asks for a rebase, a transient
 // finding is a provider-attributed outcome no code change can clear, and a
-// review-bot finding carries one unresolved comment from a third-party
-// review bot's check.
+// review-bot finding carries an available unresolved comment from a
+// third-party review bot's check, or the red check itself as a fallback when
+// no comment can be attached.
 const (
 	FindingCategoryCICheck         = "ci-check"
 	FindingCategoryCIMergeConflict = "ci-merge-conflict"

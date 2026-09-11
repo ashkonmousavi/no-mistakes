@@ -1580,11 +1580,13 @@ func (m *RunManager) autoCaptureEvalCase(ctx context.Context, cfg *config.Config
 	}
 }
 
-// autoIngestCIFalseNegatives writes false-negative gold for a finished run's
-// fixed CI findings onto its green review case. Any real code defect CI
-// surfaces (a failing ci-check or a review-bot comment), confirmed and fixed in
-// the run, is by definition a Review false negative: Review passed green and
-// missed it.
+// autoIngestCIFalseNegatives groups eligible fixed ci-check and ci-review-bot
+// findings (available bot comments or their check-level fallback) by the exact
+// green Review epoch that owned them, then writes each group onto that round's
+// case. A repair publication, documentation-authority carry, or another
+// authority-invalidating mutation ends eligibility until a later green
+// rereview, so a finding introduced after an unreviewed mutation is never
+// attributed backwards.
 //
 // Like autoCaptureEvalCase it is subordinate to the run: it swallows its own
 // panic, bounds its own time, shares the eval mutex so it never races capture,

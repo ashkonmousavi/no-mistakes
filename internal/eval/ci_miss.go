@@ -16,10 +16,10 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
-// goldSourceCIFalseNegative marks false-negative gold auto-ingested from a CI
-// finding that a green Review missed and the pipeline then fixed in-run. Any
-// real code defect CI surfaces on a reviewed head, that is confirmed and fixed,
-// is by definition a Review false negative: Review passed green and missed it.
+// goldSourceCIFalseNegative marks false-negative gold auto-ingested from an
+// eligible CI finding that the pipeline fixed in-run after an exact green
+// Review epoch. Later authority-invalidating mutations end that eligibility
+// until another Review passes green on the new head.
 const goldSourceCIFalseNegative = "recorded-ci-false-negative"
 
 type ciFalseNegativeGroup struct {
@@ -29,10 +29,11 @@ type ciFalseNegativeGroup struct {
 
 // isCIFalseNegativeCategory reports whether a CI finding category names a real
 // code defect Review could have caught: a failing check the provider attributes
-// to the job (ci-check) or a review bot's comment about the change
-// (ci-review-bot). A ci-transient failure is a provider/infra outcome no code
-// change clears, and a merge conflict is not a defect Review reads for, so both
-// are excluded.
+// to the job (ci-check), or a review-bot finding (ci-review-bot) carrying either
+// an available unresolved comment or the check-level fallback used when no
+// comment can be attached. A ci-transient failure is a provider/infra outcome
+// no code change clears, and a merge conflict is not a defect Review reads for,
+// so both are excluded.
 func isCIFalseNegativeCategory(category string) bool {
 	switch category {
 	case types.FindingCategoryCICheck, types.FindingCategoryCIReviewBot:
@@ -237,15 +238,19 @@ func repairLandedAfter(rounds []*db.StepRound, selectedIndex int) bool {
 	return repair.IsFixRound() && repair.RepairPublished
 }
 
-// AutoIngestCIFalseNegatives writes false-negative gold for a finished run's
-// fixed CI findings onto its green review case. It is the CI-side counterpart
+// AutoIngestCIFalseNegatives groups a finished run's eligible fixed CI
+// findings by the exact green Review epoch that owned them, then writes each
+// group onto that Review round's case. A repair publication, documentation
+// authority carry, or another authority-invalidating mutation ends the current
+// association until a later Review passes green. It is the CI-side counterpart
 // of AutoCapture: the caller owns the timeout and the decision to run. It opens
 // its own store, does its work, and closes it, so a failure here cannot reach
 // the run that triggered it.
 //
 // Skipped is true, with no error, when the run has no fixed ci-check /
-// ci-review-bot finding, or when its review did not pass green (there is no
-// green review case to attach the misses to) - both are ordinary outcomes.
+// ci-review-bot finding eligible for an exact green Review epoch, or when there
+// is no eligible green Review case to attach the misses to - both are ordinary
+// outcomes.
 func AutoIngestCIFalseNegatives(ctx context.Context, p *paths.Paths, database *db.DB, runID string, maxCases int) ([]IngestResult, bool, error) {
 	if p == nil || database == nil {
 		return nil, false, fmt.Errorf("eval ci false-negative ingest requires paths and a database")

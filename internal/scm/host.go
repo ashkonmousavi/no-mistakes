@@ -230,9 +230,11 @@ func (c Check) Failing() bool { return c.Bucket == CheckBucketFail }
 
 // ReviewBot describes a third-party review bot whose pull request check is an
 // opinion about the change rather than a job verdict on it. The CI step routes
-// such a check's failure to a human decision carrying the bot's unresolved
-// review comments, instead of spending an auto-fix round on it, and the
-// GitHub backend collects only these bots' review-thread comments.
+// such a check's failure to a human decision instead of spending an auto-fix
+// round on it. Available unresolved review comments become individual
+// findings; when no comment can be attached, the red check itself remains as
+// one check-level decision finding. The GitHub backend collects only these
+// bots' review-thread comments.
 type ReviewBot struct {
 	// AppSlug is the provider app slug the bot publishes its check under.
 	AppSlug string

@@ -59,8 +59,9 @@ type ciIssues struct {
 //   - a merge conflict is an auto-fix error whose repair always revalidates;
 //   - a failing check published by a registered review bot (scm.ReviewBots)
 //     is the bot's opinion about the change, not a verdict on it, so it
-//     becomes one ask-user warning per unresolved bot comment, anchored to
-//     the file and line the comment is about;
+//     becomes one ask-user warning per available unresolved bot comment,
+//     anchored to the file and line the comment is about; when no comment can
+//     be attached, the red check remains as one check-level ask-user finding;
 //   - a provider-attributed outcome no rerun will replace is an ask-user
 //     warning, exactly as before findings existed: nothing a fix agent does
 //     can clear it.
