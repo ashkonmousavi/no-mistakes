@@ -1,25 +1,5 @@
 # Changelog
 
-## [1.72.0](https://github.com/kunchenguid/no-mistakes/compare/v1.71.0...v1.72.0) (2026-09-08)
-
-
-### Features
-
-* **agent:** configure independent reviewer and fixer harness profiles ([#1016](https://github.com/kunchenguid/no-mistakes/issues/1016)) ([94afe33](https://github.com/kunchenguid/no-mistakes/commit/94afe335fa0060bccc562cd0512c2c940741d95b))
-
-
-### Bug Fixes
-
-* **pipeline:** retry invalid test analyzer findings ([#1014](https://github.com/kunchenguid/no-mistakes/issues/1014)) ([42497f8](https://github.com/kunchenguid/no-mistakes/commit/42497f8412214d8f37ed3d0ce807a6ea3692e8e0))
-
-## [1.71.0](https://github.com/kunchenguid/no-mistakes/compare/v1.70.1...v1.71.0) (2026-09-08)
-
-
-### Features
-
-* **eval:** auto-ingest fixed CI misses ([#1012](https://github.com/kunchenguid/no-mistakes/issues/1012)) ([bace158](https://github.com/kunchenguid/no-mistakes/commit/bace15861522b7613944f68dcf6574d6a202e544))
-* **pipeline:** unify CI failures with findings loop ([#1009](https://github.com/kunchenguid/no-mistakes/issues/1009)) ([9a464c2](https://github.com/kunchenguid/no-mistakes/commit/9a464c26fca7962fdd318502358cfa6cb0e1de1c))
-
 ## [1.70.1](https://github.com/kunchenguid/no-mistakes/compare/v1.70.0...v1.70.1) (2026-09-07)
 
 
