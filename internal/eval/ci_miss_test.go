@@ -821,8 +821,12 @@ func TestExecutorDirectCommitCleanTreePersistsHeadAdvanceForRecoveredCIMissAttri
 	if err != nil {
 		t.Fatal(err)
 	}
+	var reviewStep *db.StepResult
 	var persistedDocumentRound *db.StepRound
 	for _, step := range steps {
+		if step.StepName == types.StepReview {
+			reviewStep = step
+		}
 		if step.StepName != types.StepDocument {
 			continue
 		}
@@ -839,27 +843,84 @@ func TestExecutorDirectCommitCleanTreePersistsHeadAdvanceForRecoveredCIMissAttri
 	if persistedDocumentRound == nil {
 		t.Fatal("Document step not found after recovery")
 	}
-	if !roundAdvancedHead(persistedDocumentRound) {
-		t.Fatalf("direct-commit round fix summary = %#v, want durable head-advance evidence", persistedDocumentRound.FixSummary)
+	if reviewStep == nil {
+		t.Fatal("Review step not found after recovery")
+	}
+	recoveredRun, err := sourceDB.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recoveredRun.ReviewApprovedHeadSHA == nil || *recoveredRun.ReviewApprovedHeadSHA != recoveredRun.HeadSHA {
+		t.Fatalf("documentation approval carry = %#v at head %s, want exact corrected head", recoveredRun.ReviewApprovedHeadSHA, recoveredRun.HeadSHA)
 	}
 
 	ciStep, err := sourceDB.InsertStepResult(run.ID, types.StepCI)
 	if err != nil {
 		t.Fatal(err)
 	}
-	newHeadFailure := `{"findings":[{"id":"ci-new-head","severity":"error","action":"auto-fix","category":"ci-check","check":"docs","check_id":"gh:docs:new-head","description":"new documentation head fails CI"}]}`
-	observed, err := sourceDB.InsertStepRound(ciStep.ID, 1, "initial", &newHeadFailure, nil, 10)
+	preRereviewFailure := `{"findings":[{"id":"ci-pre-rereview","severity":"error","action":"auto-fix","category":"ci-check","check":"docs","check_id":"gh:docs:pre-rereview","description":"documentation head before rereview fails CI"}]}`
+	observed, err := sourceDB.InsertStepRound(ciStep.ID, 1, "initial", &preRereviewFailure, nil, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	selected := `["ci-new-head"]`
+	selected := `["ci-pre-rereview"]`
 	if err := sourceDB.SetStepRoundSelection(observed.ID, &selected, db.RoundSelectionSourceAutoFix); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sourceDB.InsertStepRoundWithRepair(ciStep.ID, 2, "auto_fix", nil, nil, true, 10); err != nil {
 		t.Fatal(err)
 	}
+
+	// Establish a later green Review epoch after the first CI repair. This
+	// deliberately makes the original Review non-latest, so final-head equality
+	// and documentation approval carry cannot exclude the first finding on
+	// their own: only the recovered Document round's head-advance evidence can.
+	reviewRounds, err := sourceDB.GetRoundsByStep(reviewStep.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reviewRounds) != 1 {
+		t.Fatalf("review rounds before rereview = %d, want 1", len(reviewRounds))
+	}
+	secondReview, err := sourceDB.InsertReviewStepRoundWithProvenance(
+		reviewStep.ID,
+		2,
+		"final_head_rereview",
+		&cleanReview,
+		nil,
+		recoveredRun.HeadSHA,
+		recoveredRun.HeadSHA,
+		stringValue(reviewRounds[0].TrustedConfigSHA),
+		reviewRounds[0].GlobalConfigYAML,
+		reviewRounds[0].RepoConfigYAML,
+		10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceDB.UpdateRunReviewApprovedHeadSHA(run.ID, recoveredRun.HeadSHA); err != nil {
+		t.Fatal(err)
+	}
+
+	postRereviewFailure := `{"findings":[{"id":"ci-post-rereview","severity":"error","action":"auto-fix","category":"ci-check","check":"docs","check_id":"gh:docs:post-rereview","description":"rereviewed documentation head fails later CI"}]}`
+	observed, err = sourceDB.InsertStepRound(ciStep.ID, 3, "initial", &postRereviewFailure, nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected = `["ci-post-rereview"]`
+	if err := sourceDB.SetStepRoundSelection(observed.ID, &selected, db.RoundSelectionSourceAutoFix); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceDB.InsertStepRoundWithRepair(ciStep.ID, 4, "auto_fix", nil, nil, true, 10); err != nil {
+		t.Fatal(err)
+	}
 	if err := sourceDB.UpdateStepStatus(ciStep.ID, types.StepStatusCompleted); err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceDB.SetRunCIReadyWithReason(run.ID, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceDB.UpdateRunStatus(run.ID, types.RunCompleted); err != nil {
 		t.Fatal(err)
 	}
 
@@ -867,8 +928,18 @@ func TestExecutorDirectCommitCleanTreePersistsHeadAdvanceForRecoveredCIMissAttri
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(gold) != 0 {
-		t.Fatalf("gold = %#v, want no new-head CI failure attributed to the earlier Review", gold)
+	if len(gold) != 1 || gold[0].Description != "rereviewed documentation head fails later CI" {
+		t.Fatalf("gold = %#v, want only the positive-control failure observed after rereview", gold)
+	}
+	groups, err := ciFalseNegativeGroupsFromRun(sourceDB, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 1 || groups[0].reviewRoundID != secondReview.ID {
+		t.Fatalf("gold groups = %#v, want the positive control bound to second Review %s", groups, secondReview.ID)
+	}
+	if !roundAdvancedHead(persistedDocumentRound) {
+		t.Fatalf("direct-commit round fix summary = %#v, want durable head-advance evidence", persistedDocumentRound.FixSummary)
 	}
 }
 

@@ -145,6 +145,10 @@ type StepOutcome struct {
 	// rounds can reference what was previously attempted.
 	FixSummary      string
 	RepairPublished bool
+	// postReviewHeadAdvanced is set only by the executor's shared head binder.
+	// It makes the round carrying that authority invalidation fail-closed if
+	// persistence fails; step-authored summaries alone cannot assert it.
+	postReviewHeadAdvanced bool
 	// ReviewApprovedHeadSHA is set only by a successfully executed full review
 	// round. The executor durably records it only when the review step actually
 	// completes, never while that outcome is parked or after a failed round.

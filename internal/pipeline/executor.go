@@ -1018,6 +1018,18 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			inserted, dbErr = e.db.InsertStepRoundWithRepair(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, outcome.RepairPublished, roundDuration)
 		}
 		if dbErr != nil {
+			if outcome.postReviewHeadAdvanced {
+				durationMS := executionMS + roundDuration
+				persistErr := fmt.Errorf("persist post-review head advance round: %w", dbErr)
+				redactedErr := safeurl.RedactText(persistErr.Error())
+				fmt.Fprintf(logFile, "\nerror: %s\n", redactedErr)
+				touchLogActivity("error: "+redactedErr, true)
+				if failErr := e.db.FailStep(sr.ID, redactedErr, durationMS); failErr != nil {
+					slog.Warn("failed to mark step as failed in db", "step", stepName, "error", failErr)
+				}
+				e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(types.StepStatusFailed), "", redactedErr, &durationMS)
+				return false, "", fmt.Errorf("step %s failed: %s", stepName, redactedErr)
+			}
 			currentRoundID = roundInsertID(currentRoundID, inserted, dbErr)
 			slog.Warn("failed to insert step round", "step", stepName, "round", roundNum, "error", dbErr)
 		} else {
