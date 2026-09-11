@@ -16,6 +16,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
+	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
@@ -23,6 +24,150 @@ import (
 )
 
 // --- RunManager integration tests ---
+
+func TestRunManager_GateWorktreeMutationsSerializeTerminalCleanupBeforeSuccessorAdd(t *testing.T) {
+	p, database, manager, repo, prior, head := newGateWorktreeMutationFixture(t, "serialized-worktree-mutations")
+	removeEntered := make(chan struct{})
+	releaseRemove := make(chan struct{})
+	manager.worktreeRemove = func(context.Context, string, string) error {
+		close(removeEntered)
+		<-releaseRemove
+		return nil
+	}
+	addEntered := make(chan struct{})
+	manager.worktreeAdd = func(context.Context, string, string, string) error {
+		close(addEntered)
+		return fmt.Errorf("injected successor add stop")
+	}
+	removeDone := make(chan struct{})
+	go func() {
+		manager.removeRunWorktree(repo.ID, prior.ID, p.RepoDir(repo.ID), prior.WorktreePath(), "test_terminal_cleanup")
+		close(removeDone)
+	}()
+	<-removeEntered
+
+	startDone := make(chan error, 1)
+	go func() {
+		_, err := manager.startRun(context.Background(), repo, "main", head, head, "test", nil, "successor waits for cleanup", "")
+		startDone <- err
+	}()
+	waitForSuccessorWorktreePlacement(t, database, repo.ID, prior.ID)
+
+	enteredBeforeCleanupFinished := false
+	select {
+	case <-addEntered:
+		enteredBeforeCleanupFinished = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseRemove)
+	<-removeDone
+	if enteredBeforeCleanupFinished {
+		t.Fatal("successor worktree add entered while terminal cleanup still owned the same gate")
+	}
+	select {
+	case <-addEntered:
+	case <-time.After(time.Second):
+		t.Fatal("successor worktree add did not enter after terminal cleanup released the gate")
+	}
+	if err := <-startDone; err == nil || !strings.Contains(err.Error(), "injected successor add stop") {
+		t.Fatalf("successor start error = %v, want injected add stop", err)
+	}
+}
+
+func TestRunManager_ShutdownCancelsSuccessorWaitingForGateWorktreeCleanup(t *testing.T) {
+	p, database, manager, repo, prior, head := newGateWorktreeMutationFixture(t, "shutdown-worktree-mutations")
+	removeEntered := make(chan struct{})
+	releaseRemove := make(chan struct{})
+	manager.worktreeRemove = func(context.Context, string, string) error {
+		close(removeEntered)
+		<-releaseRemove
+		return nil
+	}
+	addEntered := make(chan struct{})
+	manager.worktreeAdd = func(context.Context, string, string, string) error {
+		close(addEntered)
+		return fmt.Errorf("injected successor add stop")
+	}
+	removeDone := make(chan struct{})
+	go func() {
+		manager.removeRunWorktree(repo.ID, prior.ID, p.RepoDir(repo.ID), prior.WorktreePath(), "test_terminal_cleanup")
+		close(removeDone)
+	}()
+	<-removeEntered
+
+	startDone := make(chan error, 1)
+	go func() {
+		_, err := manager.startRun(context.Background(), repo, "main", head, head, "test", nil, "shutdown cancels waiting successor", "")
+		startDone <- err
+	}()
+	waitForSuccessorWorktreePlacement(t, database, repo.ID, prior.ID)
+	manager.Shutdown()
+	select {
+	case err := <-startDone:
+		if err == nil || !strings.Contains(err.Error(), context.Canceled.Error()) {
+			t.Fatalf("successor start error = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("successor setup did not stop when the manager shut down")
+	}
+	select {
+	case <-addEntered:
+		t.Fatal("shutdown successor reached git worktree add after waiting cleanup")
+	default:
+	}
+	close(releaseRemove)
+	<-removeDone
+}
+
+func newGateWorktreeMutationFixture(t *testing.T, repoID string) (*paths.Paths, *db.DB, *RunManager, *db.Repo, *db.Run, string) {
+	t.Helper()
+	p := paths.WithRoot(t.TempDir())
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	repo, head := setupTestGitRepo(t, p, database, repoID)
+	prior, err := database.InsertRun(repo.ID, "main", head, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorDir := filepath.Join(p.WorktreesDir(), repo.ID, prior.ID)
+	if err := database.SetRunWorktreeDir(prior.ID, priorDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunStatus(prior.ID, types.RunCompleted); err != nil {
+		t.Fatal(err)
+	}
+	prior, err = database.GetRun(prior.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewRunManager(database, p, func() []pipeline.Step { return nil })
+	manager.worktreeRemoveTimeout = time.Second
+	return p, database, manager, repo, prior, head
+}
+
+func waitForSuccessorWorktreePlacement(t *testing.T, database *db.DB, repoID, priorID string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		runs, err := database.GetRunsByRepo(repoID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, run := range runs {
+			if run.ID != priorID && run.WorktreePath() != "" {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("successor did not record its worktree placement")
+}
 
 func TestValidateRecoveredSessionProviders_RejectsUnavailableFixerProvider(t *testing.T) {
 	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))

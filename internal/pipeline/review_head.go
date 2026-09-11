@@ -151,6 +151,11 @@ func isPostReviewMutationStep(name types.StepName) bool {
 // carries the durable RestartReasonDocumentationHeadRecheck trigger that
 // `axi status` and the run's round history name.
 func (e *Executor) bindPostReviewHead(ctx context.Context, step Step, sctx *StepContext, outcome *StepOutcome) error {
+	if outcome != nil {
+		// Outcomes are allowed to be reused by specialized embeddings and tests;
+		// this marker describes only the execution round being bound now.
+		outcome.postReviewHeadAdvanced = false
+	}
 	if outcome == nil || !isPostReviewMutationStep(step.Name()) || outcome.RestartFrom != "" || sctx.Run.ReviewApprovedHeadSHA == nil {
 		return nil
 	}
@@ -181,12 +186,18 @@ func (e *Executor) bindPostReviewHead(ctx context.Context, step Step, sctx *Step
 	if err != nil {
 		return err
 	}
+	outcome.postReviewHeadAdvanced = true
 	if documentationOnly {
-		return e.carryReviewApprovalToDocumentationHead(step, sctx, outcome, approvedHead, currentHead, changed)
+		if err := e.carryReviewApprovalToDocumentationHead(step, sctx, outcome, approvedHead, currentHead, changed); err != nil {
+			return err
+		}
+		outcome.FixSummary = FixSummaryChangesApplied
+		return nil
 	}
 
 	outcome.RestartFrom = types.StepReview
 	outcome.RestartReason = RestartReasonFinalHeadRereview
+	outcome.FixSummary = FixSummaryChangesApplied
 	sctx.Log("final_head_rereview: pipeline-authored changes advanced HEAD after review; restarting at Review before publication")
 	return nil
 }

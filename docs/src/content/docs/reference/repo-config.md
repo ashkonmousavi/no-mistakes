@@ -446,6 +446,7 @@ Set to `0` to disable the follow-up auto-fix loop for a step (findings require m
 For empty `commands.lint`, the document step's combined housekeeping pass also assesses lint, and the lint step consumes its result; unresolved blocking lint findings pause for approval instead of starting another automatic fix loop.
 
 `auto_fix.ci` covers the CI step's CI failure and merge-conflict auto-fix attempts.
+The CI step reports each settled issue as a finding. A code-check failure or merge conflict is `auto-fix` and enters the shared fix loop, exactly as for review; a supported review bot's red check or a provider-attributed outcome no rerun will replace is `ask-user` and never consumes an attempt.
 
 Legacy alias: `auto_fix.babysit`.
 
@@ -495,8 +496,8 @@ Once the provider publishes a conclusive replacement, no-mistakes durably stops 
 A provider-attributed check that no rerun is going to replace pauses the step for user approval when it is the only remaining issue, so the pull request never looks green.
 That includes a check that came back cancelled after its rerun and a detected GitHub setup failure that persisted after its budget.
 At the default budget of `0`, once the budget is spent, or on a provider with no rerun API, cancellation itself reaches this gate because the provider has published its conclusion and will not publish another one on its own.
-The check does not enter the `auto_fix.ci` loop and never consumes an auto-fix attempt: it is not a verdict on the code, so there is nothing for the fix agent to repair and no reason to let it edit code the provider never tested.
-Answering that gate with `fix` is still honored, and the fix round you asked for is told about the check alongside any other issue.
+The check is reported as an `ask-user` finding, so it does not enter the `auto_fix.ci` loop and never consumes an auto-fix attempt: it is not a verdict on the code, so there is nothing for the fix agent to repair and no reason to let it edit code the provider never tested.
+Answering that gate with `fix` is still honored: the fix round you asked for repairs the findings you selected, and a selected transient finding names its check to the agent alongside any other issue.
 
 Reruns are skipped when:
 
@@ -577,8 +578,8 @@ The tradeoff `true` buys is cost against an unreviewed repair:
 | Run identity | unchanged; a restart is a same-run rewind | same |
 
 Turn it on where even an ordinary unreviewed CI repair is unacceptable.
-The concrete case this exists for: when a review bot posts product-behavior findings as a failing check, the fix agent treats them as CI failures and can reverse what the change was supposed to do.
-On [firstmate#3250](https://github.com/kunchenguid/firstmate/pull/3250) a CI repair made a `--changed` test run serial by default, contradicting the change's stated intent; the restarted Review caught it and reversed it. Without revalidation that repair would have shipped.
+Registered review-bot checks now park as `ask-user` findings instead of entering an automatic repair, but that classification does not make every red check's proposed fix trustworthy: an unregistered external check or a repair the user explicitly requests can still ask the fix agent to change product behavior.
+Before review-bot checks were classified structurally, [firstmate#3250](https://github.com/kunchenguid/firstmate/pull/3250) demonstrated the risk: a CI repair responding to bot feedback made a `--changed` test run serial by default, contradicting the change's stated intent; the restarted Review caught it and reversed it. Without revalidation that repair would have shipped.
 That is the safety this option buys, and the reason it is offered rather than removed.
 
 This value is read only from the trusted default-branch copy of this file, like `ci.rerun_transient` and `disable_project_settings`.

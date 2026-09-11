@@ -2,7 +2,6 @@ package steps
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -32,16 +31,29 @@ const (
 )
 
 // CIStep monitors an open PR until it is merged, closed, or its configured idle
-// timeout elapses, auto-fixing CI failures.
+// timeout elapses, and repairs CI failures through the executor's shared
+// findings machinery.
+//
+// Execute has the same shape as the review step's: when the executor
+// re-executes it as a fix round (sctx.Fixing), it first repairs the findings
+// selected for that round (sctx.PreviousFindings), then it monitors. Each
+// settled observation - every check finished, every authorized transient
+// rerun spent, at least one issue present - returns one finding per issue
+// carrying its action (ciObservationFindings), and the executor decides what
+// happens next: auto-fix findings enter the auto_fix.ci loop as fix rounds,
+// ask-user findings park for a decision. The step never counts or limits fix
+// rounds itself; the executor does, durably, from the round history.
 //
 // Empty check lists are never treated as green unless the resolved config
 // carries the trusted default-branch `no_ci: true` declaration (config.Config.NoCI).
 // A feature branch cannot self-declare that value. When checks exist, their
 // actual states are always processed normally - even on a declared no-CI repo.
 type CIStep struct {
-	lastFixedChecks              string                    // sorted check names from last fix attempt, to avoid re-fixing
-	lastFixedCompletedAt         map[string]time.Time      // terminally failed check completion times seen before the last fix attempt
-	ciFixAttempts                int                       // number of CI auto-fix attempts made
+	lastFixedChecks              string                    // encoded targets of the last published repair, so a poll that still shows them is not re-escalated
+	lastFixedCompletedAt         map[string]checkFreshness // terminally failed check freshness at the observation the last repair targeted
+	observedCompletedAt          map[string]checkFreshness // terminally failed check freshness at the observation whose findings a fix round may repair
+	pendingFixSummary            string                    // one-line summary of the repair this execution published, attached to the outcome it ends with
+	pendingRepairPublish         bool
 	transientReruns              checkRerunBudget          // per-check rerun budget spent on provider-reported transient failures
 	infrastructureReruns         infrastructureRerunBudget // candidate-wide budget and first artifact-infrastructure failure
 	infrastructureStateAvailable bool                      // true only after the durable infrastructure budget decoded successfully
@@ -239,17 +251,27 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 	if sctx.StepResultID != "" {
 		stepResult, err := sctx.DB.GetStepResult(sctx.StepResultID)
 		if err != nil {
-			return nil, fmt.Errorf("restore CI auto-fix attempts and refusal: %w", err)
+			return nil, fmt.Errorf("restore CI protected-path refusal: %w", err)
 		}
-		if stepResult != nil {
-			s.ciFixAttempts = max(s.ciFixAttempts, stepResult.CIFixAttempts)
-			if stepResult.FindingsJSON != nil {
-				refusalFindings = *stepResult.FindingsJSON
-			}
+		if stepResult != nil && stepResult.FindingsJSON != nil {
+			refusalFindings = *stepResult.FindingsJSON
 		}
 	}
 	retryRefusal := sctx.Fixing && pipeline.HasProtectedPathRefusal(refusalFindings)
-	manualFixAttempted := retryRefusal
+	// A fix round repairs the findings the executor selected for it, unless
+	// this re-entry is the retry of a retained repair a protected-path refusal
+	// interrupted: that repair is finished first and nothing new is requested.
+	repairRequested := sctx.Fixing && !retryRefusal
+	defer func() {
+		if outcome != nil {
+			if s.pendingFixSummary != "" {
+				outcome.FixSummary = s.pendingFixSummary
+			}
+			outcome.RepairPublished = s.pendingRepairPublish
+		}
+		s.pendingFixSummary = ""
+		s.pendingRepairPublish = false
+	}()
 	defer func() {
 		if !retryRefusal {
 			return
@@ -338,6 +360,15 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 	if strings.TrimSpace(pr.BaseBranch) != "" {
 		baseBranch = strings.TrimSpace(pr.BaseBranch)
 	}
+	if repairRequested {
+		repairOutcome, err := s.repairFromFindings(sctx, host, pr)
+		if err != nil {
+			return nil, err
+		}
+		if repairOutcome != nil {
+			return repairOutcome, nil
+		}
+	}
 
 	// CITimeout semantics: <0 (or "unlimited" in config) means never
 	// self-terminate; 0 means the value was never configured, so fall back
@@ -375,19 +406,21 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 	timeoutAnchor := started
 	lastBaseTip := ""
 	mergeabilityBlockedReason := ""
-	timeoutFailingChecks := []string{}
+	var timeoutFailingChecks []scm.CheckTarget
 	timeoutMergeConflict := false
 	lastMonitorLog := ""
 	consecutiveCheckErrs := 0
 	timeoutOutcome := func() (*pipeline.StepOutcome, error) {
 		sctx.Log("CI timeout reached")
+		var outcome *pipeline.StepOutcome
 		if len(timeoutFailingChecks) > 0 || timeoutMergeConflict {
-			return ciFailureOutcome(timeoutFailingChecks, timeoutMergeConflict, "CI timed out with known failures still present"), nil
+			outcome = ciFailureOutcome(timeoutFailingChecks, timeoutMergeConflict, "CI timed out with known failures still present")
+		} else if mergeabilityBlockedReason != "" {
+			outcome = ciMergeabilityOutcome("mergeability check timed out", mergeabilityBlockedReason)
+		} else {
+			outcome = ciMonitoringTimeoutOutcome()
 		}
-		if mergeabilityBlockedReason != "" {
-			return ciMergeabilityOutcome("mergeability check timed out", mergeabilityBlockedReason), nil
-		}
-		return ciMonitoringTimeoutOutcome(), nil
+		return ciTerminalMonitorOutcome(outcome, sctx.DeferredFindings), nil
 	}
 	waitForPoll := func() error {
 		interval := s.pollIntervalOverride
@@ -507,8 +540,9 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 			}
 		}
 
-		// Check CI status - wait for all checks to complete before fixing
-		ciFixLimit := sctx.Config.AutoFix.CI
+		// Check CI status - wait for all checks to complete before escalating.
+		// Re-arm all run-bound fields because an earlier transient target-read
+		// error deliberately clears them rather than retaining stale proof.
 		rearmPRPollIdentity(pr, sctx.Run.HeadSHA, baseBranch)
 		checks, err := host.GetChecks(ctx, pr)
 		if err != nil {
@@ -522,7 +556,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 			// already for merged/closed, so reaching here means the PR is open.
 			if consecutiveCheckErrs >= consecutiveCheckErrorLimit {
 				sctx.Log(fmt.Sprintf("CI checks could not be read %d consecutive times, parking for a decision", consecutiveCheckErrs))
-				return ciCheckReadFailureOutcome(err), nil
+				return ciTerminalMonitorOutcome(ciCheckReadFailureOutcome(err), sctx.DeferredFindings), nil
 			}
 		} else {
 			consecutiveCheckErrs = 0
@@ -537,7 +571,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					invalidateInfrastructurePRTarget(pr)
 				} else if mismatch != "" {
 					clearCIMonitorReady(sctx)
-					return ciFailureOutcome(failingCheckNames(checks), false, mismatch), nil
+					return ciTerminalMonitorOutcome(ciFailureOutcome(terminalCheckTargetsForNames(checks, failingCheckNames(checks)), false, mismatch), sctx.DeferredFindings), nil
 				}
 			}
 			// A failure the provider produced before the repository's own steps
@@ -588,6 +622,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 			// excluded outright: no rerun can ever clear one, so it must reach
 			// the fix agent on its first observation.
 			rerunIssued := false
+			var unsafeInfrastructure []scm.Check
 			if !checksPending && !mergeConflict {
 				issued, rerunOutcome := s.rerunInfrastructureChecks(sctx, host, pr, checks)
 				if rerunOutcome != nil {
@@ -595,20 +630,17 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					// commit whose checks were observed: nothing here may leave
 					// a ready-to-merge signal behind on the way out.
 					clearCIMonitorReady(sctx)
-					return rerunOutcome, nil
+					return ciTerminalMonitorOutcome(rerunOutcome, sctx.DeferredFindings), nil
 				}
 				rerunIssued = issued
 				if !rerunIssued {
-					if unsafe := infrastructureFailuresWithoutExactRerun(checks); len(unsafe) > 0 {
-						clearCIMonitorReady(sctx)
-						return ciFailureOutcome(unsafe, false, "provider retry scope includes work outside the proven failed-job population; infrastructure rerun remains disabled"), nil
-					}
+					unsafeInfrastructure = infrastructureFailuresWithoutExactRerun(checks)
 				}
 				if !rerunIssued {
 					issued, rerunOutcome = s.rerunTransientChecks(sctx, host, pr, checks)
 					if rerunOutcome != nil {
 						clearCIMonitorReady(sctx)
-						return rerunOutcome, nil
+						return ciTerminalMonitorOutcome(rerunOutcome, sctx.DeferredFindings), nil
 					}
 					rerunIssued = issued
 				}
@@ -649,16 +681,18 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					unresolvedCancelled = mergeCheckNames(unresolvedCancelled, s.transientReruns.cancelledWithoutRerun(checks))
 				}
 			}
-			failing := failingCheckNamesExcluding(checks, awaitingInfrastructure)
+			ordinaryChecks := checksWithoutObservations(checks, unsafeInfrastructure)
+			failing := failingCheckNamesExcluding(ordinaryChecks, awaitingInfrastructure)
 			sort.Strings(failing)
 			sort.Strings(unresolvedCancelled)
 			sort.Strings(awaitingRerun)
 			hasFailures := len(failing) > 0
-			hasIssues := hasFailures || mergeConflict || len(unresolvedCancelled) > 0
+			hasIssues := hasFailures || mergeConflict || len(unresolvedCancelled) > 0 || len(unsafeInfrastructure) > 0
 			// reportedIssues is what the step tells the user about; failing
 			// stays the set the fix agent is asked to repair.
 			reportedIssues := mergeCheckNames(failing, unresolvedCancelled)
-			timeoutFailingChecks = append(timeoutFailingChecks[:0], mergeCheckNames(reportedIssues, awaitingRerun)...)
+			timeoutFailingChecks = terminalCheckTargetsForNames(ordinaryChecks, mergeCheckNames(reportedIssues, awaitingRerun))
+			timeoutFailingChecks = append(timeoutFailingChecks, checkTargets(unsafeInfrastructure)...)
 
 			if hasIssues || len(awaitingRerun) > 0 {
 				if err := setCIMonitorReadiness(sctx, false, false); err != nil {
@@ -684,117 +718,38 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 				sctx.Log("issues detected but checks still pending, waiting for all checks to complete...")
 			} else if hasIssues {
 				lastMonitorLog = ""
-				if !hasFailures && !mergeConflict && !sctx.Fixing {
-					// Every remaining issue is a transient check rather than a
-					// verdict on the code. No fix can clear one,
-					// so this parks for a decision instead of spending a
-					// fix-agent round on a run that never tested anything. The
-					// CI step's outcomes are never auto-fixable, so sctx.Fixing
-					// here means the user answered that gate with "fix": that
-					// deliberate override is honored rather than re-parked.
-					return ciUnresolvedCancelledOutcome(unresolvedCancelled, checks, s.transientReruns.used), nil
-				}
-				// All checks done, issues present - fix or report.
-				// The fix agent is asked to repair job failures; a check the
-				// provider cancelled again is not one, so it joins the request
-				// only in a round the user asked for.
-				fixTargets := failing
-				if sctx.Fixing {
-					fixTargets = reportedIssues
-				}
-				fixKey := encodeLastFixedChecks(fixTargets, mergeConflict)
-				fixCompletedAt := terminalFailureCompletionTimes(checks)
-				issueDesc := strings.Join(fixTargets, ", ")
-				if mergeConflict {
-					if issueDesc != "" {
-						issueDesc += " + merge conflict"
-					} else {
-						issueDesc = "merge conflict"
-					}
-				}
-				if sctx.Fixing && !manualFixAttempted {
-					manualFixAttempted = true
-					sctx.Log(fmt.Sprintf("issues detected: %s - manual fix requested...", issueDesc))
-					previousHeadSHA := sctx.Run.HeadSHA
-					repair, err := s.autoFixCI(sctx, host, pr, fixTargets, mergeConflict)
-					if outcome := pipeline.ProtectedPathOutcome(err); outcome != nil {
-						return outcome, nil
-					}
-					if outcome := ciFixAgentBudgetOutcome(sctx, issueDesc, err); outcome != nil {
-						return outcome, nil
-					}
-					if err != nil && errors.Is(err, errCIAttestationUnsettled) {
-						sctx.Log(fmt.Sprintf("CI repair push is not settled: %v", err))
-						return ciFailureOutcome(reportedIssues, mergeConflict, err.Error()), nil
-					}
-					if err != nil {
-						sctx.Log(fmt.Sprintf("warning: CI manual fix failed: %v", err))
-					} else if repair.HeadAdvanced || sctx.Run.HeadSHA != previousHeadSHA {
-						s.lastFixedChecks = fixKey
-						s.lastFixedCompletedAt = fixCompletedAt
-						if repair.Revalidate {
-							return &pipeline.StepOutcome{RestartFrom: types.StepReview}, nil
-						}
-						// The repair was published, so the monitor stays on
-						// this run and waits for the provider to re-run the
-						// checks against the new head.
-					} else if repair.NoCodeChangeNeeded {
-						sctx.Log(fmt.Sprintf("CI fixer concluded no code change is needed: %s", repair.Summary))
-						return ciFailureOutcome(reportedIssues, mergeConflict, repair.Summary), nil
-					} else {
-						sctx.Log("CI fix produced no changes, returning for manual intervention...")
-						return ciFailureOutcome(reportedIssues, mergeConflict, "CI fix produced no changes - failures require manual intervention"), nil
-					}
-				} else if sctx.Fixing && fixKey == s.lastFixedChecks {
-					sctx.Log("fix already attempted for these issues, waiting for CI re-run...")
-				} else if ciFixLimit <= 0 {
-					sctx.Log(fmt.Sprintf("issues detected: %s - auto-fix disabled, waiting for manual intervention...", issueDesc))
-					return ciFailureOutcome(reportedIssues, mergeConflict, "CI failures require manual intervention"), nil
-				} else if s.ciFixAttempts >= ciFixLimit {
-					sctx.Log(fmt.Sprintf("issues detected: %s - max auto-fix attempts (%d) reached, waiting for manual intervention...", issueDesc, ciFixLimit))
-					return ciFailureOutcome(reportedIssues, mergeConflict, "CI failures still present after auto-fix attempts"), nil
-				} else if fixKey == s.lastFixedChecks {
+				if s.lastRepairStillUnverified(checks, mergeConflict) {
+					// The provider has not re-run the checks the last
+					// published repair targeted: the failures on screen are
+					// the ones that repair was for, not a verdict on it.
+					// Escalating them again would spend a fix round on stale
+					// evidence, so the monitor keeps waiting for the re-run.
 					sctx.Log("fix already attempted for these issues, waiting for CI re-run...")
 				} else {
-					nextAttempt := s.ciFixAttempts + 1
-					if sctx.StepResultID != "" {
-						if err := sctx.DB.SetCIFixAttempts(sctx.StepResultID, nextAttempt); err != nil {
-							return nil, fmt.Errorf("persist CI auto-fix attempt: %w", err)
-						}
-					}
-					s.ciFixAttempts = nextAttempt
-					sctx.Log(fmt.Sprintf("issues detected: %s - auto-fixing (attempt %d/%d)...", issueDesc, s.ciFixAttempts, ciFixLimit))
-					previousHeadSHA := sctx.Run.HeadSHA
-					repair, err := s.autoFixCI(sctx, host, pr, fixTargets, mergeConflict)
-					if outcome := pipeline.ProtectedPathOutcome(err); outcome != nil {
-						return outcome, nil
-					}
-					if outcome := ciFixAgentBudgetOutcome(sctx, issueDesc, err); outcome != nil {
-						return outcome, nil
-					}
-					if err != nil && errors.Is(err, errCIAttestationUnsettled) {
-						sctx.Log(fmt.Sprintf("CI repair push is not settled: %v", err))
-						return ciFailureOutcome(reportedIssues, mergeConflict, err.Error()), nil
-					}
-					if err != nil {
-						sctx.Log(fmt.Sprintf("warning: CI auto-fix failed: %v", err))
-					} else if repair.HeadAdvanced || sctx.Run.HeadSHA != previousHeadSHA {
-						s.lastFixedChecks = fixKey
-						s.lastFixedCompletedAt = fixCompletedAt
-						if repair.Revalidate {
-							return &pipeline.StepOutcome{RestartFrom: types.StepReview}, nil
-						}
-						// The repair was published, so the monitor stays on
-						// this run and waits for the provider to re-run the
-						// checks against the new head.
-					} else if repair.NoCodeChangeNeeded {
-						sctx.Log(fmt.Sprintf("CI fixer concluded no code change is needed: %s", repair.Summary))
-						return ciFailureOutcome(reportedIssues, mergeConflict, repair.Summary), nil
-					} else {
-						// No changes produced - don't set lastFixedChecks so next
-						// poll treats this as a new failure and retries if attempts remain.
-						sctx.Log("CI fix produced no changes, will retry if attempts remain...")
-					}
+					// Every check has finished and every authorized rerun is
+					// spent: this poll is a settled observation. Each issue
+					// becomes one finding carrying its action, and the
+					// executor's shared findings machinery decides what
+					// happens next - auto-fix findings enter the auto_fix.ci
+					// loop as fix rounds, ask-user findings park for a
+					// decision, and a poll with only ask-user findings (a
+					// transient check no rerun will replace, a review bot's
+					// comments) never starts a round.
+					s.lastFixedChecks = ""
+					s.lastFixedCompletedAt = nil
+					sctx.DeferredFindings = ""
+					s.observedCompletedAt = terminalFailureCompletionTimes(checks)
+					findings := ciSettledObservationFindings(
+						checks,
+						unsafeInfrastructure,
+						failing,
+						unresolvedCancelled,
+						mergeConflict,
+						s.transientReruns.used,
+						reviewBotComments(sctx, host, pr, ordinaryChecks),
+					)
+					sctx.Log(fmt.Sprintf("issues detected: %s", findings.Summary))
+					return ciObservationOutcome(findings), nil
 				}
 			} else {
 				s.lastFixedChecks = ""
@@ -819,6 +774,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					// is common and must never look green. Elapsed time is not
 					// evidence; there is no grace-period promotion path.
 					if sctx.Config != nil && sctx.Config.NoCI {
+						sctx.DeferredFindings = ""
 						lastMonitorLog = logCIMonitorStatus(sctx, ciNoChecksPassedMsg, lastMonitorLog)
 					} else {
 						clearCIMonitorReady(sctx)
@@ -826,6 +782,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 						sctx.Log("no CI checks reported yet, waiting for checks to register...")
 					}
 				case allChecksPassed(checks):
+					sctx.DeferredFindings = ""
 					lastMonitorLog = logCIMonitorStatus(sctx, ciChecksPassedMsg, lastMonitorLog)
 				default:
 					clearCIMonitorReady(sctx)
@@ -841,11 +798,19 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 }
 
 func logCIMonitorStatus(sctx *pipeline.StepContext, message, previous string) string {
+	return logCIMonitorStatusWithPersister(sctx, message, previous, func(ready, declaredNoCI bool) error {
+		return setCIMonitorReadiness(sctx, ready, declaredNoCI)
+	})
+}
+
+func logCIMonitorStatusWithPersister(sctx *pipeline.StepContext, message, previous string, persist func(bool, bool) error) string {
 	if message != previous {
 		ready := message == ciChecksPassedMsg || message == ciNoChecksPassedMsg
 		declaredNoCI := message == ciNoChecksPassedMsg
-		if err := setCIMonitorReadiness(sctx, ready, declaredNoCI); err != nil {
+		if err := persist(ready, declaredNoCI); err != nil {
 			sctx.Log(fmt.Sprintf("warning: could not persist CI readiness: %v", err))
+			sctx.Log(message)
+			return previous
 		}
 		sctx.Log(message)
 	}
@@ -860,8 +825,14 @@ func clearCIMonitorReady(sctx *pipeline.StepContext) {
 
 func setCIMonitorReadiness(sctx *pipeline.StepContext, ready, declaredNoCI bool) error {
 	declaredNoCI = ready && declaredNoCI
-	if err := sctx.DB.SetRunCIReadyWithReason(sctx.Run.ID, ready, declaredNoCI); err != nil {
-		return err
+	if ready && sctx.StepResultID != "" {
+		if err := sctx.DB.SetRunCIReadyAndClearStepOverride(sctx.Run.ID, sctx.StepResultID, declaredNoCI); err != nil {
+			return err
+		}
+	} else {
+		if err := sctx.DB.SetRunCIReadyWithReason(sctx.Run.ID, ready, declaredNoCI); err != nil {
+			return err
+		}
 	}
 	if sctx.CIReadinessChanged != nil {
 		sctx.CIReadinessChanged(ready, declaredNoCI)

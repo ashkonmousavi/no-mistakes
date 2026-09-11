@@ -48,8 +48,8 @@ type commitSummary struct {
 var errRejectedCommitSummary = errors.New("rejected commit summary")
 
 const (
-	noChangesAppliedSummary = "no changes applied"
-	changesAppliedSummary   = "changes applied"
+	noChangesAppliedSummary = pipeline.FixSummaryNoChangesApplied
+	changesAppliedSummary   = pipeline.FixSummaryChangesApplied
 )
 
 const fixerRemovalRule = `

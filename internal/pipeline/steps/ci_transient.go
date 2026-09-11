@@ -741,15 +741,23 @@ func infrastructureRerunCandidates(checks []scm.Check, budget *infrastructureRer
 	return []scm.Check{*candidate}
 }
 
-func infrastructureFailuresWithoutExactRerun(checks []scm.Check) []string {
-	var names []string
+func infrastructureFailuresWithoutExactRerun(checks []scm.Check) []scm.Check {
+	var unsafe []scm.Check
 	for _, check := range checks {
 		if checkFailedTerminally(check) && check.InfrastructureFailure && !check.InfrastructureRerunSafe {
-			names = append(names, check.Name)
+			unsafe = append(unsafe, check)
 		}
 	}
-	sort.Strings(names)
-	return names
+	sort.Slice(unsafe, func(i, j int) bool {
+		if unsafe[i].Name != unsafe[j].Name {
+			return unsafe[i].Name < unsafe[j].Name
+		}
+		if unsafe[i].ProviderID != unsafe[j].ProviderID {
+			return unsafe[i].ProviderID < unsafe[j].ProviderID
+		}
+		return unsafe[i].Link < unsafe[j].Link
+	})
+	return unsafe
 }
 
 // mergeCheckNames appends the names in extra that base does not already carry.
@@ -935,7 +943,7 @@ func (s *CIStep) rerunInfrastructureChecks(sctx *pipeline.StepContext, host scm.
 	} else if mismatch != "" {
 		sctx.Log(mismatch)
 		invalidateInfrastructurePRTarget(pr)
-		return false, ciFailureOutcome(failingCheckNames(checks), false, mismatch)
+		return false, ciFailureOutcome(terminalCheckTargetsForNames(checks, failingCheckNames(checks)), false, mismatch)
 	}
 	publishedHead := publishedBranchHead
 	if s.publishedHead != nil {
@@ -1187,40 +1195,46 @@ func markArtifactInfrastructureFailures(sctx *pipeline.StepContext, host scm.Hos
 	}
 }
 
-// ciUnresolvedCancelledOutcome parks the run for transient checks that will not
-// resolve on their own: either the run already spent their rerun budget and they
-// came back cancelled or failed during setup again, or no rerun is outstanding.
+// unresolvedTransientFindings renders the transient checks that will not
+// resolve on their own as findings: either the run already spent their rerun
+// budget and they came back cancelled or failed during setup again, or no
+// rerun is outstanding.
 //
 // A cancellation is never a verdict on the code, so there is nothing for the fix
 // agent to repair: routing it into the auto_fix.ci loop would spend an agent
 // round - and let that agent edit code the provider never tested - chasing an
-// outcome only the provider can clear. The findings are ask-user for the same
-// reason, so a fix loop cannot pick them up later either.
+// outcome only the provider can clear. The findings are ask-user for that
+// reason: the executor's auto-fix filter never selects them, and only a human
+// who answers the gate with fix can send one to the fix agent.
 //
 // checks preserves the provider-attributed cause through the shared cancel
 // bucket so the approval result does not describe a setup failure as a
 // cancellation. reruns reports how many reruns this run spent on each check.
-func ciUnresolvedCancelledOutcome(names []string, checks []scm.Check, reruns func(string) int) *pipeline.StepOutcome {
+// The summary names the diagnosis; it is empty when there is nothing to
+// report.
+func unresolvedTransientFindings(names []string, checks []scm.Check, reruns func(string) int) ([]Finding, string) {
 	unresolved := unresolvedTransientChecks(names, checks)
+	if len(unresolved) == 0 {
+		return nil, ""
+	}
 	preRunCount := 0
 	for _, check := range unresolved {
 		if check.PreRunFailure {
 			preRunCount++
 		}
 	}
-	findings := Findings{Summary: unresolvedTransientSummary(len(unresolved), preRunCount)}
+	items := make([]Finding, 0, len(unresolved))
 	for _, check := range unresolved {
-		findings.Items = append(findings.Items, Finding{
+		items = append(items, Finding{
 			Severity:    "warning",
 			Description: unresolvedTransientDescription(check.Name, reruns(check.Name), check.PreRunFailure),
 			Action:      types.ActionAskUser,
+			Category:    types.FindingCategoryCITransient,
+			Check:       check.Name,
+			CheckID:     check.ProviderID,
 		})
 	}
-	findingsJSON, _ := json.Marshal(findings)
-	return &pipeline.StepOutcome{
-		NeedsApproval: true,
-		Findings:      string(findingsJSON),
-	}
+	return items, unresolvedTransientSummary(len(unresolved), preRunCount)
 }
 
 // unresolvedTransientChecks keeps the cause attached to each provider check.

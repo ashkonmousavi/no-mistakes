@@ -2,8 +2,11 @@ package daemon
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -97,6 +100,58 @@ func TestRunSnapshot_CompletedRunRetainsTerminalRevisionUntilEviction(t *testing
 	event, ok := sub.Next(t.Context())
 	if !ok || event.Type != ipc.EventStreamGap || event.StateRev != terminalRev {
 		t.Fatalf("completed subscription first event = %#v, ok=%v, want terminal gap revision %d", event, ok, terminalRev)
+	}
+}
+
+// A persisted terminal status is authoritative before the executor owner's
+// deferred cleanup marks its in-memory stream complete. A subscriber entering
+// that interval gets one reconciliation gap and closes immediately instead of
+// waiting on unrelated agent or worktree cleanup.
+func TestSubscribe_PersistedTerminalRunYieldsGapThenClosesBeforeOwnerCleanup(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	repo, err := database.InsertRepo(t.TempDir(), "https://example.com/repo.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := database.InsertRun(repo.ID, "feature", "head", "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunStatus(run.ID, types.RunCompleted); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewRunManager(database, nil, nil)
+	m.broadcast(ipc.Event{Type: ipc.EventRunCompleted, RunID: run.ID})
+	sub, err := m.Subscribe(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	first, ok := sub.Next(t.Context())
+	if !ok || first.Type != ipc.EventStreamGap {
+		t.Fatalf("first frame = %#v, ok=%v, want one stream gap", first, ok)
+	}
+	closed := make(chan bool, 1)
+	go func() {
+		_, stillOpen := sub.Next(t.Context())
+		closed <- !stillOpen
+	}()
+	select {
+	case isClosed := <-closed:
+		if !isClosed {
+			t.Fatal("terminal subscription produced a second frame")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("persisted terminal subscription waited for owner cleanup")
+	}
+	if m.completedRuns[run.ID] {
+		t.Fatal("test did not isolate the interval before owner cleanup")
 	}
 }
 

@@ -312,6 +312,7 @@ func (e *Executor) initializeRunScopes(runID string) {
 type stepExecutionState struct {
 	fixing           bool
 	previousFindings string
+	deferredFindings string
 	roundNum         int
 	autoFixAttempts  int
 	executionMS      int64
@@ -544,6 +545,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		skipRemaining, restartFrom, err := e.executeStep(ctx, gate.step, gate.stepResult, run, repo, workDir, logDir, stepExecutionState{
 			fixing:           true,
 			previousFindings: merged,
+			deferredFindings: removeMatchingFindingsJSON(gate.findings, selected),
 			roundNum:         gate.round,
 			autoFixAttempts:  gate.autoFixes,
 			executionMS:      duration,
@@ -874,6 +876,18 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		ciReadyNoCI = declaredNoCI
 		e.emitCIReadinessEvent(run, repo, ready, declaredNoCI)
 	}
+	// A fix round is marked fixing before the step re-executes and only
+	// changes status when Execute returns. A step whose fix round ends with
+	// ordinary execution (the CI monitor after a published repair) reports
+	// that here, so the durable status and every subscriber see running
+	// again; step_started is the event the TUI already maps to running.
+	markRunning := func() error {
+		if err := e.db.UpdateStepStatus(sr.ID, types.StepStatusRunning); err != nil {
+			return fmt.Errorf("return step status to running: %w", err)
+		}
+		e.emitStepEvent(ipc.EventStepStarted, run, repo, stepName, string(types.StepStatusRunning))
+		return nil
+	}
 	sctx := &StepContext{
 		Ctx:              ctx,
 		Run:              run,
@@ -892,6 +906,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		EvidenceDir:      e.runEvidenceDir(run.ID),
 		Fixing:           state.fixing,
 		PreviousFindings: state.previousFindings,
+		DeferredFindings: state.deferredFindings,
 		Log:              writeLog,
 		LogChunk:         writeLogChunk,
 		LogFile: func(text string) {
@@ -899,6 +914,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			touchLogActivity(text, true)
 		},
 		CIReadinessChanged: ciReadinessChanged,
+		MarkRunning:        markRunning,
 		OnPRMerged:         e.onPRMerged,
 	}
 	if stepName == types.StepReview {
@@ -992,9 +1008,6 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		if outcome.RestartReason != "" {
 			roundTrigger = string(outcome.RestartReason)
 		}
-		if stepName == types.StepCI && restartFrom != "" && !sctx.Fixing {
-			roundTrigger = "auto_fix"
-		}
 		if stepName == types.StepReview {
 			if e.config != nil && e.config.CaptureEvalProvenance {
 				inserted, dbErr = e.db.InsertReviewStepRoundWithProvenance(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, reviewStartingHeadSHA, e.config.TrustedConfigSHA, e.config.ReplayGlobalYAML, e.config.ReplayRepoYAML, roundDuration)
@@ -1002,9 +1015,21 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 				inserted, dbErr = e.db.InsertReviewStepRound(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, roundDuration)
 			}
 		} else {
-			inserted, dbErr = e.db.InsertStepRound(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, roundDuration)
+			inserted, dbErr = e.db.InsertStepRoundWithRepair(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, outcome.RepairPublished, roundDuration)
 		}
 		if dbErr != nil {
+			if outcome.postReviewHeadAdvanced {
+				durationMS := executionMS + roundDuration
+				persistErr := fmt.Errorf("persist post-review head advance round: %w", dbErr)
+				redactedErr := safeurl.RedactText(persistErr.Error())
+				fmt.Fprintf(logFile, "\nerror: %s\n", redactedErr)
+				touchLogActivity("error: "+redactedErr, true)
+				if failErr := e.db.FailStep(sr.ID, redactedErr, durationMS); failErr != nil {
+					slog.Warn("failed to mark step as failed in db", "step", stepName, "error", failErr)
+				}
+				e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(types.StepStatusFailed), "", redactedErr, &durationMS)
+				return false, "", fmt.Errorf("step %s failed: %s", stepName, redactedErr)
+			}
 			currentRoundID = roundInsertID(currentRoundID, inserted, dbErr)
 			slog.Warn("failed to insert step round", "step", stepName, "round", roundNum, "error", dbErr)
 		} else {
@@ -1044,6 +1069,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 				phaseStart = time.Now()
 				sctx.Fixing = true
 				sctx.PreviousFindings = fixableFindings
+				sctx.DeferredFindings = removeMatchingFindingsJSON(outcome.Findings, fixableFindings)
 				nextTrigger = "auto_fix"
 				continue
 			}
@@ -1170,6 +1196,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			selectedFindings := filterFindingsJSON(outcome.Findings, response.findingIDs)
 			mergedFindings := mergeUserOverridesJSON(selectedFindings, response.instructions, response.addedFindings)
 			sctx.PreviousFindings = mergedFindings
+			sctx.DeferredFindings = removeMatchingFindingsJSON(outcome.Findings, selectedFindings)
 			nextTrigger = "auto_fix"
 			if currentRoundID != "" {
 				allSelectedIDs := combineSelectedFindingIDs(response.findingIDs, mergedFindings)

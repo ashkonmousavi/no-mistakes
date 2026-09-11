@@ -48,11 +48,20 @@ type RunManager struct {
 	dones        map[string]chan struct{}           // runID → closed when goroutine exits
 	wg           sync.WaitGroup                     // tracks background run goroutines
 	shuttingDown atomic.Bool                        // prevents new runs during shutdown
+	shutdownCtx  context.Context                    // cancels setup not yet owned by an executor
+	stopSetup    context.CancelFunc
 	db           *db.DB
 	paths        *paths.Paths
 	steps        StepFactory
 
 	branchLocks sync.Map // repoID+"/"+branch → *sync.Mutex
+	// worktreeLocks serializes Git worktree administration mutations for one
+	// bare gate repository. Pipelines on different branches still execute in
+	// parallel; only their short worktree add/remove operations are ordered.
+	worktreeLocks         sync.Map // repoID → chan struct{}
+	worktreeAdd           func(context.Context, string, string, string) error
+	worktreeRemove        func(context.Context, string, string) error
+	worktreeRemoveTimeout time.Duration
 
 	// evalCaptureMu serializes automatic eval collection. Concurrent runs
 	// finishing together would otherwise write the same per-repository object
@@ -69,7 +78,7 @@ type RunManager struct {
 	subMu          sync.Mutex
 	subscribers    map[string][]*eventMailbox // runID → subscriber mailboxes
 	stateRevs      map[string]int64           // runID → monotonic state revision
-	completedRuns  map[string]bool            // runIDs whose goroutines have finished
+	completedRuns  map[string]bool            // runIDs whose subscriber streams have finished
 	completedOrder []string                   // insertion order for FIFO eviction
 }
 
@@ -83,16 +92,22 @@ func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory) *Ru
 	if stepFactory == nil {
 		stepFactory = func() []pipeline.Step { return steps.AllSteps() }
 	}
+	shutdownCtx, stopSetup := context.WithCancel(context.Background())
 	return &RunManager{
-		executors:     make(map[string]*pipeline.Executor),
-		cancels:       make(map[string]context.CancelCauseFunc),
-		dones:         make(map[string]chan struct{}),
-		db:            database,
-		paths:         p,
-		steps:         stepFactory,
-		subscribers:   make(map[string][]*eventMailbox),
-		stateRevs:     make(map[string]int64),
-		completedRuns: make(map[string]bool),
+		executors:             make(map[string]*pipeline.Executor),
+		cancels:               make(map[string]context.CancelCauseFunc),
+		dones:                 make(map[string]chan struct{}),
+		shutdownCtx:           shutdownCtx,
+		stopSetup:             stopSetup,
+		db:                    database,
+		paths:                 p,
+		steps:                 stepFactory,
+		worktreeAdd:           git.WorktreeAdd,
+		worktreeRemove:        git.WorktreeRemove,
+		worktreeRemoveTimeout: 30 * time.Second,
+		subscribers:           make(map[string][]*eventMailbox),
+		stateRevs:             make(map[string]int64),
+		completedRuns:         make(map[string]bool),
 	}
 }
 
@@ -260,6 +275,30 @@ func newPipelineAgent(ctx context.Context, cfg *config.Config, evidenceRoot stri
 	if steps.IsDemoMode() {
 		return agent.NewNoop(), nil
 	}
+	primary, err := newConfiguredAgent(ctx, cfg, evidenceRoot, lookPath, environment)
+	if err != nil {
+		return nil, err
+	}
+	roles := make(map[string]agent.Agent, len(cfg.ReviewAgents))
+	for _, role := range []string{"reviewer", "fixer"} {
+		entry, ok := cfg.ReviewAgents[role]
+		if !ok {
+			continue
+		}
+		next, err := newConfiguredAgent(ctx, cfg.ForReviewAgent(entry), evidenceRoot, lookPath, environment)
+		if err != nil {
+			_ = primary.Close()
+			for _, existing := range roles {
+				_ = existing.Close()
+			}
+			return nil, fmt.Errorf("create review_agents.%s: %w", role, err)
+		}
+		roles[role] = next
+	}
+	return agent.WithReviewAgents(primary, roles["reviewer"], roles["fixer"]), nil
+}
+
+func newConfiguredAgent(ctx context.Context, cfg *config.Config, evidenceRoot string, lookPath func(string) (string, error), environment runenv.Overlay) (agent.Agent, error) {
 	if err := cfg.ResolveAgent(ctx, lookPath); err != nil {
 		return nil, err
 	}
@@ -407,6 +446,7 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 		}
 		addRunPerformanceSummary(m.db, plan.run.ID, fields)
 		telemetry.Track("run", fields)
+		m.autoIngestCIFalseNegatives(runCtx, plan.cfg, plan.run.ID)
 	}()
 }
 
@@ -460,11 +500,24 @@ func trustedConfigOverrideFields(pushed, effective *config.RepoConfig) []string 
 // subscribe-then-reconcile ordering rule. A run that has already completed
 // yields that one gap and then finishes.
 func (m *RunManager) Subscribe(runID string) (*Subscription, error) {
+	// The executor persists terminal state before its owner goroutine returns
+	// and calls closeSubscribers. A subscriber admitted in that interval needs
+	// only the initial gap so it can reconcile the authoritative terminal
+	// snapshot; keeping its stream open until owner cleanup makes closure depend
+	// on unrelated agent/process teardown latency. Read before subMu so the
+	// event fan-out critical section remains I/O-free. Terminal states never
+	// advance again, so a positive observation cannot become stale.
+	persistedTerminal := false
+	if m.db != nil {
+		run, err := m.db.GetRun(runID)
+		persistedTerminal = err == nil && run != nil && run.Status.Terminal()
+	}
+
 	m.subMu.Lock()
 	defer m.subMu.Unlock()
 
 	mb := newEventMailbox(runID, m.stateRevs[runID])
-	if m.completedRuns[runID] {
+	if persistedTerminal || m.completedRuns[runID] {
 		mb.close()
 		return &Subscription{mb: mb, unsub: func() {}}, nil
 	}
@@ -604,9 +657,32 @@ func (m *RunManager) removeRunWorktree(repoID, runID, gateDir, wtDir, reason str
 		slog.Warn("preserving run worktree", "run_id", runID, "path", wtDir, "reason", refusal)
 		return
 	}
-	if err := git.WorktreeRemove(context.Background(), gateDir, wtDir); err != nil {
+	removeCtx, cancel := context.WithTimeout(context.Background(), m.worktreeRemoveTimeout)
+	defer cancel()
+	if err := m.withGateWorktreeLock(removeCtx, repoID, func() error {
+		return m.worktreeRemove(removeCtx, gateDir, wtDir)
+	}); err != nil {
 		slog.Warn("failed to remove run worktree", "reason", reason, "run_id", runID, "path", wtDir, "error", err)
 	}
+}
+
+// withGateWorktreeLock keeps mutations of one gate's shared worktrees
+// administration directory from overlapping. A run's terminal DB status is
+// visible before its goroutine performs deferred cleanup, so a successor can
+// otherwise start while removal of the last prior worktree deletes the shared
+// directory Git is concurrently using for the new worktree.
+func (m *RunManager) withGateWorktreeLock(ctx context.Context, repoID string, action func() error) error {
+	candidate := make(chan struct{}, 1)
+	candidate <- struct{}{}
+	lockVal, _ := m.worktreeLocks.LoadOrStore(repoID, candidate)
+	gate := lockVal.(chan struct{})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gate:
+	}
+	defer func() { gate <- struct{}{} }()
+	return action()
 }
 
 // closeSubscribers soft-closes every subscriber for a run and marks the run
@@ -1167,6 +1243,12 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		trackStartFailure("daemon_shutdown")
 		return "", fmt.Errorf("daemon is shutting down")
 	}
+	ctx, cancelSetup := context.WithCancel(ctx)
+	stopShutdownPropagation := context.AfterFunc(m.shutdownCtx, cancelSetup)
+	defer func() {
+		stopShutdownPropagation()
+		cancelSetup()
+	}()
 
 	// Best-effort only: a clone's remotes may change after init. Refresh the
 	// registered URLs before constructing any run-owned Git operation, but keep
@@ -1246,7 +1328,9 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		trackStartFailure("record_worktree_placement")
 		return "", fmt.Errorf("record worktree placement: %w", err)
 	}
-	if err := git.WorktreeAdd(ctx, gateDir, wtDir, headSHA); err != nil {
+	if err := m.withGateWorktreeLock(ctx, repo.ID, func() error {
+		return m.worktreeAdd(ctx, gateDir, wtDir, headSHA)
+	}); err != nil {
 		m.db.UpdateRunError(run.ID, fmt.Sprintf("create worktree: %s", err))
 		trackStartFailure("create_worktree")
 		return "", fmt.Errorf("create worktree: %w", err)
@@ -1360,51 +1444,14 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		return "", fmt.Errorf("resolve forge profile: %w", err)
 	}
 
-	// Create agent. In demo mode, skip resolution and use a no-op agent.
-	var ag agent.Agent
-	if steps.IsDemoMode() {
-		ag = agent.NewNoop()
-	} else {
-		if err := cfg.ResolveAgent(ctx, exec.LookPath); err != nil {
-			m.db.UpdateRunError(run.ID, err.Error())
-			trackStartFailure("resolve_agent")
-			return "", err
-		}
-		agents := cfg.Agents
-		if len(agents) == 0 {
-			agents = []types.AgentName{cfg.Agent}
-		}
-		created := make([]agent.Agent, 0, len(agents))
-		for _, name := range agents {
-			next, agErr := agent.NewWithOptions(name, cfg.AgentPathFor(name), cfg.AgentArgsFor(name), agent.Options{
-				ACPRegistryOverrides:   cfg.ACPRegistryOverrides,
-				DisableProjectSettings: cfg.DisableProjectSettings,
-				Profile:                cfg.AgentProfileFor(name),
-				Environment:            forgeEnvironment(forgeCtx),
-			})
-			if agErr != nil {
-				m.db.UpdateRunError(run.ID, fmt.Sprintf("create agent %s: %s", name, agErr))
-				trackStartFailure("create_agent")
-				return "", fmt.Errorf("create agent %s: %w", name, agErr)
-			}
-			// Steer every pipeline agent to keep writes inside the worktree and
-			// avoid mutating system state (e.g. brew/Homebrew touching
-			// /Applications), which triggers macOS App Management prompts.
-			created = append(created, agent.WithSteering(next, m.paths.EvidenceRoot(cfg.Test.Evidence.LocalRoot)))
-		}
-		ag = agent.NewFallback(created)
-		// Fail closed ONLY under the trusted opt-out: when the repo asked to
-		// disable project settings, refuse any resolved harness that lacks a
-		// verified suppression knob rather than launch it with the target repo's
-		// project instructions loaded. When the repo did not opt out, every
-		// adapter runs exactly as before (backward-compat).
-		if cfg.DisableProjectSettings {
-			if err := agent.EnsureGateNeutralized(ag); err != nil {
-				m.db.UpdateRunError(run.ID, err.Error())
-				trackStartFailure("gate_not_neutralized")
-				return "", err
-			}
-		}
+	// Create agent. In demo mode, newPipelineAgent returns a no-op agent, and it
+	// wires review-role routing plus the trusted-opt-out gate-neutralization
+	// fail-closed check.
+	ag, err := newPipelineAgent(ctx, cfg, m.paths.EvidenceRoot(cfg.Test.Evidence.LocalRoot), exec.LookPath, forgeEnvironment(forgeCtx))
+	if err != nil {
+		m.db.UpdateRunError(run.ID, err.Error())
+		trackStartFailure("create_agent")
+		return "", err
 	}
 
 	execSteps := m.steps()
@@ -1433,16 +1480,23 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 	// Track executor.
 	done := make(chan struct{})
 	m.mu.Lock()
+	if m.shuttingDown.Load() {
+		m.mu.Unlock()
+		cancel(nil)
+		_ = ag.Close()
+		trackStartFailure("daemon_shutdown")
+		return "", fmt.Errorf("daemon is shutting down")
+	}
 	m.executors[run.ID] = executor
 	m.cancels[run.ID] = cancel
 	m.dones[run.ID] = done
+	m.wg.Add(1)
 	m.mu.Unlock()
 
 	// Background goroutine now owns worktree cleanup.
 	bgOwnsWorktree = true
 
 	// Launch pipeline in background.
-	m.wg.Add(1)
 	go func() {
 		startedAt := time.Now()
 		defer m.wg.Done()
@@ -1531,6 +1585,7 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		// pipeline's own outcome is already decided and reported above, so
 		// nothing below can change it.
 		m.autoCaptureEvalCase(runCtx, cfg, run.ID)
+		m.autoIngestCIFalseNegatives(runCtx, cfg, run.ID)
 	}()
 
 	return run.ID, nil
@@ -1588,6 +1643,54 @@ func (m *RunManager) autoCaptureEvalCase(ctx context.Context, cfg *config.Config
 		slog.Debug("run has no eval case to collect", "run_id", runID, "reason", result.Reason)
 	default:
 		slog.Info("collected eval case", "run_id", runID, "cases", result.Captured, "pruned", result.Pruned)
+	}
+}
+
+// autoIngestCIFalseNegatives groups eligible fixed ci-check and ci-review-bot
+// findings (available bot comments or their check-level fallback) by the exact
+// green Review epoch that owned them, then writes each group onto that round's
+// case. A repair publication, documentation-authority carry, or another
+// authority-invalidating mutation ends eligibility until a later green
+// rereview, so a finding introduced after an unreviewed mutation is never
+// attributed backwards.
+//
+// Like autoCaptureEvalCase it is subordinate to the run: it swallows its own
+// panic, bounds its own time, shares the eval mutex so it never races capture,
+// and reports failure only to the log. It reads the CI findings the pipeline
+// already persisted per round, so it never fabricates a case.
+func (m *RunManager) autoIngestCIFalseNegatives(ctx context.Context, cfg *config.Config, runID string) {
+	if cfg == nil || !cfg.Eval.AutoCapture || !cfg.Eval.CaptureProvenance {
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic while ingesting CI false negatives", "run_id", runID, "panic", r)
+		}
+	}()
+	m.evalCaptureMu.Lock()
+	defer m.evalCaptureMu.Unlock()
+
+	if ctx.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, evalAutoCaptureTimeout)
+	defer cancel()
+
+	results, skipped, err := eval.AutoIngestCIFalseNegatives(ctx, m.paths, m.db, runID, cfg.Eval.MaxCases)
+	switch {
+	case err != nil:
+		slog.Warn("failed to ingest CI false negatives", "run_id", runID, "error", err)
+	case skipped:
+		slog.Debug("run has no CI false negative to ingest", "run_id", runID)
+	default:
+		added := 0
+		for _, result := range results {
+			added += result.Added
+		}
+		slog.Info("ingested CI false negatives", "run_id", runID, "cases", len(results), "added", added)
 	}
 }
 
@@ -1685,9 +1788,9 @@ func (m *RunManager) HandleRespondWithOverrides(runID string, step types.StepNam
 // Shutdown cancels all active runs. Called during daemon shutdown to prevent
 // orphaned goroutines from continuing agent calls and git operations.
 func (m *RunManager) Shutdown() {
-	m.shuttingDown.Store(true)
-
 	m.mu.Lock()
+	m.shuttingDown.Store(true)
+	m.stopSetup()
 	cancels := make(map[string]context.CancelCauseFunc, len(m.cancels))
 	for id, cancel := range m.cancels {
 		cancels[id] = cancel

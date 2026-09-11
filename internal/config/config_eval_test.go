@@ -108,4 +108,8 @@ func TestDefaultConfigYAMLDocumentsEvalCollection(t *testing.T) {
 	if cfg.Eval != evalDefaults() {
 		t.Fatalf("shipped default config eval = %#v, want Go defaults %#v", cfg.Eval, evalDefaults())
 	}
+	const exactEligibilityGuidance = "Eligible repaired ci-check and ci-review-bot findings become\n# Review false negatives only for their exact green Review epoch. The eval\n# reference owns the complete eligibility rules."
+	if !strings.Contains(string(written), exactEligibilityGuidance) {
+		t.Fatalf("shipped default config omits exact Review-epoch eligibility guidance:\n%s", written)
+	}
 }

@@ -344,6 +344,40 @@ func TestResetStepsFromPreservesSkippedSteps(t *testing.T) {
 	}
 }
 
+func TestResetStepsFromClearsApprovalOverrideForRevalidation(t *testing.T) {
+	d := openTestDB(t)
+	repo, err := d.InsertRepo("/tmp/gate", "https://example.com/repo.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := d.InsertRun(repo.ID, "feature", "abc123", "def456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ci, err := d.InsertStepResult(run.ID, types.StepCI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CompleteStep(ci.ID, 0, 10, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetStepOverrideReason(ci.ID, "required check still failing"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := d.ResetStepsFrom(run.ID, types.StepReview.Order()); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := d.GetStepResult(ci.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != types.StepStatusPending || got.OverrideReason != nil {
+		t.Fatalf("reset CI step = %+v, want pending with no stale override", got)
+	}
+}
+
 func TestUpdateStepStatusWithDuration(t *testing.T) {
 	d := openTestDB(t)
 	repo, _ := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")

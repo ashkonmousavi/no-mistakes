@@ -148,6 +148,9 @@ type GlobalConfig struct {
 	// which model runs with the operator's credentials, so no pushed branch may
 	// set it.
 	AgentConfig map[string]agentcfg.Profile `yaml:"agent_config"`
+	// ReviewAgents selects independent review-loop harnesses and profiles.
+	// Global-only: repository input must not select credential/model profiles.
+	ReviewAgents map[string]ReviewAgent `yaml:"review_agents"`
 	// WorktreeRoots places a repository's pipeline run worktrees under a
 	// directory the operator chose instead of the default
 	// <NM_HOME>/worktrees/<repoID>. Keys are registered checkout paths
@@ -203,6 +206,7 @@ type globalConfigRaw struct {
 	AgentPathOverride       map[string]string          `yaml:"agent_path_override"`
 	AgentArgsOverride       map[string][]string        `yaml:"agent_args_override"`
 	AgentConfig             map[string]agentProfileRaw `yaml:"agent_config"`
+	ReviewAgents            map[string]ReviewAgent     `yaml:"review_agents"`
 	WorktreeRoots           map[string]string          `yaml:"worktree_roots"`
 	CITimeout               string                     `yaml:"ci_timeout"`
 	DaemonConnectTimeout    string                     `yaml:"daemon_connect_timeout"`
@@ -596,6 +600,7 @@ type Config struct {
 	AgentPathOverride     map[string]string
 	AgentArgsOverride     map[string][]string
 	AgentConfig           map[string]agentcfg.Profile
+	ReviewAgents          map[string]ReviewAgent
 	CITimeout             time.Duration
 	StepQuietWarning      time.Duration
 	AgentTimeout          time.Duration
@@ -822,8 +827,9 @@ type EvalRaw struct {
 // configuration is a point-in-time snapshot that no longer exists anywhere.
 //
 // AutoCapture is the downstream half: it freezes each finished run's review
-// passes into the local corpus without anyone running a command. It has no
-// effect while CaptureProvenance is off, since there is nothing to freeze.
+// passes into the local corpus without anyone running a command and labels
+// repaired CI findings as false-negative gold. It has no effect while
+// CaptureProvenance is off, since there is nothing to freeze.
 type Eval struct {
 	CaptureProvenance bool
 	AutoCapture       bool
@@ -1145,9 +1151,12 @@ intent:
 # configuration a replay needs; it cannot be added afterwards, so a round
 # recorded without it is never replayable. auto_capture freezes each finished
 # run's review passes into the corpus so it fills without anyone remembering to
-# collect it. Cases of the same repository share one local object pool, so a
-# case costs its own records plus the objects its commits introduced - not a
-# copy of the repository. max_cases bounds the corpus: the oldest cases are
+# collect it. Eligible repaired ci-check and ci-review-bot findings become
+# Review false negatives only for their exact green Review epoch. The eval
+# reference owns the complete eligibility rules. Cases of the same repository
+# share one local object pool, so a case costs its own records plus the objects
+# its commits introduced - not a copy of the repository. max_cases bounds the
+# corpus: the oldest cases are
 # dropped first, and a case that already has recorded replays is never dropped.
 # Set max_cases to 0 to keep every case. diversified_size caps the official
 # gold-only eval set (default 32); 0 means one gold case per stratum. Unlabeled
@@ -2017,6 +2026,11 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 		}
 		cfg.AgentConfig = profiles
 	}
+	reviewAgents, err := parseReviewAgents(raw.ReviewAgents)
+	if err != nil {
+		return nil, err
+	}
+	cfg.ReviewAgents = reviewAgents
 	if raw.WorktreeRoots != nil {
 		if err := ValidateWorktreeRoots(raw.WorktreeRoots); err != nil {
 			return nil, err
@@ -2859,6 +2873,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		AgentPathOverride:     global.AgentPathOverride,
 		AgentArgsOverride:     global.AgentArgsOverride,
 		AgentConfig:           global.AgentConfig,
+		ReviewAgents:          global.ReviewAgents,
 		CITimeout:             global.CITimeout,
 		StepQuietWarning:      global.StepQuietWarning,
 		AgentTimeout:          global.AgentTimeout,
