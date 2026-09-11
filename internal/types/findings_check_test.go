@@ -6,7 +6,7 @@ import "testing"
 // both travel through the same JSON the executor persists and hands back as
 // PreviousFindings. Finding.UnmarshalJSON copies fields explicitly, so a
 // field it does not name is silently dropped on every parse.
-func TestParseFindingsJSON_RoundTripsCICheckFields(t *testing.T) {
+func TestParseFindingsJSON_RoundTripsDocumentClassAndCICheckIdentityTogether(t *testing.T) {
 	t.Parallel()
 	encoded, err := MarshalFindingsJSON(Findings{
 		Summary: "1 CI check failing",
@@ -17,6 +17,7 @@ func TestParseFindingsJSON_RoundTripsCICheckFields(t *testing.T) {
 			Category:    FindingCategoryCICheck,
 			Check:       "test (ubuntu-latest)",
 			CheckID:     "github-check-run:42",
+			Class:       FindingClassBehavioural,
 			Description: "CI check failing: test (ubuntu-latest)",
 		}},
 	})
@@ -31,8 +32,8 @@ func TestParseFindingsJSON_RoundTripsCICheckFields(t *testing.T) {
 		t.Fatalf("items = %+v, want one", parsed.Items)
 	}
 	item := parsed.Items[0]
-	if item.Check != "test (ubuntu-latest)" || item.CheckID != "github-check-run:42" || item.Category != FindingCategoryCICheck {
-		t.Fatalf("item = %+v, want the check name and category preserved", item)
+	if item.Check != "test (ubuntu-latest)" || item.CheckID != "github-check-run:42" || item.Category != FindingCategoryCICheck || item.Class != FindingClassBehavioural {
+		t.Fatalf("item = %+v, want the document class and CI identity preserved together", item)
 	}
 
 	legacy, err := ParseFindingsJSON(`{"findings":[{"severity":"warning","description":"CI check failing: test"}],"summary":"x"}`)

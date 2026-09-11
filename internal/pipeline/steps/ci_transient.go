@@ -935,7 +935,7 @@ func (s *CIStep) rerunInfrastructureChecks(sctx *pipeline.StepContext, host scm.
 	} else if mismatch != "" {
 		sctx.Log(mismatch)
 		invalidateInfrastructurePRTarget(pr)
-		return false, ciFailureOutcome(failingCheckNames(checks), false, mismatch)
+		return false, ciFailureOutcome(terminalCheckTargetsForNames(checks, failingCheckNames(checks)), false, mismatch)
 	}
 	publishedHead := publishedBranchHead
 	if s.publishedHead != nil {

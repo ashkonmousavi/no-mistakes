@@ -914,14 +914,27 @@ func TestRerunningArtifactInfrastructureIsOffByDefault(t *testing.T) {
 	}
 }
 
-func TestInfrastructureFailuresWithoutExactRerun_ReportMismatchInsteadOfAutofix(t *testing.T) {
+func TestInfrastructureFailureWithoutExactRerunBecomesUnifiedCIFinding(t *testing.T) {
 	t.Parallel()
 	checks := []scm.Check{
-		{Name: "artifact", Bucket: scm.CheckBucketFail, State: "FAILURE", InfrastructureFailure: true, InfrastructureRerunSafe: false},
+		{Name: "artifact", ProviderID: "github-check-run:42", Bucket: scm.CheckBucketFail, State: "FAILURE", InfrastructureFailure: true, InfrastructureRerunSafe: false},
 		{Name: "green", Bucket: scm.CheckBucketPass, State: "SUCCESS"},
 	}
-	if got := infrastructureFailuresWithoutExactRerun(checks); len(got) != 1 || got[0] != "artifact" {
+	got := infrastructureFailuresWithoutExactRerun(checks)
+	if len(got) != 1 || got[0] != "artifact" {
 		t.Fatalf("unsafe infrastructure failures = %v, want artifact", got)
+	}
+	outcome := ciFailureOutcome(terminalCheckTargetsForNames(checks, got), false, "provider retry scope is unsafe")
+	var findings Findings
+	if err := json.Unmarshal([]byte(outcome.Findings), &findings); err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.NeedsApproval || len(findings.Items) != 1 {
+		t.Fatalf("outcome = %+v findings = %+v, want one parked finding", outcome, findings.Items)
+	}
+	item := findings.Items[0]
+	if item.Action != types.ActionAskUser || item.Category != types.FindingCategoryCICheck || item.Check != "artifact" || item.CheckID != "github-check-run:42" {
+		t.Fatalf("finding = %+v, want provider-identified unified CI finding", item)
 	}
 }
 

@@ -49,17 +49,17 @@ const (
 // A feature branch cannot self-declare that value. When checks exist, their
 // actual states are always processed normally - even on a declared no-CI repo.
 type CIStep struct {
-	lastFixedChecks      string                    // encoded targets of the last published repair, so a poll that still shows them is not re-escalated
-	lastFixedCompletedAt map[string]checkFreshness // terminally failed check freshness at the observation the last repair targeted
-	observedCompletedAt  map[string]checkFreshness // terminally failed check freshness at the observation whose findings a fix round may repair
-	pendingFixSummary    string                    // one-line summary of the repair this execution published, attached to the outcome it ends with
-	pendingRepairPublish bool
+	lastFixedChecks              string                    // encoded targets of the last published repair, so a poll that still shows them is not re-escalated
+	lastFixedCompletedAt         map[string]checkFreshness // terminally failed check freshness at the observation the last repair targeted
+	observedCompletedAt          map[string]checkFreshness // terminally failed check freshness at the observation whose findings a fix round may repair
+	pendingFixSummary            string                    // one-line summary of the repair this execution published, attached to the outcome it ends with
+	pendingRepairPublish         bool
 	transientReruns              checkRerunBudget          // per-check rerun budget spent on provider-reported transient failures
 	infrastructureReruns         infrastructureRerunBudget // candidate-wide budget and first artifact-infrastructure failure
 	infrastructureStateAvailable bool                      // true only after the durable infrastructure budget decoded successfully
 	pollIntervalOverride         time.Duration             // if set, overrides computed poll interval (for testing)
-	waitForNextPoll      func(context.Context, time.Duration) error
-	now                  func() time.Time
+	waitForNextPoll              func(context.Context, time.Duration) error
+	now                          func() time.Time
 	// baseBranchTip resolves the current tip SHA of the upstream default
 	// branch. The bool is false when the SHA is a fallback/unknown value and
 	// must not re-arm the timeout. Overridable for testing; defaults to
@@ -571,7 +571,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					invalidateInfrastructurePRTarget(pr)
 				} else if mismatch != "" {
 					clearCIMonitorReady(sctx)
-					return ciFailureOutcome(failingCheckNames(checks), false, mismatch), nil
+					return ciFailureOutcome(terminalCheckTargetsForNames(checks, failingCheckNames(checks)), false, mismatch), nil
 				}
 			}
 			// A failure the provider produced before the repository's own steps
@@ -635,7 +635,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 				if !rerunIssued {
 					if unsafe := infrastructureFailuresWithoutExactRerun(checks); len(unsafe) > 0 {
 						clearCIMonitorReady(sctx)
-						return ciFailureOutcome(unsafe, false, "provider retry scope includes work outside the proven failed-job population; infrastructure rerun remains disabled"), nil
+						return ciFailureOutcome(terminalCheckTargetsForNames(checks, unsafe), false, "provider retry scope includes work outside the proven failed-job population; infrastructure rerun remains disabled"), nil
 					}
 				}
 				if !rerunIssued {
