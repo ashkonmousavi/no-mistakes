@@ -220,6 +220,88 @@ func TestCIFalseNegativesFromRun_ExcludesFindingIntroducedByUnreviewedCIRepair(t
 	}
 }
 
+func TestCIFalseNegativesFromRun_SelectedFindingCannotCarryAcrossPublishedRepair(t *testing.T) {
+	tests := []struct {
+		name            string
+		selectedInitial string
+		selectionSource string
+		postRepair      string
+		selectedRepair  string
+		wantDescription string
+	}{
+		{
+			name:            "ci-check auto-fix selection",
+			selectedInitial: `["ci-1"]`,
+			selectionSource: db.RoundSelectionSourceAutoFix,
+			postRepair:      `{"findings":[{"id":"ci-1-new","severity":"error","action":"auto-fix","category":"ci-check","check":"build","check_id":"gh:build:2","description":"CI repair introduced a different build failure"}]}`,
+			selectedRepair:  `["ci-1-new"]`,
+			wantDescription: "CI check failing: build - provider reported failure",
+		},
+		{
+			name:            "ci-check user selection",
+			selectedInitial: `["ci-1"]`,
+			selectionSource: db.RoundSelectionSourceUser,
+			postRepair:      `{"findings":[{"id":"ci-1-new","severity":"error","action":"auto-fix","category":"ci-check","check":"build","check_id":"gh:build:2","description":"CI repair introduced a different build failure"}]}`,
+			selectedRepair:  `["ci-1-new"]`,
+			wantDescription: "CI check failing: build - provider reported failure",
+		},
+		{
+			name:            "ci-review-bot auto-fix selection",
+			selectedInitial: `["ci-2"]`,
+			selectionSource: db.RoundSelectionSourceAutoFix,
+			postRepair:      `{"findings":[{"id":"ci-2-new","severity":"warning","action":"ask-user","category":"ci-review-bot","check":"greptile","check_id":"gh:greptile:2","file":"pkg/svc.go","line":42,"description":"greptile[bot]: possible nil dereference here"}]}`,
+			selectedRepair:  `["ci-2-new"]`,
+			wantDescription: "greptile[bot]: possible nil dereference here",
+		},
+		{
+			name:            "ci-review-bot user selection",
+			selectedInitial: `["ci-2"]`,
+			selectionSource: db.RoundSelectionSourceUser,
+			postRepair:      `{"findings":[{"id":"ci-2-new","severity":"warning","action":"ask-user","category":"ci-review-bot","check":"greptile","check_id":"gh:greptile:2","file":"pkg/svc.go","line":42,"description":"greptile[bot]: possible nil dereference here"}]}`,
+			selectedRepair:  `["ci-2-new"]`,
+			wantDescription: "greptile[bot]: possible nil dereference here",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			_, sourceDB, run, _ := setupRunWithGreenReviewAndCI(t, ctx, "", "")
+			defer sourceDB.Close()
+
+			steps, err := sourceDB.GetStepsByRun(run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ciStep := steps[len(steps)-1]
+			rounds, err := sourceDB.GetRoundsByStep(ciStep.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := sourceDB.SetStepRoundSelection(rounds[0].ID, &tc.selectedInitial, tc.selectionSource); err != nil {
+				t.Fatal(err)
+			}
+			second, err := sourceDB.InsertStepRoundWithRepair(ciStep.ID, 2, "auto_fix", &tc.postRepair, nil, true, 40)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := sourceDB.SetStepRoundSelection(second.ID, &tc.selectedRepair, db.RoundSelectionSourceAutoFix); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sourceDB.InsertStepRoundWithRepair(ciStep.ID, 3, "auto_fix", nil, nil, true, 40); err != nil {
+				t.Fatal(err)
+			}
+
+			gold, err := CIFalseNegativesFromRun(sourceDB, run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(gold) != 1 || gold[0].Description != tc.wantDescription {
+				t.Fatalf("gold = %#v, want only the defect selected on the reviewed head", gold)
+			}
+		})
+	}
+}
+
 func TestCIFalseNegativesFromRun_PreservesDeferredFindingReviewEpoch(t *testing.T) {
 	ctx := context.Background()
 	_, sourceDB, run, _ := setupRunWithGreenReviewAndCI(t, ctx, "", "")

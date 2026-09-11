@@ -229,6 +229,14 @@ func ciReviewMissCandidates(rounds, reviewRounds, authorityInvalidations []*db.S
 			currentReviewRoundID = ""
 		}
 		current := map[string]string{}
+		nextCarried := map[string]string{}
+		selectedCarryIDs := map[string]bool{}
+		selectionValid := true
+		var selected map[string]bool
+		if round.SelectedFindingIDs != nil {
+			selected = parseSelectedFindingIDs(*round.SelectedFindingIDs)
+			selectionValid = selected != nil
+		}
 		if round.FindingsJSON != nil {
 			findings, err := types.ParseFindingsJSON(*round.FindingsJSON)
 			if err == nil {
@@ -237,6 +245,9 @@ func ciReviewMissCandidates(rounds, reviewRounds, authorityInvalidations []*db.S
 						continue
 					}
 					findingID := ciFindingCarryID(finding)
+					if selected[strings.TrimSpace(finding.ID)] {
+						selectedCarryIDs[findingID] = true
+					}
 					if reviewRoundID := carried[findingID]; reviewRoundID != "" {
 						current[findingID] = reviewRoundID
 					} else if currentReviewRoundID != "" {
@@ -248,7 +259,14 @@ func ciReviewMissCandidates(rounds, reviewRounds, authorityInvalidations []*db.S
 		if len(current) > 0 {
 			associated[round.ID] = current
 		}
-		carried = current
+		if selectionValid {
+			for findingID, reviewRoundID := range current {
+				if !selectedCarryIDs[findingID] {
+					nextCarried[findingID] = reviewRoundID
+				}
+			}
+		}
+		carried = nextCarried
 	}
 	return associated
 }
