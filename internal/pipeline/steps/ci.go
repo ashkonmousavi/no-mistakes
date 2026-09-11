@@ -798,11 +798,19 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 }
 
 func logCIMonitorStatus(sctx *pipeline.StepContext, message, previous string) string {
+	return logCIMonitorStatusWithPersister(sctx, message, previous, func(ready, declaredNoCI bool) error {
+		return setCIMonitorReadiness(sctx, ready, declaredNoCI)
+	})
+}
+
+func logCIMonitorStatusWithPersister(sctx *pipeline.StepContext, message, previous string, persist func(bool, bool) error) string {
 	if message != previous {
 		ready := message == ciChecksPassedMsg || message == ciNoChecksPassedMsg
 		declaredNoCI := message == ciNoChecksPassedMsg
-		if err := setCIMonitorReadiness(sctx, ready, declaredNoCI); err != nil {
+		if err := persist(ready, declaredNoCI); err != nil {
 			sctx.Log(fmt.Sprintf("warning: could not persist CI readiness: %v", err))
+			sctx.Log(message)
+			return previous
 		}
 		sctx.Log(message)
 	}
@@ -818,12 +826,13 @@ func clearCIMonitorReady(sctx *pipeline.StepContext) {
 func setCIMonitorReadiness(sctx *pipeline.StepContext, ready, declaredNoCI bool) error {
 	declaredNoCI = ready && declaredNoCI
 	if ready && sctx.StepResultID != "" {
-		if err := sctx.DB.ClearStepOverrideReason(sctx.StepResultID); err != nil {
+		if err := sctx.DB.SetRunCIReadyAndClearStepOverride(sctx.Run.ID, sctx.StepResultID, declaredNoCI); err != nil {
 			return err
 		}
-	}
-	if err := sctx.DB.SetRunCIReadyWithReason(sctx.Run.ID, ready, declaredNoCI); err != nil {
-		return err
+	} else {
+		if err := sctx.DB.SetRunCIReadyWithReason(sctx.Run.ID, ready, declaredNoCI); err != nil {
+			return err
+		}
 	}
 	if sctx.CIReadinessChanged != nil {
 		sctx.CIReadinessChanged(ready, declaredNoCI)

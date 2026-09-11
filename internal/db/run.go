@@ -705,17 +705,52 @@ func (d *DB) SetRunCIReady(id string, ready bool) error {
 }
 
 func (d *DB) SetRunCIReadyWithReason(id string, ready, declaredNoCI bool) error {
+	return setRunCIReadyWithReason(d.sql, id, ready, declaredNoCI, now())
+}
+
+func (d *DB) SetRunCIReadyAndClearStepOverride(runID, stepID string, declaredNoCI bool) error {
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("begin green CI readiness update: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := setRunCIReadyWithReason(tx, runID, true, declaredNoCI, now()); err != nil {
+		return err
+	}
+	result, err := tx.Exec(`UPDATE step_results SET override_reason = NULL WHERE id = ? AND run_id = ?`, stepID, runID)
+	if err != nil {
+		return fmt.Errorf("clear step override for green CI: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("clear step override for green CI rows affected: %w", err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("clear step override for green CI: updated %d rows", rows)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit green CI readiness update: %w", err)
+	}
+	return nil
+}
+
+type ciReadinessExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func setRunCIReadyWithReason(execer ciReadinessExecer, id string, ready, declaredNoCI bool, ts int64) error {
 	readyValue := 0
 	declaredValue := 0
 	var readyAt any
 	if ready {
 		readyValue = 1
-		readyAt = now()
+		readyAt = ts
 		if declaredNoCI {
 			declaredValue = 1
 		}
 	}
-	_, err := d.sql.Exec(`UPDATE runs SET ci_ready_at = ?, ci_ready_no_ci = ?, updated_at = ? WHERE id = ? AND ((ci_ready_at IS NULL AND ? = 1) OR (ci_ready_at IS NOT NULL AND ? = 0) OR (COALESCE(ci_ready_no_ci, 0) != ?))`, readyAt, declaredValue, now(), id, readyValue, readyValue, declaredValue)
+	_, err := execer.Exec(`UPDATE runs SET ci_ready_at = ?, ci_ready_no_ci = ?, updated_at = ? WHERE id = ? AND ((ci_ready_at IS NULL AND ? = 1) OR (ci_ready_at IS NOT NULL AND ? = 0) OR (COALESCE(ci_ready_no_ci, 0) != ?))`, readyAt, declaredValue, ts, id, readyValue, readyValue, declaredValue)
 	if err != nil {
 		return fmt.Errorf("set run CI ready: %w", err)
 	}

@@ -244,13 +244,6 @@ func (d *DB) SetStepOverrideReason(id string, reason string) error {
 	return nil
 }
 
-func (d *DB) ClearStepOverrideReason(id string) error {
-	if _, err := d.sql.Exec(`UPDATE step_results SET override_reason = NULL WHERE id = ?`, id); err != nil {
-		return fmt.Errorf("clear step override reason: %w", err)
-	}
-	return nil
-}
-
 func autoFixLimitDBValue(autoFixLimit int) any {
 	if autoFixLimit <= 0 {
 		return nil

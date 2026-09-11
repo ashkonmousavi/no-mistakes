@@ -98,3 +98,66 @@ func TestCIMonitorFreshGreenClearsApprovalOverride(t *testing.T) {
 		t.Fatalf("fresh green CI retained override reason %q", *green.OverrideReason)
 	}
 }
+
+func TestCIMonitorGreenPersistenceFailureRetriesIdenticalStatusAtomically(t *testing.T) {
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	ci, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepCI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sctx.StepResultID = ci.ID
+	if err := sctx.DB.SetStepOverrideReason(ci.ID, "required check still failing"); err != nil {
+		t.Fatal(err)
+	}
+
+	attempts := 0
+	persist := func(ready, declaredNoCI bool) error {
+		attempts++
+		if attempts == 1 {
+			return sctx.DB.SetRunCIReadyAndClearStepOverride(sctx.Run.ID, "missing-step", declaredNoCI)
+		}
+		return setCIMonitorReadiness(sctx, ready, declaredNoCI)
+	}
+
+	previous := logCIMonitorStatusWithPersister(sctx, ciChecksPassedMsg, "", persist)
+	if previous != "" {
+		t.Fatalf("cached monitor status after failed persistence = %q, want empty", previous)
+	}
+	runAfterFailure, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runAfterFailure.CIReadyAt != nil {
+		t.Fatalf("failed atomic persistence recorded readiness at %v", *runAfterFailure.CIReadyAt)
+	}
+	stepAfterFailure, err := sctx.DB.GetStepResult(ci.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stepAfterFailure.OverrideReason == nil {
+		t.Fatal("failed atomic persistence cleared the approval override")
+	}
+
+	previous = logCIMonitorStatusWithPersister(sctx, ciChecksPassedMsg, previous, persist)
+	if previous != ciChecksPassedMsg {
+		t.Fatalf("cached monitor status after retry = %q, want %q", previous, ciChecksPassedMsg)
+	}
+	if attempts != 2 {
+		t.Fatalf("persistence attempts = %d, want 2", attempts)
+	}
+	runAfterRetry, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runAfterRetry.CIReadyAt == nil || runAfterRetry.CIReadyNoCI {
+		t.Fatalf("retried green readiness = at %v, no_ci %v", runAfterRetry.CIReadyAt, runAfterRetry.CIReadyNoCI)
+	}
+	stepAfterRetry, err := sctx.DB.GetStepResult(ci.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stepAfterRetry.OverrideReason != nil {
+		t.Fatalf("retried green persistence retained override reason %q", *stepAfterRetry.OverrideReason)
+	}
+}
