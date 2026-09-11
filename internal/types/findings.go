@@ -410,11 +410,25 @@ func FindingsMetadata(findings Findings) Findings {
 
 // NormalizeFindings assigns deterministic IDs to findings that do not have one yet.
 func NormalizeFindings(findings Findings, prefix string) Findings {
+	used := make(map[string]bool, len(findings.Items))
+	for _, item := range findings.Items {
+		if item.ID != "" {
+			used[item.ID] = true
+		}
+	}
 	for i := range findings.Items {
 		if findings.Items[i].ID != "" {
 			continue
 		}
-		findings.Items[i].ID = prefix + "-" + itoa(i+1)
+		for candidate := i + 1; ; candidate++ {
+			id := prefix + "-" + itoa(candidate)
+			if used[id] {
+				continue
+			}
+			findings.Items[i].ID = id
+			used[id] = true
+			break
+		}
 	}
 	return findings
 }

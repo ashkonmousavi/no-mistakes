@@ -19,7 +19,8 @@ const ciObservationFindings = `{"findings":[
 	{"id":"ci-1","severity":"error","action":"auto-fix","category":"ci-check","check":"build","check_id":"gh:build:1","description":"CI check failing: build - provider reported failure"},
 	{"id":"ci-2","severity":"warning","action":"ask-user","category":"ci-review-bot","check":"greptile","check_id":"gh:greptile:1","file":"pkg/svc.go","line":42,"description":"greptile[bot]: possible nil dereference here"},
 	{"id":"ci-3","severity":"warning","action":"ask-user","category":"ci-transient","check":"flaky-runner","check_id":"gh:flaky:1","description":"runner was cancelled by the provider"},
-	{"id":"ci-4","severity":"warning","action":"ask-user","category":"ci-review-bot","check":"greptile","check_id":"gh:greptile:1","file":"pkg/other.go","line":7,"description":"greptile[bot]: style nit the human dismissed"}
+	{"id":"ci-4","severity":"warning","action":"ask-user","category":"ci-review-bot","check":"greptile","check_id":"gh:greptile:1","file":"pkg/other.go","line":7,"description":"greptile[bot]: style nit the human dismissed"},
+	{"id":"ci-5","severity":"warning","action":"ask-user","category":"ci-transient","check":"artifact","check_id":"gh:artifact:1","description":"provider retry scope includes work outside the proven failed-job population"}
 ],"summary":"1 CI check failing; review bot needs a decision (2 findings); 1 transient"}`
 
 // setupRunWithGreenReviewAndCI builds on the captured-run fixture: it adds a
@@ -159,6 +160,20 @@ func TestCIFalseNegativesFromRun_ExcludesOverriddenAndUnselected(t *testing.T) {
 	}
 	if len(gold) != 0 {
 		t.Fatalf("no-selection gold = %#v, want none", gold)
+	}
+}
+
+func TestCIFalseNegativesFromRun_ExcludesProviderInfrastructureFinding(t *testing.T) {
+	ctx := context.Background()
+	_, sourceDB, run, _ := setupRunWithGreenReviewAndCI(t, ctx, `["ci-5"]`, "")
+	defer sourceDB.Close()
+
+	gold, err := CIFalseNegativesFromRun(sourceDB, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gold) != 0 {
+		t.Fatalf("provider infrastructure gold = %#v, want none", gold)
 	}
 }
 

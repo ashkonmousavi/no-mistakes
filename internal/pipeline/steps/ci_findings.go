@@ -126,52 +126,12 @@ func ciObservationFindings(issues ciIssues) Findings {
 // auto-fix findings, and it is false when nothing here is one, so a poll
 // with only ask-user findings never starts a round.
 func ciObservationOutcome(findings Findings) *pipeline.StepOutcome {
-	return ciObservationOutcomeWithDeferred(findings, "")
-}
-
-// ciObservationOutcomeWithDeferred combines a new settled observation with
-// findings a preceding repair deliberately left unselected. Unlike
-// ciTerminalRepairOutcome, it preserves each finding's action: a genuine code
-// failure in the new observation must remain auto-fixable while an unsafe
-// infrastructure failure and the older deferred findings remain ask-user.
-func ciObservationOutcomeWithDeferred(findings Findings, deferredRaw string) *pipeline.StepOutcome {
-	if deferred, err := types.ParseFindingsJSON(deferredRaw); err == nil {
-		findings = mergeCIFindings(findings, deferred)
-	}
 	encoded, _ := json.Marshal(findings)
 	return &pipeline.StepOutcome{
 		NeedsApproval: hasBlockingFindings(findings.Items),
 		AutoFixable:   hasAutoFixFindings(findings.Items),
 		Findings:      string(encoded),
 	}
-}
-
-func mergeCIFindings(base, extra Findings) Findings {
-	seenIDs := make(map[string]bool, len(base.Items))
-	seenItems := make(map[Finding]bool, len(base.Items))
-	for _, item := range base.Items {
-		if item.ID != "" {
-			seenIDs[item.ID] = true
-		}
-		seenItems[item] = true
-	}
-	for _, item := range extra.Items {
-		if item.ID != "" && seenIDs[item.ID] || seenItems[item] {
-			continue
-		}
-		base.Items = append(base.Items, item)
-		if item.ID != "" {
-			seenIDs[item.ID] = true
-		}
-		seenItems[item] = true
-	}
-	if strings.TrimSpace(extra.Summary) != "" && !strings.Contains(base.Summary, extra.Summary) {
-		if strings.TrimSpace(base.Summary) != "" {
-			base.Summary += "; "
-		}
-		base.Summary += extra.Summary
-	}
-	return base
 }
 
 // appendUnsafeInfrastructureFindings adds the exact provider observations
@@ -186,7 +146,7 @@ func appendUnsafeInfrastructureFindings(findings Findings, unsafe []scm.Check) F
 		findings.Items = append(findings.Items, Finding{
 			Severity:    types.FindingSeverityWarning,
 			Action:      types.ActionAskUser,
-			Category:    types.FindingCategoryCICheck,
+			Category:    types.FindingCategoryCITransient,
 			Check:       check.Name,
 			CheckID:     check.ProviderID,
 			Description: ciCheckDescription(check) + " - provider retry scope includes work outside the proven failed-job population",
@@ -559,6 +519,7 @@ func ciTerminalRepairOutcome(outcome *pipeline.StepOutcome, selected Findings, d
 			appendFinding(item)
 		}
 	}
+	parked = types.NormalizeFindings(parked, string(types.StepCI))
 	encoded, _ := json.Marshal(parked)
 	outcome.NeedsApproval = true
 	outcome.AutoFixable = false

@@ -319,6 +319,25 @@ func TestCITerminalMonitorOutcomePreservesDeferredFindingsAfterPublishedRepair(t
 	}
 }
 
+func TestCITerminalMonitorOutcomeAssignsUniqueIDsAfterDeferredMerge(t *testing.T) {
+	t.Parallel()
+	outcome := ciTerminalMonitorOutcome(
+		ciFailureOutcome([]scm.CheckTarget{{Name: "provider", ProviderID: "github-check-run:42"}}, false, "provider unavailable"),
+		`{"findings":[{"id":"ci-1","severity":"warning","description":"review decision still required","action":"ask-user","category":"ci-review-bot","check":"review"}]}`,
+	)
+	findings, err := types.ParseFindingsJSON(outcome.Findings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings.Items) != 2 || findings.Items[0].ID != "ci-2" || findings.Items[1].ID != "ci-1" {
+		t.Fatalf("finding IDs = %+v, want a new collision-free ID and the stable deferred ID", findings.Items)
+	}
+	selected := types.FilterFindings(findings, []string{"ci-1"})
+	if len(selected.Items) != 1 || selected.Items[0].Description != "review decision still required" {
+		t.Fatalf("ci-1 selected %+v, want only the deferred finding", selected.Items)
+	}
+}
+
 // The first concrete case of the findings model: a red Greptile check is the
 // bot's opinion, not a verdict, so it parks as ask-user findings anchored to
 // each comment and never spends an auto_fix.ci round, even with budget left.

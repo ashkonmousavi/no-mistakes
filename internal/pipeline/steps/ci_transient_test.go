@@ -942,32 +942,33 @@ func TestInfrastructureFailureWithoutExactRerunBecomesUnifiedCIFinding(t *testin
 			ID: "comment-1", Author: "greptile-apps[bot]", Path: "internal/pipeline/steps/ci.go", Line: 636, Body: "preserve every issue class",
 		}},
 	)
-	outcome := ciObservationOutcomeWithDeferred(
-		findings,
-		`{"findings":[{"id":"deferred-review","severity":"warning","action":"ask-user","category":"ci-review-bot","check":"review","description":"deferred review decision"}]}`,
-	)
+	outcome := ciObservationOutcome(findings)
 	var persisted Findings
 	if err := json.Unmarshal([]byte(outcome.Findings), &persisted); err != nil {
 		t.Fatal(err)
 	}
-	if !outcome.NeedsApproval || !outcome.AutoFixable || len(persisted.Items) != 6 {
-		t.Fatalf("outcome = %+v findings = %+v, want exact infrastructure, two fixable failures, cancellation, bot comment, and deferred decision", outcome, persisted.Items)
+	if !outcome.NeedsApproval || !outcome.AutoFixable || len(persisted.Items) != 5 {
+		t.Fatalf("outcome = %+v findings = %+v, want exact infrastructure, two fixable failures, cancellation, and bot comment", outcome, persisted.Items)
 	}
 	actions := map[string]string{}
+	categories := map[string]string{}
 	for _, item := range persisted.Items {
 		actions[item.CheckID] = item.Action
+		categories[item.CheckID] = item.Category
 	}
 	if actions["github-check-run:42"] != types.ActionAskUser || actions["github-check-run:43"] != types.ActionAutoFix || actions["github-check-run:44"] != types.ActionAutoFix {
 		t.Fatalf("finding actions by exact provider id = %+v", actions)
 	}
-	var sawCancellation, sawBotComment, sawDeferred bool
+	if categories["github-check-run:42"] != types.FindingCategoryCITransient {
+		t.Fatalf("unsafe infrastructure category = %q, want %q", categories["github-check-run:42"], types.FindingCategoryCITransient)
+	}
+	var sawCancellation, sawBotComment bool
 	for _, item := range persisted.Items {
 		sawCancellation = sawCancellation || item.Category == types.FindingCategoryCITransient && item.Check == "cancelled"
 		sawBotComment = sawBotComment || item.Category == types.FindingCategoryCIReviewBot && item.File == "internal/pipeline/steps/ci.go" && item.Line == 636
-		sawDeferred = sawDeferred || item.ID == "deferred-review" && item.Action == types.ActionAskUser
 	}
-	if !sawCancellation || !sawBotComment || !sawDeferred {
-		t.Fatalf("findings = %+v, want cancellation=%t bot-comment=%t deferred=%t", persisted.Items, sawCancellation, sawBotComment, sawDeferred)
+	if !sawCancellation || !sawBotComment {
+		t.Fatalf("findings = %+v, want cancellation=%t bot-comment=%t", persisted.Items, sawCancellation, sawBotComment)
 	}
 }
 
