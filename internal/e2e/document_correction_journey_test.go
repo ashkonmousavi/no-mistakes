@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -206,6 +207,16 @@ func TestDocumentCorrectionJourney(t *testing.T) {
 	if test.RoundCount != 2 || test.RoundTrigger != "documentation_head_recheck" {
 		t.Fatalf("test rounds = %d trigger = %q, want 2 rounds durably marked documentation_head_recheck", test.RoundCount, test.RoundTrigger)
 	}
+	if test.FindingsJSON == nil {
+		t.Fatal("final Test recheck has no persisted findings")
+	}
+	testFindings, err := types.ParseFindingsJSON(*test.FindingsJSON)
+	if err != nil {
+		t.Fatalf("parse final Test findings: %v", err)
+	}
+	if testFindings.TestedHeadSHA != run.HeadSHA {
+		t.Fatalf("final Test validated head %q, want corrected run head %q", testFindings.TestedHeadSHA, run.HeadSHA)
+	}
 
 	// (3): the correction reached the branch that was actually published, and
 	// the published head is the one the pipeline validated.
@@ -232,6 +243,61 @@ func TestDocumentCorrectionJourney(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("pull-request body does not state %q:\n%s", want, body)
 		}
+	}
+	assertCurrentDocumentCorrectionAttestation(t, body, run.HeadSHA)
+}
+
+// assertCurrentDocumentCorrectionAttestation proves the external consumer view
+// is bound to the same corrected head as the durable Test result. Do not infer
+// this from the human-readable Testing section: the hidden attestation is what
+// downstream policy reads.
+func assertCurrentDocumentCorrectionAttestation(t *testing.T, body, headSHA string) {
+	t.Helper()
+	const (
+		prefix = "<!-- no-mistakes-pipeline-attestation:v1 "
+		suffix = " -->"
+	)
+	start := strings.Index(body, prefix)
+	if start < 0 {
+		t.Fatalf("PR body has no pipeline attestation:\n%s", body)
+	}
+	payloadStart := start + len(prefix)
+	end := strings.Index(body[payloadStart:], suffix)
+	if end < 0 {
+		t.Fatalf("PR body has an unterminated pipeline attestation:\n%s", body)
+	}
+	var attestation struct {
+		HeadSHA string `json:"head_sha"`
+		Steps   []struct {
+			Step   types.StepName   `json:"step"`
+			Status types.StepStatus `json:"status"`
+		} `json:"steps"`
+		LiveValidation *struct {
+			Verdict string `json:"verdict"`
+			Live    int    `json:"live"`
+			Total   int    `json:"total"`
+		} `json:"live_validation"`
+	}
+	if err := json.Unmarshal([]byte(body[payloadStart:payloadStart+end]), &attestation); err != nil {
+		t.Fatalf("parse pipeline attestation: %v", err)
+	}
+	if attestation.HeadSHA != headSHA {
+		t.Fatalf("attestation head = %q, want corrected run head %q", attestation.HeadSHA, headSHA)
+	}
+	foundTest := false
+	for _, step := range attestation.Steps {
+		if step.Step == types.StepTest {
+			foundTest = true
+			if step.Status != types.StepStatusCompleted {
+				t.Fatalf("attested Test status = %q, want completed", step.Status)
+			}
+		}
+	}
+	if !foundTest {
+		t.Fatal("attestation has no Test step")
+	}
+	if got := attestation.LiveValidation; got == nil || got.Verdict != types.TestVerdictGo || got.Live != 1 || got.Total != 1 {
+		t.Fatalf("attested live_validation = %+v, want verdict=go live=1 total=1", got)
 	}
 }
 
