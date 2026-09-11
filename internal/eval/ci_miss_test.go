@@ -220,6 +220,90 @@ func TestCIFalseNegativesFromRun_ExcludesFindingIntroducedByUnreviewedCIRepair(t
 	}
 }
 
+func TestCIFalseNegativesFromRun_PreservesDeferredFindingReviewEpoch(t *testing.T) {
+	ctx := context.Background()
+	_, sourceDB, run, _ := setupRunWithGreenReviewAndCI(t, ctx, "", "")
+	defer sourceDB.Close()
+
+	steps, err := sourceDB.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciStep := steps[len(steps)-1]
+	rounds, err := sourceDB.GetRoundsByStep(ciStep.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectedInitial := `["ci-1"]`
+	if err := sourceDB.SetStepRoundSelection(rounds[0].ID, &selectedInitial, db.RoundSelectionSourceAutoFix); err != nil {
+		t.Fatal(err)
+	}
+	deferred := `{"findings":[{"id":"ci-2-carried","severity":"warning","action":"ask-user","category":"ci-review-bot","check":"greptile","check_id":"gh:greptile:2","file":"pkg/svc.go","line":42,"description":"greptile[bot]: possible nil dereference here"}]}`
+	second, err := sourceDB.InsertStepRoundWithRepair(ciStep.ID, 2, "auto_fix", &deferred, nil, true, 40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectedDeferred := `["ci-2-carried"]`
+	if err := sourceDB.SetStepRoundSelection(second.ID, &selectedDeferred, db.RoundSelectionSourceUser); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceDB.InsertStepRoundWithRepair(ciStep.ID, 3, "auto_fix", nil, nil, true, 40); err != nil {
+		t.Fatal(err)
+	}
+
+	gold, err := CIFalseNegativesFromRun(sourceDB, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gold) != 2 || !containsGoldDescription(gold, "CI check failing: build - provider reported failure") || !containsGoldDescription(gold, "greptile[bot]: possible nil dereference here") {
+		t.Fatalf("gold = %#v, want both defects first observed on the reviewed head", gold)
+	}
+}
+
+func TestCIFalseNegativesFromRun_NoChangeFixRoundsPreserveReviewEpoch(t *testing.T) {
+	for _, stepName := range []types.StepName{types.StepTest, types.StepDocument, types.StepLint} {
+		t.Run(string(stepName), func(t *testing.T) {
+			ctx := context.Background()
+			_, sourceDB, run, _ := setupRunWithGreenReviewAndCI(t, ctx, "", "")
+			defer sourceDB.Close()
+
+			steps, err := sourceDB.GetStepsByRun(run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ciStep := steps[len(steps)-1]
+			mutationStep, err := sourceDB.InsertStepResult(run.ID, stepName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			noChanges := "no changes applied"
+			if _, err := sourceDB.InsertStepRound(mutationStep.ID, 1, "auto_fix", nil, &noChanges, 10); err != nil {
+				t.Fatal(err)
+			}
+			postRetry := `{"findings":[{"id":"ci-after-noop","severity":"error","action":"auto-fix","category":"ci-check","check":"post-retry-test","check_id":"gh:post-retry:1","description":"reviewed head still fails after a no-change fix round"}]}`
+			observed, err := sourceDB.InsertStepRound(ciStep.ID, 2, "initial", &postRetry, nil, 30)
+			if err != nil {
+				t.Fatal(err)
+			}
+			selected := `["ci-after-noop"]`
+			if err := sourceDB.SetStepRoundSelection(observed.ID, &selected, db.RoundSelectionSourceAutoFix); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sourceDB.InsertStepRoundWithRepair(ciStep.ID, 3, "auto_fix", nil, nil, true, 40); err != nil {
+				t.Fatal(err)
+			}
+
+			gold, err := CIFalseNegativesFromRun(sourceDB, run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(gold) != 1 || gold[0].Description != "reviewed head still fails after a no-change fix round" {
+				t.Fatalf("gold = %#v, want the miss from the unchanged reviewed head", gold)
+			}
+		})
+	}
+}
+
 func TestCIFalseNegativesFromRun_IncludesFindingAfterRepairWasRereviewed(t *testing.T) {
 	ctx := context.Background()
 	_, sourceDB, run, _ := setupRunWithGreenReviewAndCI(t, ctx, "", "")
@@ -545,12 +629,13 @@ func TestCIFalseNegativesFromRun_ExcludesDocumentationCarriedHead(t *testing.T) 
 		t.Fatal(err)
 	}
 	ciStep := steps[len(steps)-1]
-	testStep, err := sourceDB.InsertStepResult(run.ID, types.StepTest)
+	documentStep, err := sourceDB.InsertStepResult(run.ID, types.StepDocument)
 	if err != nil {
 		t.Fatal(err)
 	}
 	passed := `{"findings":[]}`
-	if _, err := sourceDB.InsertStepRound(testStep.ID, 1, "documentation_head_recheck", &passed, nil, 10); err != nil {
+	changesApplied := "changes applied"
+	if _, err := sourceDB.InsertStepRound(documentStep.ID, 1, "documentation_head_recheck", &passed, &changesApplied, 10); err != nil {
 		t.Fatal(err)
 	}
 	if err := sourceDB.UpdateRunReviewApprovedHeadSHA(run.ID, "documentation-carried-head"); err != nil {

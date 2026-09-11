@@ -122,7 +122,7 @@ func ciFalseNegativeGroupsFromRun(database *db.DB, runID string) ([]ciFalseNegat
 				return nil, fmt.Errorf("read %s rounds: %w", step.StepName, err)
 			}
 			for _, round := range stepRounds {
-				if round.IsFixRound() || round.Trigger == "documentation_head_recheck" {
+				if roundAdvancedHead(round) {
 					authorityInvalidations = append(authorityInvalidations, round)
 				}
 			}
@@ -132,7 +132,7 @@ func ciFalseNegativeGroupsFromRun(database *db.DB, runID string) ([]ciFalseNegat
 	if run.ReviewApprovedHeadSHA != nil {
 		approvedHead = strings.TrimSpace(*run.ReviewApprovedHeadSHA)
 	}
-	reviewRoundsByCIRound := ciReviewMissRounds(rounds, reviewRounds, authorityInvalidations, approvedHead)
+	reviewRoundsByFinding := ciReviewMissCandidates(rounds, reviewRounds, authorityInvalidations, approvedHead)
 	var groups []ciFalseNegativeGroup
 	groupIndexes := map[string]int{}
 	seen := map[string]map[string]bool{}
@@ -145,10 +145,6 @@ func ciFalseNegativeGroupsFromRun(database *db.DB, runID string) ([]ciFalseNegat
 		}
 		selected := parseSelectedFindingIDs(*round.SelectedFindingIDs)
 		if len(selected) == 0 {
-			continue
-		}
-		reviewRoundID := reviewRoundsByCIRound[round.ID]
-		if reviewRoundID == "" {
 			continue
 		}
 		findings, err := types.ParseFindingsJSON(*round.FindingsJSON)
@@ -164,6 +160,10 @@ func ciFalseNegativeGroupsFromRun(database *db.DB, runID string) ([]ciFalseNegat
 				continue
 			}
 			g := ciFindingGold(finding)
+			reviewRoundID := reviewRoundsByFinding[round.ID][ciFindingCarryID(finding)]
+			if reviewRoundID == "" {
+				continue
+			}
 			if seen[reviewRoundID] == nil {
 				seen[reviewRoundID] = map[string]bool{}
 			}
@@ -183,7 +183,11 @@ func ciFalseNegativeGroupsFromRun(database *db.DB, runID string) ([]ciFalseNegat
 	return groups, nil
 }
 
-func ciReviewMissRounds(rounds, reviewRounds, authorityInvalidations []*db.StepRound, approvedHead string) map[string]string {
+func roundAdvancedHead(round *db.StepRound) bool {
+	return round.FixSummary != nil && strings.TrimSpace(*round.FixSummary) == "changes applied"
+}
+
+func ciReviewMissCandidates(rounds, reviewRounds, authorityInvalidations []*db.StepRound, approvedHead string) map[string]map[string]string {
 	type authorityEvent struct {
 		id     string
 		review *db.StepRound
@@ -201,7 +205,8 @@ func ciReviewMissRounds(rounds, reviewRounds, authorityInvalidations []*db.StepR
 	}
 	sort.Slice(events, func(i, j int) bool { return events[i].id < events[j].id })
 
-	associated := map[string]string{}
+	associated := map[string]map[string]string{}
+	carried := map[string]string{}
 	currentReviewRoundID := ""
 	eventIndex := 0
 	for _, round := range rounds {
@@ -223,11 +228,44 @@ func ciReviewMissRounds(rounds, reviewRounds, authorityInvalidations []*db.StepR
 		if round.RepairPublished {
 			currentReviewRoundID = ""
 		}
-		if currentReviewRoundID != "" {
-			associated[round.ID] = currentReviewRoundID
+		current := map[string]string{}
+		if round.FindingsJSON != nil {
+			findings, err := types.ParseFindingsJSON(*round.FindingsJSON)
+			if err == nil {
+				for _, finding := range findings.Items {
+					if !isCIFalseNegativeCategory(finding.Category) {
+						continue
+					}
+					findingID := ciFindingCarryID(finding)
+					if reviewRoundID := carried[findingID]; reviewRoundID != "" {
+						current[findingID] = reviewRoundID
+					} else if currentReviewRoundID != "" {
+						current[findingID] = currentReviewRoundID
+					}
+				}
+			}
 		}
+		if len(current) > 0 {
+			associated[round.ID] = current
+		}
+		carried = current
 	}
 	return associated
+}
+
+func ciFindingCarryID(finding types.Finding) string {
+	parts := []string{
+		finding.Category,
+		strings.TrimSpace(finding.Check),
+	}
+	if finding.Category == types.FindingCategoryCIReviewBot && (strings.TrimSpace(finding.File) != "" || finding.Line != 0) {
+		parts = append(parts,
+			strings.TrimSpace(finding.File),
+			strconv.Itoa(finding.Line),
+			strings.TrimSpace(finding.Description),
+		)
+	}
+	return strings.Join(parts, "\x00")
 }
 
 func repairLandedAfter(rounds []*db.StepRound, selectedIndex int) bool {
