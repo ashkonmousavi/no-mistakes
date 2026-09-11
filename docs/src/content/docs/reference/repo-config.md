@@ -446,7 +446,7 @@ Set to `0` to disable the follow-up auto-fix loop for a step (findings require m
 For empty `commands.lint`, the document step's combined housekeeping pass also assesses lint, and the lint step consumes its result; unresolved blocking lint findings pause for approval instead of starting another automatic fix loop.
 
 `auto_fix.ci` covers the CI step's CI failure and merge-conflict auto-fix attempts.
-The CI step reports each settled failure as an `auto-fix` finding and the shared auto-fix loop drives its fix rounds, exactly as for review; `ask-user` findings (a supported review bot's red check, a provider-attributed check no rerun will replace) never consume an attempt.
+The CI step reports each settled issue as a finding. A code-check failure or merge conflict is `auto-fix` and enters the shared fix loop, exactly as for review; a supported review bot's red check or a provider-attributed outcome no rerun will replace is `ask-user` and never consumes an attempt.
 
 Legacy alias: `auto_fix.babysit`.
 
