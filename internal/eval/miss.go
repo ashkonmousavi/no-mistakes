@@ -25,6 +25,11 @@ type IngestResult struct {
 	Total  int
 }
 
+type reviewRoundMisses struct {
+	reviewRoundID string
+	findings      []FindingGold
+}
+
 // ParsePostPRMissFinding accepts one finding object. ID and description are
 // required; they are the eval matcher keys. This is the typed source of truth
 // for a confirmed post-PR miss. no-mistakes does not read firstmate ledgers
@@ -86,25 +91,6 @@ func IngestPostPRMiss(ctx context.Context, store *Store, p *paths.Paths, databas
 	if len(misses) == 0 {
 		return IngestResult{}, fmt.Errorf("eval miss ingest requires at least one finding")
 	}
-	for i, miss := range misses {
-		if strings.TrimSpace(miss.ID) == "" || strings.TrimSpace(miss.Description) == "" {
-			return IngestResult{}, fmt.Errorf("finding %d requires id and description", i+1)
-		}
-		if miss.Kind == "" {
-			misses[i].Kind = GoldFalseNegative
-		}
-		if miss.Source == "" {
-			misses[i].Source = goldSourcePostPRMiss
-		}
-		if misses[i].Kind != GoldFalseNegative {
-			return IngestResult{}, fmt.Errorf("finding %q must be false-negative gold", miss.ID)
-		}
-	}
-
-	cases, err := Capture(ctx, store, p, database, runID)
-	if err != nil {
-		return IngestResult{}, err
-	}
 	run, err := database.GetRun(strings.TrimSpace(runID))
 	if err != nil {
 		return IngestResult{}, fmt.Errorf("read source run: %w", err)
@@ -116,28 +102,103 @@ func IngestPostPRMiss(ctx context.Context, store *Store, p *paths.Paths, databas
 	if err != nil {
 		return IngestResult{}, err
 	}
-	var target *Case
-	for i := range cases {
-		if cases[i].SourceRoundID == green.ID {
-			target = &cases[i]
+	results, err := ingestPostPRMissesForReviewRounds(ctx, store, p, database, run.ID, []reviewRoundMisses{{reviewRoundID: green.ID, findings: misses}})
+	if err != nil {
+		return IngestResult{}, err
+	}
+	return results[0], nil
+}
+
+func ingestPostPRMissesForReviewRounds(ctx context.Context, store *Store, p *paths.Paths, database *db.DB, runID string, groups []reviewRoundMisses) ([]IngestResult, error) {
+	if store == nil || p == nil || database == nil {
+		return nil, fmt.Errorf("eval miss ingest requires a store, paths, and database")
+	}
+	if len(groups) == 0 {
+		return nil, fmt.Errorf("eval miss ingest requires at least one review round")
+	}
+	for groupIndex := range groups {
+		if strings.TrimSpace(groups[groupIndex].reviewRoundID) == "" {
+			return nil, fmt.Errorf("eval miss ingest requires a review round")
+		}
+		if len(groups[groupIndex].findings) == 0 {
+			return nil, fmt.Errorf("eval miss ingest requires at least one finding")
+		}
+		for findingIndex, miss := range groups[groupIndex].findings {
+			if strings.TrimSpace(miss.ID) == "" || strings.TrimSpace(miss.Description) == "" {
+				return nil, fmt.Errorf("finding %d requires id and description", findingIndex+1)
+			}
+			if miss.Kind == "" {
+				groups[groupIndex].findings[findingIndex].Kind = GoldFalseNegative
+			}
+			if miss.Source == "" {
+				groups[groupIndex].findings[findingIndex].Source = goldSourcePostPRMiss
+			}
+			if groups[groupIndex].findings[findingIndex].Kind != GoldFalseNegative {
+				return nil, fmt.Errorf("finding %q must be false-negative gold", miss.ID)
+			}
+		}
+	}
+
+	steps, err := database.GetStepsByRun(strings.TrimSpace(runID))
+	if err != nil {
+		return nil, fmt.Errorf("read source steps: %w", err)
+	}
+	var reviewStep *db.StepResult
+	for _, step := range steps {
+		if step.StepName == types.StepReview {
+			reviewStep = step
 			break
 		}
 	}
-	if target == nil {
-		return IngestResult{}, fmt.Errorf("%w: green review round %q was not captured", ErrNoCapturableReview, green.ID)
+	if reviewStep == nil {
+		return nil, fmt.Errorf("%w: run %q has no review step", ErrNoCapturableReview, runID)
+	}
+	reviewRounds, err := database.GetRoundsByStep(reviewStep.ID)
+	if err != nil {
+		return nil, fmt.Errorf("read review rounds: %w", err)
+	}
+	greenRounds := make(map[string]bool, len(reviewRounds))
+	for _, round := range reviewRounds {
+		if round.FindingsJSON != nil && reviewPassedGreen(*round.FindingsJSON) {
+			greenRounds[round.ID] = true
+		}
+	}
+	for _, group := range groups {
+		if !greenRounds[group.reviewRoundID] {
+			return nil, fmt.Errorf("%w: review round %q was not green", ErrReviewDidNotPassGreen, group.reviewRoundID)
+		}
+	}
+
+	cases, err := Capture(ctx, store, p, database, runID)
+	if err != nil {
+		return nil, err
+	}
+	caseByRound := make(map[string]Case, len(cases))
+	for _, c := range cases {
+		caseByRound[c.SourceRoundID] = c
+	}
+	for _, group := range groups {
+		if _, ok := caseByRound[group.reviewRoundID]; !ok {
+			return nil, fmt.Errorf("%w: green review round %q was not captured", ErrNoCapturableReview, group.reviewRoundID)
+		}
 	}
 
 	unlock, err := lockCorpus(ctx, store.root)
 	if err != nil {
-		return IngestResult{}, err
+		return nil, err
 	}
 	defer unlock()
 
-	updated, added, err := store.appendFindingGold(*target, misses)
-	if err != nil {
-		return IngestResult{}, err
+	results := make([]IngestResult, 0, len(groups))
+	for _, group := range groups {
+		updated, added, err := store.appendFindingGold(caseByRound[group.reviewRoundID], group.findings)
+		if err != nil {
+			return nil, err
+		}
+		caseByRound[group.reviewRoundID] = updated
+		results = append(results, IngestResult{CaseID: updated.ID, Added: added, Total: len(updated.Labels.Findings)})
 	}
-	return IngestResult{CaseID: updated.ID, Added: added, Total: len(updated.Labels.Findings)}, nil
+	return results, nil
 }
 
 func lastGreenReviewRound(database *db.DB, runID string) (*db.StepRound, error) {

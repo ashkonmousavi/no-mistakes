@@ -172,6 +172,17 @@ func TestCIObservationFindings_PreservesSameNamedCheckIdentityAndClassification(
 	}
 }
 
+func TestCIObservationFindings_IgnoresNamesAbsentFromObservation(t *testing.T) {
+	t.Parallel()
+	findings := ciObservationFindings(ciIssues{
+		checks:  []scm.Check{{Name: "build", ProviderID: "github-check-run:41", Bucket: scm.CheckBucketFail}},
+		failing: []string{"missing"},
+	})
+	if len(findings.Items) != 0 || findings.Summary != "" {
+		t.Fatalf("findings = %+v, want no synthetic finding for an absent check", findings)
+	}
+}
+
 // A red review-bot check with no unresolved comment still needs a decision; a
 // bot that left more comments than one gate can carry is summarized.
 func TestReviewBotFindings_BoundsAndEmptyCase(t *testing.T) {

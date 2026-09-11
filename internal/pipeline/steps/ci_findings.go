@@ -223,18 +223,13 @@ func selectedFailingChecks(checks []scm.Check, names []string) []scm.Check {
 	used := make([]bool, len(checks))
 	selected := make([]scm.Check, 0, len(names))
 	for _, name := range names {
-		matched := false
 		for i, check := range checks {
 			if used[i] || !check.Failing() || check.Name != name {
 				continue
 			}
 			selected = append(selected, check)
 			used[i] = true
-			matched = true
 			break
-		}
-		if !matched {
-			selected = append(selected, scm.Check{Name: name, Bucket: scm.CheckBucketFail})
 		}
 	}
 	return selected

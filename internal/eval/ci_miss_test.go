@@ -51,6 +51,9 @@ func setupRunWithCIRepairEvidence(t *testing.T, ctx context.Context, selected, o
 	if err := sourceDB.UpdateStepStatus(reviewStepID, types.StepStatusCompleted); err != nil {
 		t.Fatal(err)
 	}
+	if err := sourceDB.UpdateRunReviewApprovedHeadSHA(run.ID, run.HeadSHA); err != nil {
+		t.Fatal(err)
+	}
 
 	ciStep, err := sourceDB.InsertStepResult(run.ID, types.StepCI)
 	if err != nil {
@@ -235,6 +238,9 @@ func TestCIFalseNegativesFromRun_IncludesFindingAfterRepairWasRereviewed(t *test
 	if _, err := sourceDB.InsertReviewStepRound(reviewStep.ID, 3, "final_head_rereview", &clean, nil, "repaired-head", 20); err != nil {
 		t.Fatal(err)
 	}
+	if err := sourceDB.UpdateRunReviewApprovedHeadSHA(run.ID, "repaired-head"); err != nil {
+		t.Fatal(err)
+	}
 	postReview := `{"findings":[{"id":"ci-1","severity":"error","action":"auto-fix","category":"ci-check","check":"post-review-test","check_id":"gh:post-review:1","description":"reviewed repair still fails a CI check"}]}`
 	third, err := sourceDB.InsertStepRound(ciStep.ID, 3, "initial", &postReview, nil, 30)
 	if err != nil {
@@ -289,6 +295,9 @@ func TestCIFalseNegativesFromRun_ExcludesFindingAfterApprovedNonGreenRereview(t 
 	}
 	clean := `{"findings":[],"risk_level":"low","risk_rationale":"clean","risk_scope":"source-or-external"}`
 	if _, err := sourceDB.InsertReviewStepRound(reviewStep.ID, 4, "final_head_rereview", &clean, nil, "second-repaired-head", 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceDB.UpdateRunReviewApprovedHeadSHA(run.ID, "second-repaired-head"); err != nil {
 		t.Fatal(err)
 	}
 	finalCI := `{"findings":[]}`
@@ -396,15 +405,15 @@ func TestAutoIngestCIFalseNegatives_AttachesToGreenReviewAndIsIdempotent(t *test
 	p, sourceDB, run, greenRound := setupRunWithGreenReviewAndCI(t, ctx, `["ci-1","ci-2"]`, "")
 	defer sourceDB.Close()
 
-	result, skipped, err := AutoIngestCIFalseNegatives(ctx, p, sourceDB, run.ID)
+	results, skipped, err := AutoIngestCIFalseNegatives(ctx, p, sourceDB, run.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if skipped {
 		t.Fatal("ingest was skipped, want the fixed CI findings attached")
 	}
-	if result.Added != 2 || result.CaseID != run.ID+"-"+greenRound.ID {
-		t.Fatalf("ingest result = %#v, want 2 FN gold on the green review case", result)
+	if len(results) != 1 || results[0].Added != 2 || results[0].CaseID != run.ID+"-"+greenRound.ID {
+		t.Fatalf("ingest results = %#v, want 2 FN gold on the green review case", results)
 	}
 
 	store, err := Open(p.EvalDir())
@@ -446,7 +455,119 @@ func TestAutoIngestCIFalseNegatives_AttachesToGreenReviewAndIsIdempotent(t *test
 	if skipped {
 		t.Fatal("second ingest was skipped, want an idempotent no-op result")
 	}
-	if again.Added != 0 || again.Total != 2 {
+	if len(again) != 1 || again[0].Added != 0 || again[0].Total != 2 {
 		t.Fatalf("re-ingest = %#v, want a no-op that adds nothing", again)
 	}
+}
+
+func TestAutoIngestCIFalseNegatives_AttachesEachEpochToItsGreenReview(t *testing.T) {
+	ctx := context.Background()
+	p, sourceDB, run, firstGreen := setupRunWithGreenReviewAndCI(t, ctx, `["ci-1"]`, "")
+	defer sourceDB.Close()
+
+	steps, err := sourceDB.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewStep := steps[0]
+	ciStep := steps[len(steps)-1]
+	clean := `{"findings":[],"risk_level":"low","risk_rationale":"clean","risk_scope":"source-or-external"}`
+	secondGreen, err := sourceDB.InsertReviewStepRoundWithProvenance(reviewStep.ID, 3, "final_head_rereview", &clean, nil, run.HeadSHA, run.HeadSHA, stringValue(firstGreen.TrustedConfigSHA), firstGreen.GlobalConfigYAML, firstGreen.RepoConfigYAML, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceDB.UpdateRunReviewApprovedHeadSHA(run.ID, run.HeadSHA); err != nil {
+		t.Fatal(err)
+	}
+	secondObservation := `{"findings":[{"id":"ci-1","severity":"error","action":"auto-fix","category":"ci-check","check":"post-review-test","check_id":"gh:post-review:2","description":"second reviewed head fails a CI check"}]}`
+	observed, err := sourceDB.InsertStepRound(ciStep.ID, 3, "initial", &secondObservation, nil, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := `["ci-1"]`
+	if err := sourceDB.SetStepRoundSelection(observed.ID, &selected, db.RoundSelectionSourceAutoFix); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceDB.InsertStepRoundWithRepair(ciStep.ID, 4, "auto_fix", nil, nil, true, 40); err != nil {
+		t.Fatal(err)
+	}
+
+	results, skipped, err := AutoIngestCIFalseNegatives(ctx, p, sourceDB, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skipped || len(results) != 2 {
+		t.Fatalf("ingest results = %#v skipped=%v, want one result per green review epoch", results, skipped)
+	}
+	store, err := Open(p.EvalDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cases, err := store.ListCases("labeled")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byRound := map[string][]FindingGold{}
+	for _, c := range cases {
+		byRound[c.SourceRoundID] = c.Labels.Findings
+	}
+	if !containsGoldDescription(byRound[firstGreen.ID], "CI check failing: build - provider reported failure") || containsGoldDescription(byRound[firstGreen.ID], "second reviewed head fails a CI check") {
+		t.Fatalf("first review gold = %#v, want only its own CI miss", byRound[firstGreen.ID])
+	}
+	if !containsGoldDescription(byRound[secondGreen.ID], "second reviewed head fails a CI check") || containsGoldDescription(byRound[secondGreen.ID], "CI check failing: build - provider reported failure") {
+		t.Fatalf("second review gold = %#v, want only its own CI miss", byRound[secondGreen.ID])
+	}
+}
+
+func TestCIFalseNegativesFromRun_ExcludesDocumentationCarriedHead(t *testing.T) {
+	ctx := context.Background()
+	_, sourceDB, run, _ := setupRunWithGreenReviewAndCI(t, ctx, "", "")
+	defer sourceDB.Close()
+
+	steps, err := sourceDB.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciStep := steps[len(steps)-1]
+	testStep, err := sourceDB.InsertStepResult(run.ID, types.StepTest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	passed := `{"findings":[]}`
+	if _, err := sourceDB.InsertStepRound(testStep.ID, 1, "documentation_head_recheck", &passed, nil, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceDB.UpdateRunReviewApprovedHeadSHA(run.ID, "documentation-carried-head"); err != nil {
+		t.Fatal(err)
+	}
+	documentationFailure := `{"findings":[{"id":"ci-1","severity":"error","action":"auto-fix","category":"ci-check","check":"docs","check_id":"gh:docs:1","description":"documentation head fails its CI check"}]}`
+	observed, err := sourceDB.InsertStepRound(ciStep.ID, 2, "initial", &documentationFailure, nil, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := `["ci-1"]`
+	if err := sourceDB.SetStepRoundSelection(observed.ID, &selected, db.RoundSelectionSourceAutoFix); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceDB.InsertStepRoundWithRepair(ciStep.ID, 3, "auto_fix", nil, nil, true, 40); err != nil {
+		t.Fatal(err)
+	}
+
+	gold, err := CIFalseNegativesFromRun(sourceDB, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gold) != 0 {
+		t.Fatalf("gold = %#v, want none from a head carried past Review", gold)
+	}
+}
+
+func containsGoldDescription(gold []FindingGold, description string) bool {
+	for _, finding := range gold {
+		if finding.Description == description {
+			return true
+		}
+	}
+	return false
 }

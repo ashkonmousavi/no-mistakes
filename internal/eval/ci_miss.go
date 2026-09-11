@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -20,6 +21,11 @@ import (
 // real code defect CI surfaces on a reviewed head, that is confirmed and fixed,
 // is by definition a Review false negative: Review passed green and missed it.
 const goldSourceCIFalseNegative = "recorded-ci-false-negative"
+
+type ciFalseNegativeGroup struct {
+	reviewRoundID string
+	findings      []FindingGold
+}
 
 // isCIFalseNegativeCategory reports whether a CI finding category names a real
 // code defect Review could have caught: a failing check the provider attributes
@@ -56,6 +62,18 @@ func isCIFalseNegativeCategory(category string) bool {
 // defect that slipped a green Review is a valid case regardless of which commit
 // introduced it.
 func CIFalseNegativesFromRun(database *db.DB, runID string) ([]FindingGold, error) {
+	groups, err := ciFalseNegativeGroupsFromRun(database, runID)
+	if err != nil {
+		return nil, err
+	}
+	var gold []FindingGold
+	for _, group := range groups {
+		gold = append(gold, group.findings...)
+	}
+	return gold, nil
+}
+
+func ciFalseNegativeGroupsFromRun(database *db.DB, runID string) ([]ciFalseNegativeGroup, error) {
 	if database == nil {
 		return nil, fmt.Errorf("ci false-negative ingest requires a database")
 	}
@@ -94,9 +112,29 @@ func CIFalseNegativesFromRun(database *db.DB, runID string) ([]FindingGold, erro
 	if err != nil {
 		return nil, fmt.Errorf("read Review rounds: %w", err)
 	}
-	reviewMissCandidates := ciReviewMissCandidates(rounds, reviewRounds)
-	var gold []FindingGold
-	seen := map[string]bool{}
+	var authorityInvalidations []*db.StepRound
+	for _, step := range steps {
+		switch step.StepName {
+		case types.StepTest, types.StepDocument, types.StepLint:
+			stepRounds, err := database.GetRoundsByStep(step.ID)
+			if err != nil {
+				return nil, fmt.Errorf("read %s rounds: %w", step.StepName, err)
+			}
+			for _, round := range stepRounds {
+				if round.IsFixRound() || round.Trigger == "documentation_head_recheck" {
+					authorityInvalidations = append(authorityInvalidations, round)
+				}
+			}
+		}
+	}
+	approvedHead := ""
+	if run.ReviewApprovedHeadSHA != nil {
+		approvedHead = strings.TrimSpace(*run.ReviewApprovedHeadSHA)
+	}
+	reviewRoundsByCIRound := ciReviewMissRounds(rounds, reviewRounds, authorityInvalidations, approvedHead)
+	var groups []ciFalseNegativeGroup
+	groupIndexes := map[string]int{}
+	seen := map[string]map[string]bool{}
 	for i, round := range rounds {
 		if round.FindingsJSON == nil || round.SelectedFindingIDs == nil || !repairLandedAfter(rounds, i) {
 			continue
@@ -108,6 +146,10 @@ func CIFalseNegativesFromRun(database *db.DB, runID string) ([]FindingGold, erro
 		if len(selected) == 0 {
 			continue
 		}
+		reviewRoundID := reviewRoundsByCIRound[round.ID]
+		if reviewRoundID == "" {
+			continue
+		}
 		findings, err := types.ParseFindingsJSON(*round.FindingsJSON)
 		if err != nil {
 			continue
@@ -116,54 +158,75 @@ func CIFalseNegativesFromRun(database *db.DB, runID string) ([]FindingGold, erro
 			if !isCIFalseNegativeCategory(finding.Category) {
 				continue
 			}
-			candidateID := ciFalseNegativeID(finding)
-			if !reviewMissCandidates[candidateID] {
-				continue
-			}
 			id := strings.TrimSpace(finding.ID)
 			if id == "" || !selected[id] {
 				continue
 			}
 			g := ciFindingGold(finding)
-			if seen[g.ID] {
+			if seen[reviewRoundID] == nil {
+				seen[reviewRoundID] = map[string]bool{}
+			}
+			if seen[reviewRoundID][g.ID] {
 				continue
 			}
-			seen[g.ID] = true
-			gold = append(gold, g)
+			seen[reviewRoundID][g.ID] = true
+			groupIndex, ok := groupIndexes[reviewRoundID]
+			if !ok {
+				groupIndex = len(groups)
+				groupIndexes[reviewRoundID] = groupIndex
+				groups = append(groups, ciFalseNegativeGroup{reviewRoundID: reviewRoundID})
+			}
+			groups[groupIndex].findings = append(groups[groupIndex].findings, g)
 		}
 	}
-	return gold, nil
+	return groups, nil
 }
 
-func ciReviewMissCandidates(rounds, reviewRounds []*db.StepRound) map[string]bool {
-	candidates := map[string]bool{}
-	reviewed := false
-	reviewIndex := 0
-	for _, round := range rounds {
-		for reviewIndex < len(reviewRounds) && reviewRounds[reviewIndex].ID < round.ID {
-			reviewRound := reviewRounds[reviewIndex]
-			reviewed = reviewRound.ReviewedHeadSHA != nil &&
-				strings.TrimSpace(*reviewRound.ReviewedHeadSHA) != "" &&
-				reviewRound.FindingsJSON != nil && reviewPassedGreen(*reviewRound.FindingsJSON)
-			reviewIndex++
-		}
-		if round.RepairPublished {
-			reviewed = false
-		}
-		if !reviewed || round.FindingsJSON == nil {
-			continue
-		}
-		findings, err := types.ParseFindingsJSON(*round.FindingsJSON)
-		if err != nil {
-			continue
-		}
-		for _, finding := range findings.Items {
-			if isCIFalseNegativeCategory(finding.Category) {
-				candidates[ciFalseNegativeID(finding)] = true
-			}
+func ciReviewMissRounds(rounds, reviewRounds, authorityInvalidations []*db.StepRound, approvedHead string) map[string]string {
+	type authorityEvent struct {
+		id     string
+		review *db.StepRound
+	}
+	events := make([]authorityEvent, 0, len(reviewRounds)+len(authorityInvalidations))
+	latestReviewRoundID := ""
+	for _, round := range reviewRounds {
+		events = append(events, authorityEvent{id: round.ID, review: round})
+		if round.FindingsJSON != nil && strings.TrimSpace(*round.FindingsJSON) != "" {
+			latestReviewRoundID = round.ID
 		}
 	}
-	return candidates
+	for _, round := range authorityInvalidations {
+		events = append(events, authorityEvent{id: round.ID})
+	}
+	sort.Slice(events, func(i, j int) bool { return events[i].id < events[j].id })
+
+	associated := map[string]string{}
+	currentReviewRoundID := ""
+	eventIndex := 0
+	for _, round := range rounds {
+		for eventIndex < len(events) && events[eventIndex].id < round.ID {
+			event := events[eventIndex]
+			currentReviewRoundID = ""
+			if event.review != nil {
+				reviewedHead := ""
+				if event.review.ReviewedHeadSHA != nil {
+					reviewedHead = strings.TrimSpace(*event.review.ReviewedHeadSHA)
+				}
+				if reviewedHead != "" && event.review.FindingsJSON != nil && reviewPassedGreen(*event.review.FindingsJSON) &&
+					(event.review.ID != latestReviewRoundID || approvedHead == reviewedHead) {
+					currentReviewRoundID = event.review.ID
+				}
+			}
+			eventIndex++
+		}
+		if round.RepairPublished {
+			currentReviewRoundID = ""
+		}
+		if currentReviewRoundID != "" {
+			associated[round.ID] = currentReviewRoundID
+		}
+	}
+	return associated
 }
 
 func repairLandedAfter(rounds []*db.StepRound, selectedIndex int) bool {
@@ -183,33 +246,37 @@ func repairLandedAfter(rounds []*db.StepRound, selectedIndex int) bool {
 // Skipped is true, with no error, when the run has no fixed ci-check /
 // ci-review-bot finding, or when its review did not pass green (there is no
 // green review case to attach the misses to) - both are ordinary outcomes.
-func AutoIngestCIFalseNegatives(ctx context.Context, p *paths.Paths, database *db.DB, runID string) (IngestResult, bool, error) {
+func AutoIngestCIFalseNegatives(ctx context.Context, p *paths.Paths, database *db.DB, runID string) ([]IngestResult, bool, error) {
 	if p == nil || database == nil {
-		return IngestResult{}, false, fmt.Errorf("eval ci false-negative ingest requires paths and a database")
+		return nil, false, fmt.Errorf("eval ci false-negative ingest requires paths and a database")
 	}
-	misses, err := CIFalseNegativesFromRun(database, runID)
+	groups, err := ciFalseNegativeGroupsFromRun(database, runID)
 	if err != nil {
-		return IngestResult{}, false, err
+		return nil, false, err
 	}
-	if len(misses) == 0 {
-		return IngestResult{}, true, nil
+	if len(groups) == 0 {
+		return nil, true, nil
 	}
 	store, err := Open(p.EvalDir())
 	if err != nil {
-		return IngestResult{}, false, err
+		return nil, false, err
 	}
 	defer store.Close()
 
-	result, err := IngestPostPRMiss(ctx, store, p, database, runID, misses)
+	misses := make([]reviewRoundMisses, 0, len(groups))
+	for _, group := range groups {
+		misses = append(misses, reviewRoundMisses{reviewRoundID: group.reviewRoundID, findings: group.findings})
+	}
+	results, err := ingestPostPRMissesForReviewRounds(ctx, store, p, database, runID, misses)
 	if err != nil {
 		// A run whose review did not pass green, or has no capturable review,
 		// has nowhere to attach these misses: skip it rather than fault.
 		if errors.Is(err, ErrReviewDidNotPassGreen) || errors.Is(err, ErrNoCapturableReview) {
-			return IngestResult{}, true, nil
+			return nil, true, nil
 		}
-		return IngestResult{}, false, err
+		return nil, false, err
 	}
-	return result, false, nil
+	return results, false, nil
 }
 
 // ciFindingGold converts one persisted CI finding into false-negative gold. It
