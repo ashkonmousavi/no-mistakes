@@ -405,7 +405,7 @@ func TestAutoIngestCIFalseNegatives_AttachesToGreenReviewAndIsIdempotent(t *test
 	p, sourceDB, run, greenRound := setupRunWithGreenReviewAndCI(t, ctx, `["ci-1","ci-2"]`, "")
 	defer sourceDB.Close()
 
-	results, skipped, err := AutoIngestCIFalseNegatives(ctx, p, sourceDB, run.ID)
+	results, skipped, err := AutoIngestCIFalseNegatives(ctx, p, sourceDB, run.ID, 200)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +448,7 @@ func TestAutoIngestCIFalseNegatives_AttachesToGreenReviewAndIsIdempotent(t *test
 		t.Fatalf("review-bot gold lost its file/line: %#v", ingested.Labels.Findings)
 	}
 
-	again, skipped, err := AutoIngestCIFalseNegatives(ctx, p, sourceDB, run.ID)
+	again, skipped, err := AutoIngestCIFalseNegatives(ctx, p, sourceDB, run.ID, 200)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -492,7 +492,7 @@ func TestAutoIngestCIFalseNegatives_AttachesEachEpochToItsGreenReview(t *testing
 		t.Fatal(err)
 	}
 
-	results, skipped, err := AutoIngestCIFalseNegatives(ctx, p, sourceDB, run.ID)
+	results, skipped, err := AutoIngestCIFalseNegatives(ctx, p, sourceDB, run.ID, 200)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,6 +517,21 @@ func TestAutoIngestCIFalseNegatives_AttachesEachEpochToItsGreenReview(t *testing
 	}
 	if !containsGoldDescription(byRound[secondGreen.ID], "second reviewed head fails a CI check") || containsGoldDescription(byRound[secondGreen.ID], "CI check failing: build - provider reported failure") {
 		t.Fatalf("second review gold = %#v, want only its own CI miss", byRound[secondGreen.ID])
+	}
+	if _, err := store.Prune(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, skipped, err := AutoIngestCIFalseNegatives(ctx, p, sourceDB, run.ID, 1); err != nil {
+		t.Fatal(err)
+	} else if skipped {
+		t.Fatal("capped re-ingest was skipped")
+	}
+	all, err := store.ListCases("all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("cases after capped multi-epoch ingest = %d, want retention target 1", len(all))
 	}
 }
 

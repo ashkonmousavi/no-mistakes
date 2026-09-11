@@ -1611,7 +1611,7 @@ func (m *RunManager) autoIngestCIFalseNegatives(ctx context.Context, cfg *config
 	ctx, cancel := context.WithTimeout(ctx, evalAutoCaptureTimeout)
 	defer cancel()
 
-	results, skipped, err := eval.AutoIngestCIFalseNegatives(ctx, m.paths, m.db, runID)
+	results, skipped, err := eval.AutoIngestCIFalseNegatives(ctx, m.paths, m.db, runID, cfg.Eval.MaxCases)
 	switch {
 	case err != nil:
 		slog.Warn("failed to ingest CI false negatives", "run_id", runID, "error", err)

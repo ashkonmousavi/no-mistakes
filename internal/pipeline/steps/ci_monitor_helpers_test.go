@@ -67,3 +67,34 @@ func TestCIMonitorReadinessChangeNotifiesConsumers(t *testing.T) {
 		}
 	}
 }
+
+func TestCIMonitorFreshGreenClearsApprovalOverride(t *testing.T) {
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	ci, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepCI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sctx.StepResultID = ci.ID
+	if err := sctx.DB.SetStepOverrideReason(ci.ID, "required check still failing"); err != nil {
+		t.Fatal(err)
+	}
+
+	clearCIMonitorReady(sctx)
+	stillOverridden, err := sctx.DB.GetStepResult(ci.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stillOverridden.OverrideReason == nil {
+		t.Fatal("non-green readiness update cleared the approval override")
+	}
+
+	logCIMonitorStatus(sctx, ciChecksPassedMsg, "")
+	green, err := sctx.DB.GetStepResult(ci.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if green.OverrideReason != nil {
+		t.Fatalf("fresh green CI retained override reason %q", *green.OverrideReason)
+	}
+}

@@ -57,10 +57,10 @@ func isCIFalseNegativeCategory(category string) bool {
 // and terminal PR completion before checks passed are excluded.
 //
 // It never fabricates: a run that did not finish, whose CI step did not
-// complete cleanly green, or that has no such fixed finding yields nothing. It
-// makes no head/commit provenance, same-head, or cross-run judgement - a real
-// defect that slipped a green Review is a valid case regardless of which commit
-// introduced it.
+// complete cleanly green, or that has no such fixed finding yields nothing.
+// Each eligible finding stays associated with the exact green Review round
+// whose head CI observed. A repair or another post-review head mutation ends
+// that association until a later green Review establishes a new one.
 func CIFalseNegativesFromRun(database *db.DB, runID string) ([]FindingGold, error) {
 	groups, err := ciFalseNegativeGroupsFromRun(database, runID)
 	if err != nil {
@@ -246,7 +246,7 @@ func repairLandedAfter(rounds []*db.StepRound, selectedIndex int) bool {
 // Skipped is true, with no error, when the run has no fixed ci-check /
 // ci-review-bot finding, or when its review did not pass green (there is no
 // green review case to attach the misses to) - both are ordinary outcomes.
-func AutoIngestCIFalseNegatives(ctx context.Context, p *paths.Paths, database *db.DB, runID string) ([]IngestResult, bool, error) {
+func AutoIngestCIFalseNegatives(ctx context.Context, p *paths.Paths, database *db.DB, runID string, maxCases int) ([]IngestResult, bool, error) {
 	if p == nil || database == nil {
 		return nil, false, fmt.Errorf("eval ci false-negative ingest requires paths and a database")
 	}
@@ -267,14 +267,21 @@ func AutoIngestCIFalseNegatives(ctx context.Context, p *paths.Paths, database *d
 	for _, group := range groups {
 		misses = append(misses, reviewRoundMisses{reviewRoundID: group.reviewRoundID, findings: group.findings})
 	}
-	results, err := ingestPostPRMissesForReviewRounds(ctx, store, p, database, runID, misses)
-	if err != nil {
+	results, ingestErr := ingestPostPRMissesForReviewRounds(ctx, store, p, database, runID, misses)
+	_, pruneErr := store.Prune(ctx, maxCases)
+	if pruneErr != nil {
+		if ingestErr != nil {
+			return nil, false, errors.Join(ingestErr, fmt.Errorf("enforce eval retention after CI miss ingest: %w", pruneErr))
+		}
+		return nil, false, fmt.Errorf("enforce eval retention after CI miss ingest: %w", pruneErr)
+	}
+	if ingestErr != nil {
 		// A run whose review did not pass green, or has no capturable review,
 		// has nowhere to attach these misses: skip it rather than fault.
-		if errors.Is(err, ErrReviewDidNotPassGreen) || errors.Is(err, ErrNoCapturableReview) {
+		if errors.Is(ingestErr, ErrReviewDidNotPassGreen) || errors.Is(ingestErr, ErrNoCapturableReview) {
 			return nil, true, nil
 		}
-		return nil, false, err
+		return nil, false, ingestErr
 	}
 	return results, false, nil
 }
