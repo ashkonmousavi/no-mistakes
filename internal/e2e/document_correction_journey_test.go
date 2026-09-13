@@ -5,6 +5,7 @@ package e2e
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -245,6 +246,178 @@ func TestDocumentCorrectionJourney(t *testing.T) {
 		}
 	}
 	assertCurrentDocumentCorrectionAttestation(t, body, run.HeadSHA)
+}
+
+// TestDocumentCorrectionJourney_ConfiguredCommand proves that the repository's
+// own deterministic command runs again on a Document-corrected head. The
+// witness lives outside the candidate tree, so recording it cannot itself
+// advance HEAD or make a stale derivative look current.
+func TestDocumentCorrectionJourney_ConfiguredCommand(t *testing.T) {
+	const initial = "# Reference\n\n| flag | meaning |\n| --- | --- |\n"
+	for _, tc := range []struct {
+		name       string
+		fix        bool
+		noHeadMove bool
+	}{
+		{name: "stale_derivative_blocks_push"},
+		{name: "fixed_derivative_publishes_only_tested_head", fix: true},
+		{name: "unchanged_head_runs_command_once", noHeadMove: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scenarioText := documentCorrectionScenario
+			if tc.fix {
+				fixAction := `  - match: "Fix the failing tests in this repository."
+    text: "updated the derivative"
+    edits:
+      - path: docs/derivative.md
+        new: "# Reference\n\n| flag | meaning |\n| --- | --- |\n| --carve | carve the widget |\n"
+    structured:
+      summary: "update the stale derivative"
+`
+				scenarioText = strings.Replace(scenarioText, "actions:\n", "actions:\n"+fixAction, 1)
+			}
+			if tc.noHeadMove {
+				cleanAction := `  - match: "stale or incorrect statement"
+    text: "documentation accurate"
+    structured:
+      findings: []
+      summary: "documentation accurate"
+`
+				scenarioText = strings.Replace(scenarioText, "actions:\n", "actions:\n"+cleanAction, 1)
+			}
+			scenario := filepath.Join(t.TempDir(), "document-command.yaml")
+			if err := os.WriteFile(scenario, []byte(scenarioText), 0o644); err != nil {
+				t.Fatalf("write scenario: %v", err)
+			}
+			h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: scenario})
+			ctx := context.Background()
+			witness := filepath.Join(t.TempDir(), "tested-heads")
+			command := "git rev-parse HEAD >> " + shellQuote(witness) + " && cmp -s docs/reference.md docs/derivative.md"
+			config := strings.Replace(trustedRepoConfigWithDocumentCorrection,
+				"  lint: \"true\"\n", "  lint: \"true\"\n  test: "+fmt.Sprintf("%q", command)+"\n", 1)
+			if tc.fix {
+				config = strings.Replace(config, "  document: 1\n", "  document: 1\n  test: 1\n", 1)
+			}
+			pushMainRepoConfig(t, h, config)
+			forkDir, ghLog := configureDocumentCorrectionFork(t, h)
+			if out, err := h.Run("init", "--fork-url", "https://github.com/example-fork/no-mistakes.git"); err != nil {
+				t.Fatalf("nm init: %v\n%s", err, out)
+			}
+
+			branch := "document-command-" + strings.ReplaceAll(tc.name, "_", "-")
+			h.CommitChange(branch, "docs/reference.md", initial, "add the reference table")
+			h.CommitChange(branch, "docs/derivative.md", initial, "add its derivative")
+			submitted := h.CommitChange(branch, "internal/widget/carve.go", "package widget\n\n// Carve implements --carve.\nfunc Carve() {}\n", "add the carve flag")
+			h.PushToGate(branch)
+
+			if !tc.fix && !tc.noHeadMove {
+				gated := waitForStepStatus(t, h, branch, types.StepTest, types.StepStatusAwaitingApproval, 180*time.Second)
+				if gated == nil {
+					t.Fatal("stale derivative did not gate Test")
+				}
+				assertDocumentCommandHeads(t, witness, submitted, gated.HeadSHA, false)
+				if _, err := h.runGit(ctx, forkDir, "rev-parse", "--verify", "refs/heads/"+branch); err == nil {
+					t.Fatal("stale derivative was published before Test passed")
+				}
+				if _, err := os.Stat(ghLog); err == nil {
+					if len(readGHStubInvocations(t, ghLog)) != 0 {
+						t.Fatal("stale derivative reached the forge before Test passed")
+					}
+				} else if !os.IsNotExist(err) {
+					t.Fatalf("inspect forge stub log: %v", err)
+				}
+				return
+			}
+
+			run := h.WaitForRun(branch, 180*time.Second)
+			if run.Status != types.RunCompleted {
+				t.Fatalf("run did not complete: status=%s error=%v", run.Status, deref(run.Error))
+			}
+			heads := assertDocumentCommandHeads(t, witness, submitted, run.HeadSHA, tc.noHeadMove)
+			detail := h.RunInfo(run.ID)
+			if got := stepInfo(t, detail, types.StepReview).RoundCount; got != 1 {
+				t.Fatalf("Review rounds = %d, want 1 for documentation-only changes", got)
+			}
+			if tc.noHeadMove {
+				if got := stepInfo(t, detail, types.StepTest).RoundCount; got != 1 {
+					t.Fatalf("Test rounds = %d, want one with no head change", got)
+				}
+			} else if heads[1] == run.HeadSHA {
+				t.Fatal("stale corrected head became the final published head")
+			}
+			test := stepInfo(t, detail, types.StepTest)
+			if test.FindingsJSON == nil {
+				t.Fatal("final Test has no persisted findings")
+			}
+			findings, err := types.ParseFindingsJSON(*test.FindingsJSON)
+			if err != nil || findings.TestedHeadSHA != run.HeadSHA {
+				t.Fatalf("final Test head = %q, want published head %s: %v", findings.TestedHeadSHA, run.HeadSHA, err)
+			}
+			finalHead, err := h.runGit(ctx, forkDir, "rev-parse", "refs/heads/"+branch)
+			if err != nil || strings.TrimSpace(string(finalHead)) != run.HeadSHA {
+				t.Fatalf("published head = %q, want final tested head %s: %v", strings.TrimSpace(string(finalHead)), run.HeadSHA, err)
+			}
+			if !tc.noHeadMove {
+				body := createdPRBody(t, readGHStubInvocations(t, ghLog))
+				assertCurrentDocumentCorrectionAttestation(t, body, run.HeadSHA)
+			}
+		})
+	}
+}
+
+func assertDocumentCommandHeads(t *testing.T, path, submitted, final string, noHeadMove bool) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read configured-command witness: %v", err)
+	}
+	heads := strings.Fields(string(data))
+	if len(heads) == 0 || heads[0] != submitted {
+		t.Fatalf("first configured command ran on heads %q, want submitted %s first", heads, submitted)
+	}
+	if noHeadMove {
+		if len(heads) != 1 || final != submitted {
+			t.Fatalf("unchanged head executed command on %q; final=%s submitted=%s", heads, final, submitted)
+		}
+		return heads
+	}
+	if len(heads) < 2 || heads[1] == submitted {
+		t.Fatalf("Document changed head but configured command saw %q, want a second distinct head", heads)
+	}
+	if len(heads) == 2 && heads[1] != final {
+		t.Fatalf("second configured command ran on %s, want corrected head %s", heads[1], final)
+	}
+	if len(heads) > 2 && heads[len(heads)-1] != final {
+		t.Fatalf("last configured command ran on %s, want final %s", heads[len(heads)-1], final)
+	}
+	return heads
+}
+
+func configureDocumentCorrectionFork(t *testing.T, h *Harness) (string, string) {
+	t.Helper()
+	ctx := context.Background()
+	const parentURL = "https://github.com/example/no-mistakes.git"
+	const forkURL = "https://github.com/example-fork/no-mistakes.git"
+	forkDir := filepath.Join(filepath.Dir(h.UpstreamDir), "fork.git")
+	if err := os.MkdirAll(forkDir, 0o755); err != nil {
+		t.Fatalf("mkdir fork: %v", err)
+	}
+	if out, err := h.runGit(ctx, forkDir, "init", "--bare", "--initial-branch=main"); err != nil {
+		t.Fatalf("init fork: %v\n%s", err, out)
+	}
+	if out, err := h.runGit(ctx, h.WorkDir, "push", forkDir, "main"); err != nil {
+		t.Fatalf("seed fork main: %v\n%s", err, out)
+	}
+	configureGitURLRewrite(t, h, parentURL, h.UpstreamDir)
+	configureGitURLRewrite(t, h, forkURL, forkDir)
+	if out, err := h.runGit(ctx, h.WorkDir, "remote", "set-url", "origin", parentURL); err != nil {
+		t.Fatalf("set parent origin: %v\n%s", err, out)
+	}
+	ghLog := filepath.Join(filepath.Dir(h.AgentLog), "gh-document-command.log")
+	t.Setenv("FAKEAGENT_GH_MODE", "fork-pr")
+	t.Setenv("FAKEAGENT_GH_LOG", ghLog)
+	t.Setenv("FAKEAGENT_GH_PARENT", "example/no-mistakes")
+	return forkDir, ghLog
 }
 
 // assertCurrentDocumentCorrectionAttestation proves the external consumer view

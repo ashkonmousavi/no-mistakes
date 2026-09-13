@@ -119,6 +119,7 @@ Previous test findings to address:
 		if exitCode != 0 {
 			baselineFindings = []Finding{{
 				Severity:    "error",
+				Action:      types.ActionAutoFix,
 				Description: fmt.Sprintf("tests failed with exit code %d", exitCode),
 			}}
 			baselineSummary = projectedOutput

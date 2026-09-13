@@ -146,8 +146,8 @@ func TestTestStep_FailingBaselineStillRunsEvidenceTurn(t *testing.T) {
 	if len(findings.Tested) < 2 || findings.Tested[0] != testCmd {
 		t.Fatalf("tested = %+v, want baseline followed by evidence checks", findings.Tested)
 	}
-	if len(findings.Items) == 0 || !strings.Contains(findings.Items[0].Description, "tests failed with exit code 7") {
-		t.Fatalf("baseline finding missing from %+v", findings.Items)
+	if len(findings.Items) == 0 || findings.Items[0].Action != types.ActionAutoFix || !strings.Contains(findings.Items[0].Description, "tests failed with exit code 7") {
+		t.Fatalf("auto-fixable baseline finding missing from %+v", findings.Items)
 	}
 }
 
