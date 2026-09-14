@@ -454,23 +454,30 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 			return timeoutOutcome()
 		}
 
-		// Re-arm the timeout whenever the base branch advances.
-		if !unlimited {
+		// Re-arm the timeout when the base advances. A repaired conflict also
+		// needs the current base tip, including on an unlimited monitor.
+		currentBaseSHA := ""
+		if !unlimited || s.needsConflictRepairBase(sctx.Run.HeadSHA) {
 			resolveWindow := defaultBaseBranchTipResolveWindow
-			if remaining := timeout - now().Sub(timeoutAnchor); remaining <= 0 {
-				return timeoutOutcome()
-			} else if remaining < resolveWindow {
-				resolveWindow = remaining
+			if !unlimited {
+				if remaining := timeout - now().Sub(timeoutAnchor); remaining <= 0 {
+					return timeoutOutcome()
+				} else if remaining < resolveWindow {
+					resolveWindow = remaining
+				}
 			}
 			tipCtx, cancel := context.WithTimeout(ctx, resolveWindow)
 			tip, resolved := baseBranchTip(tipCtx)
 			cancel()
 			if resolved && tip != "" {
+				currentBaseSHA = tip
 				if lastBaseTip == "" {
 					lastBaseTip = tip
 				} else if tip != lastBaseTip {
-					sctx.Log(fmt.Sprintf("base branch advanced (%s..%s), re-arming CI monitor timeout", shortSHA(lastBaseTip), shortSHA(tip)))
-					timeoutAnchor = now()
+					if !unlimited {
+						sctx.Log(fmt.Sprintf("base branch advanced (%s..%s), re-arming CI monitor timeout", shortSHA(lastBaseTip), shortSHA(tip)))
+						timeoutAnchor = now()
+					}
 					lastBaseTip = tip
 				}
 			}
@@ -669,7 +676,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 				sctx.Log("issues detected but checks still pending, waiting for all checks to complete...")
 			} else if hasIssues {
 				lastMonitorLog = ""
-				if s.lastRepairStillUnverified(checks, mergeConflict) {
+				if s.lastRepairStillUnverified(checks, mergeConflict, currentBaseSHA, sctx.Run.HeadSHA) {
 					// The provider has not re-run the checks the last
 					// published repair targeted: the failures on screen are
 					// the ones that repair was for, not a verdict on it.
