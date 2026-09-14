@@ -51,12 +51,13 @@ The pipeline is opinionated so that "passed the gate" has a stable meaning:
 - **Rebase next** so everything else runs against the latest upstream and pushed-branch target.
   It also stops when the branch would silently bundle commits from a local default branch that were never pushed to `origin/<default_branch>`.
   If there's no diff left after the rebase, the pipeline skips the rest.
+  The trusted [`sync_strategy`](/no-mistakes/reference/repo-config/#sync_strategy) key (default `rebase`) selects the integration mechanism: `rebase` rewrites history as above, while `sync_strategy: merge` integrates with an ordinary `git merge` instead - a merge commit, or a fast-forward when possible - so the pushed head always stays an ancestor of the new head. It applies identically to the CI step's merge-conflict repair.
 - **Review before test** so the agent reads fresh code, not code it may have touched during fixes.
   A later run's initial review also receives fix-round provenance for any uncertified pipeline-authored commits left on the branch when a previous run's re-review did not complete.
 - **Document after test** so docs are updated against code that's known to work.
 - **Lint last among local checks** so it doesn't churn over code that may still change.
 - **Push → PR → CI** happens after all local checks pass.
-  CI publishes a repair through the Push step's guarded path and keeps monitoring only when it can prove the repair descends from the reviewed head; otherwise the repair revalidates from Review before Push republishes it, which is what a merge-conflict repair always does. [`ci.revalidate_repairs`](/no-mistakes/reference/repo-config/#cirevalidate_repairs) sets that intent: `false` (default) publishes when it is provable, `true` revalidates every repair.
+  CI publishes a repair through the Push step's guarded path and keeps monitoring only when it can prove the repair descends from the reviewed head; otherwise the repair revalidates from Review before Push republishes it, which is what a merge-conflict repair always does under the default `sync_strategy: rebase` (under `sync_strategy: merge` a merge-conflict repair's continuity is provable like any other repair). [`ci.revalidate_repairs`](/no-mistakes/reference/repo-config/#cirevalidate_repairs) sets that intent: `false` (default) publishes when it is provable, `true` revalidates every repair.
   CI is the only step that talks to the outside world for validation.
 
 ## What each step can do

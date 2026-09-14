@@ -8,7 +8,7 @@ Per-repo configuration lives in `.no-mistakes.yaml` at the root of your reposito
 :::caution[Security: gate-control fields are read from the default branch]
 `commands.*` execute arbitrary shell on the daemon host via `sh -c` / `cmd.exe /c`, and `agent` selects which process launches there (including ordered fallback lists, ACP aliases such as `cursor`, and `acp:` targets) with the maintainer's credentials.
 To prevent a supply-chain attack where a contributor lands a hostile value on a gated branch, the daemon always reads **`commands` and `agent` from your default branch** (e.g. `origin/main`), never from the pushed SHA, and reads them at the exact commit a fresh fetch resolved (so a stale `origin/<default>` ref cannot serve a value the live default branch removed).
-The daemon also reads `document.instructions`, `document.correction_paths`, `review.path_instructions`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.rerun_infrastructure`, `ci.revalidate_repairs`, `test.instructions`, and `test.evidence.branch` only from that trusted copy.
+The daemon also reads `document.instructions`, `document.correction_paths`, `review.path_instructions`, `protected_paths`, `disable_project_settings`, `no_ci`, `sync_strategy`, `ci.rerun_transient`, `ci.rerun_infrastructure`, `ci.revalidate_repairs`, `test.instructions`, and `test.evidence.branch` only from that trusted copy.
 `pr.base_branch` is trusted-default-branch-only as well, but unlike those fields it follows the same `allow_repo_commands: true` opt-in exception as `commands`/`agent` (see [`pr.base_branch`](#prbase_branch) below).
 If the default branch cannot be fetched and resolved to a readable commit, or its present `.no-mistakes.yaml` cannot be read and parsed, the run aborts before launching an agent.
 A readable default-branch tree with no `.no-mistakes.yaml` is valid and uses defaults.
@@ -195,6 +195,22 @@ If checks still appear on a declared no-CI repository, their actual states are p
 
 This field is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`, regardless of `allow_repo_commands`.
 A feature branch cannot self-declare `no_ci: true` to bypass checks, and cannot clear a trusted declaration either.
+
+### sync_strategy
+
+Select how the pipeline integrates the pushed branch with its target branch.
+
+| | |
+| --- | --- |
+| Type | `string`: `rebase` or `merge` |
+| Default | `rebase` |
+
+`rebase` (default) preserves the pipeline's original behavior: the [Rebase step](/no-mistakes/reference/pipeline-steps/#rebase) and the [CI step](/no-mistakes/reference/pipeline-steps/#ci)'s merge-conflict repair rewrite the branch's history onto its target.
+`merge` integrates with an ordinary `git merge` everywhere the pipeline would otherwise rebase: a merge commit, or a fast-forward when possible, so the pushed head always stays an ancestor of the new head and no branch-moving step ever rewrites history, runs `git rebase`, or `git reset --hard`s onto another commit.
+
+This field is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`, regardless of `allow_repo_commands`.
+A pushed branch cannot switch itself back to `rebase` after a maintainer has forbidden it, nor force `merge` on a repository that expects the default.
+A value other than `rebase` or `merge` fails config parsing closed, naming `sync_strategy` in the error.
 
 ### pr.base_branch
 
