@@ -85,7 +85,6 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 	issueDesc := targets.description()
 	sctx.Log(fmt.Sprintf("repairing: %s...", issueDesc))
 	previousHeadSHA := sctx.Run.HeadSHA
-	fixKey := encodeLastFixedChecks(targets.Checks, targets.MergeConflict)
 	fixCompletedAt := completionTimesForTargets(s.observedCompletedAt, targets.Checks)
 	repair, err := s.autoFixCI(sctx, host, pr, targets)
 	if outcome := pipeline.ProtectedPathOutcome(err); outcome != nil {
@@ -106,7 +105,7 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 		return nil, nil
 	}
 	if repair.HeadAdvanced || sctx.Run.HeadSHA != previousHeadSHA {
-		s.lastFixedChecks = fixKey
+		s.lastFixedChecks = encodeLastFixedChecks(targets.Checks, targets.MergeConflict, repair.ConflictRepairBaseSHA, repair.ConflictRepairHeadSHA)
 		s.lastFixedCompletedAt = fixCompletedAt
 		s.pendingFixSummary = repair.Summary
 		s.pendingRepairPublish = true
@@ -161,7 +160,7 @@ func (s *CIStep) autoFixCI(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR
 		baseBranch = strings.TrimSpace(pr.BaseBranch)
 	}
 	baseSHA := resolveBranchBaseSHA(ctx, sctx.WorkDir, sctx.Run.BaseSHA, baseBranch)
-	rebaseBaseSHA := resolveRunDefaultBranchTipSHA(ctx, sctx, sctx.Run.BaseSHA, baseBranch)
+	rebaseBaseSHA, rebaseBaseVerified := resolveRunDefaultBranchTip(ctx, sctx, sctx.Run.BaseSHA, baseBranch)
 	promptBaseSHA := baseSHA
 	if mergeConflict {
 		promptBaseSHA = rebaseBaseSHA
@@ -269,6 +268,10 @@ CI logs:
 	}
 	if repair.HeadAdvanced {
 		repair.Summary = conclusion.Summary
+		if mergeConflict && rebaseBaseVerified {
+			repair.ConflictRepairBaseSHA = rebaseBaseSHA
+			repair.ConflictRepairHeadSHA = sctx.Run.HeadSHA
+		}
 		return repair, nil
 	}
 	if !mergeConflict && conclusion.CodeChangeNeeded != nil && !*conclusion.CodeChangeNeeded {
@@ -519,6 +522,11 @@ type ciRepairResult struct {
 	Revalidate         bool
 	NoCodeChangeNeeded bool
 	Summary            string
+	// ConflictRepairBaseSHA and ConflictRepairHeadSHA bind conflict-only
+	// suppression to the exact verified base and resulting repair head.
+	// They remain empty when the base could not be resolved.
+	ConflictRepairBaseSHA string
+	ConflictRepairHeadSHA string
 }
 
 // commitAndPush remains as the narrow test seam for the default summary.

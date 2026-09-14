@@ -12,6 +12,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 func TestCIStep_MergeConflictDetected_ReturnsNeedsApproval(t *testing.T) {
@@ -63,6 +64,48 @@ func TestCIStep_MergeConflictDetected_ReturnsNeedsApproval(t *testing.T) {
 	}
 	if !foundConflict {
 		t.Fatalf("expected merge conflict finding, got: %+v", findings.Items)
+	}
+}
+
+func TestCIStep_ConflictRepairAgainstNewBaseReturnsNewFinding(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, repairHeadSHA := setupGitRepo(t)
+
+	// This is the first CI poll after a conflict-only repair restarted from
+	// Review. The old base-A repair had no check targets; main advanced to B
+	// before revalidation completed, so the PR is dirty again with no checks
+	// yet registered. That must reach the normal conflict finding route rather
+	// than waiting for a rerun that cannot start.
+	env := fakeCIGHMergeable(t, "OPEN", `[]`, "CONFLICTING")
+	prURL := "https://github.com/test/repo/pull/42"
+	sctx := newTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, repairHeadSHA, config.Commands{})
+	sctx.Env = env
+	sctx.Run.PRURL = &prURL
+	sctx.Config.CITimeout = 30 * time.Second
+	sctx.Config.AutoFix = config.AutoFix{CI: 0}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sctx.Ctx = ctx
+
+	step := (&CIStep{
+		lastFixedChecks: encodeLastFixedChecks(nil, true, "base-a", repairHeadSHA),
+	}).SetBaseBranchTip(func(context.Context) (string, bool) { return "base-b", true }).SetWaitForNextPoll(func(context.Context, time.Duration) error {
+		cancel()
+		return context.Canceled
+	})
+	outcome, err := driveCI(t, step, sctx)
+	if err != nil {
+		t.Fatalf("CI monitor returned error: %v", err)
+	}
+	if outcome == nil || !outcome.NeedsApproval {
+		t.Fatalf("outcome = %#v, want the normal conflict finding", outcome)
+	}
+	var findings Findings
+	if err := json.Unmarshal([]byte(outcome.Findings), &findings); err != nil {
+		t.Fatal(err)
+	}
+	if len(findings.Items) != 1 || findings.Items[0].Category != types.FindingCategoryCIMergeConflict {
+		t.Fatalf("findings = %+v, want one merge-conflict finding", findings.Items)
 	}
 }
 

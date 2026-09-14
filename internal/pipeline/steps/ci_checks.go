@@ -13,8 +13,10 @@ import (
 )
 
 type lastFixedIssues struct {
-	Checks        []scm.CheckTarget `json:"checks,omitempty"`
-	MergeConflict bool              `json:"mergeConflict,omitempty"`
+	Checks                []scm.CheckTarget `json:"checks,omitempty"`
+	MergeConflict         bool              `json:"mergeConflict,omitempty"`
+	ConflictRepairBaseSHA string            `json:"conflictRepairBaseSHA,omitempty"`
+	ConflictRepairHeadSHA string            `json:"conflictRepairHeadSHA,omitempty"`
 }
 
 // pollInterval returns the polling interval based on elapsed time since CI monitoring started.
@@ -229,11 +231,16 @@ func pendingCheckMatchesLastFixed(checks []scm.Check, lastFixedChecks string) bo
 	return false
 }
 
-func encodeLastFixedChecks(checks []scm.CheckTarget, mergeConflict bool) string {
+func encodeLastFixedChecks(checks []scm.CheckTarget, mergeConflict bool, conflictRepairBaseSHA, conflictRepairHeadSHA string) string {
 	if len(checks) == 0 && !mergeConflict {
 		return ""
 	}
-	encoded, err := json.Marshal(lastFixedIssues{Checks: checks, MergeConflict: mergeConflict})
+	encoded, err := json.Marshal(lastFixedIssues{
+		Checks:                checks,
+		MergeConflict:         mergeConflict,
+		ConflictRepairBaseSHA: conflictRepairBaseSHA,
+		ConflictRepairHeadSHA: conflictRepairHeadSHA,
+	})
 	if err != nil {
 		return ""
 	}
@@ -263,13 +270,25 @@ func decodeLastFixedChecks(raw string) (lastFixedIssues, bool) {
 // one whose targets are all still red as they were. A target that cleared, or
 // a conflict that resolved, is the provider acting on the repair and makes
 // the observation fresh.
-func (s *CIStep) lastRepairStillUnverified(checks []scm.Check, mergeConflict bool) bool {
+func (s *CIStep) lastRepairStillUnverified(checks []scm.Check, mergeConflict bool, currentBaseSHA, currentHeadSHA string) bool {
 	issues, ok := decodeLastFixedChecks(s.lastFixedChecks)
 	if !ok {
 		return false
 	}
 	if issues.MergeConflict && !mergeConflict {
 		return false
+	}
+	if issues.MergeConflict {
+		// A conflict-only repair has no check target whose freshness can prove
+		// that the provider observed the repaired branch. Keep suppression scoped
+		// to its verified rebase tip and resulting repair head. An unresolved base
+		// deliberately cannot invent a new repair target.
+		if issues.ConflictRepairHeadSHA != "" && currentHeadSHA != issues.ConflictRepairHeadSHA {
+			return false
+		}
+		if issues.ConflictRepairBaseSHA != "" && currentBaseSHA != "" && currentBaseSHA != issues.ConflictRepairBaseSHA {
+			return false
+		}
 	}
 	for _, target := range issues.Checks {
 		if !checkTargetFailedTerminally(checks, target) {
