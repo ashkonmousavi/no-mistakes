@@ -261,6 +261,11 @@ func decodeLastFixedChecks(raw string) (lastFixedIssues, bool) {
 	return issues, true
 }
 
+func (s *CIStep) needsConflictRepairBase(currentHeadSHA string) bool {
+	issues, ok := decodeLastFixedChecks(s.lastFixedChecks)
+	return ok && issues.MergeConflict && issues.ConflictRepairBaseSHA != "" && issues.ConflictRepairHeadSHA == currentHeadSHA
+}
+
 // lastRepairStillUnverified reports whether every issue the last published
 // repair targeted is still terminally failed, meaning the provider has not
 // yet re-run those checks against the repaired head. The two clears that
@@ -276,6 +281,9 @@ func (s *CIStep) lastRepairStillUnverified(checks []scm.Check, mergeConflict boo
 		return false
 	}
 	if issues.MergeConflict && !mergeConflict {
+		return false
+	}
+	if mergeConflict && !issues.MergeConflict {
 		return false
 	}
 	if issues.MergeConflict {

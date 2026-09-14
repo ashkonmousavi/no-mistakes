@@ -109,6 +109,65 @@ func TestCIStep_ConflictRepairAgainstNewBaseReturnsNewFinding(t *testing.T) {
 	}
 }
 
+func TestCIStep_UnlimitedConflictRepairAgainstNewBaseReturnsNewFinding(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, repairHeadSHA := setupGitRepo(t)
+
+	// Unlimited monitoring normally avoids the timeout base-tip lookup. A
+	// retained, verified conflict repair binding still needs that bounded lookup
+	// so a new base cannot be hidden behind the prior conflict suppression.
+	env := fakeCIGHMergeable(t, "OPEN", `[]`, "CONFLICTING")
+	prURL := "https://github.com/test/repo/pull/42"
+	sctx := newTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, repairHeadSHA, config.Commands{})
+	sctx.Env = env
+	sctx.Run.PRURL = &prURL
+	sctx.Config.CITimeout = -1
+	sctx.Config.AutoFix = config.AutoFix{CI: 0}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sctx.Ctx = ctx
+
+	step := (&CIStep{
+		lastFixedChecks: encodeLastFixedChecks(nil, true, "base-a", repairHeadSHA),
+	}).SetBaseBranchTip(func(context.Context) (string, bool) { return "base-b", true }).SetWaitForNextPoll(func(context.Context, time.Duration) error {
+		cancel()
+		return context.Canceled
+	})
+	outcome, err := driveCI(t, step, sctx)
+	if err != nil {
+		t.Fatalf("unlimited CI monitor returned error: %v", err)
+	}
+	if outcome == nil || !outcome.NeedsApproval {
+		t.Fatalf("outcome = %#v, want the normal conflict finding", outcome)
+	}
+}
+
+func TestConflictRepairBindingRequiresIncorporatedTarget(t *testing.T) {
+	t.Parallel()
+	dir, _, featureHead := setupGitRepo(t)
+
+	gitCmd(t, dir, "checkout", "main")
+	if err := os.WriteFile(filepath.Join(dir, "target.txt"), []byte("target\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", "target.txt")
+	gitCmd(t, dir, "commit", "-m", "advanced target")
+	targetSHA := gitCmd(t, dir, "rev-parse", "HEAD")
+	gitCmd(t, dir, "checkout", "feature")
+
+	if base, head := conflictRepairBinding(context.Background(), dir, targetSHA, true, featureHead); base != "" || head != "" {
+		t.Fatalf("non-incorporated target binding = (%q, %q), want empty", base, head)
+	}
+	gitCmd(t, dir, "rebase", "main")
+	repairedHead := gitCmd(t, dir, "rev-parse", "HEAD")
+	if base, head := conflictRepairBinding(context.Background(), dir, targetSHA, true, repairedHead); base != targetSHA || head != repairedHead {
+		t.Fatalf("incorporated target binding = (%q, %q), want (%q, %q)", base, head, targetSHA, repairedHead)
+	}
+	if base, head := conflictRepairBinding(context.Background(), dir, targetSHA, false, repairedHead); base != "" || head != "" {
+		t.Fatalf("unverified target binding = (%q, %q), want empty", base, head)
+	}
+}
+
 func TestCIStep_MergeConflictAndCIFailure_FixPromptIncludesBoth(t *testing.T) {
 	t.Parallel()
 	upstream := t.TempDir()
@@ -318,6 +377,7 @@ func TestCIStep_MergeConflictAutoFixPromptUsesBaseBranchTip(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(opts.CWD, "conflict-fix.txt"), []byte("resolved\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
+			gitCmd(t, opts.CWD, "rebase", "main")
 			return &agent.Result{}, nil
 		},
 	}
@@ -341,7 +401,7 @@ func TestCIStep_MergeConflictAutoFixPromptUsesBaseBranchTip(t *testing.T) {
 		t.Fatalf("buildHost returned nil: %s", skip)
 	}
 	pr := &scm.PR{Number: "42", URL: prURL}
-	_, err := step.autoFixCI(sctx, host, pr, ciTargetsFor(nil, true))
+	repair, err := step.autoFixCI(sctx, host, pr, ciTargetsFor(nil, true))
 	if err != nil {
 		t.Fatalf("auto-fix CI: %v", err)
 	}
@@ -353,6 +413,9 @@ func TestCIStep_MergeConflictAutoFixPromptUsesBaseBranchTip(t *testing.T) {
 	}
 	if strings.Contains(capturedPrompt, "base commit: "+baseSHA) {
 		t.Fatalf("expected prompt to avoid merge-base %s, got:\n%s", baseSHA, capturedPrompt)
+	}
+	if repair.ConflictRepairBaseSHA != mainTip || repair.ConflictRepairHeadSHA != sctx.Run.HeadSHA {
+		t.Fatalf("repair binding = base %q head %q, want incorporated target %q and recorded head %q", repair.ConflictRepairBaseSHA, repair.ConflictRepairHeadSHA, mainTip, sctx.Run.HeadSHA)
 	}
 }
 

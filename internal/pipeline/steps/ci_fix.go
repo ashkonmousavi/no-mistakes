@@ -105,7 +105,12 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 		return nil, nil
 	}
 	if repair.HeadAdvanced || sctx.Run.HeadSHA != previousHeadSHA {
-		s.lastFixedChecks = encodeLastFixedChecks(targets.Checks, targets.MergeConflict, repair.ConflictRepairBaseSHA, repair.ConflictRepairHeadSHA)
+		// A conflict can be suppressed only after the repair demonstrably
+		// incorporated the verified target. Keep ordinary check tracking when
+		// that proof is absent, but let the unresolved conflict re-enter the
+		// existing findings and repair policy after Review revalidation.
+		suppressConflict := targets.MergeConflict && repair.ConflictRepairBaseSHA != "" && repair.ConflictRepairHeadSHA != ""
+		s.lastFixedChecks = encodeLastFixedChecks(targets.Checks, suppressConflict, repair.ConflictRepairBaseSHA, repair.ConflictRepairHeadSHA)
 		s.lastFixedCompletedAt = fixCompletedAt
 		s.pendingFixSummary = repair.Summary
 		s.pendingRepairPublish = true
@@ -268,9 +273,11 @@ CI logs:
 	}
 	if repair.HeadAdvanced {
 		repair.Summary = conclusion.Summary
-		if mergeConflict && rebaseBaseVerified {
-			repair.ConflictRepairBaseSHA = rebaseBaseSHA
-			repair.ConflictRepairHeadSHA = sctx.Run.HeadSHA
+		if mergeConflict {
+			repair.ConflictRepairBaseSHA, repair.ConflictRepairHeadSHA = conflictRepairBinding(ctx, sctx.WorkDir, rebaseBaseSHA, rebaseBaseVerified, sctx.Run.HeadSHA)
+			if repair.ConflictRepairBaseSHA == "" {
+				sctx.Log("CI conflict repair did not prove the requested rebase target was incorporated; leaving conflict eligible for revalidation findings")
+			}
 		}
 		return repair, nil
 	}
@@ -279,6 +286,13 @@ CI logs:
 		repair.Summary = conclusion.Summary
 	}
 	return repair, nil
+}
+
+func conflictRepairBinding(ctx context.Context, workDir, baseSHA string, baseVerified bool, repairHeadSHA string) (string, string) {
+	if !baseVerified || strings.TrimSpace(baseSHA) == "" || strings.TrimSpace(repairHeadSHA) == "" || !isAncestor(ctx, workDir, baseSHA, repairHeadSHA) {
+		return "", ""
+	}
+	return baseSHA, repairHeadSHA
 }
 
 func fetchCILogOutput(ctx context.Context, host scm.Host, pr *scm.PR, branch, headSHA string, targets []scm.CheckTarget, maxBytes int) string {

@@ -124,6 +124,26 @@ func TestLastRepairStillUnverified_ConflictRepairBindsBaseAndHead(t *testing.T) 
 	if step.lastRepairStillUnverified(nil, false, "base-a", "repair-head") {
 		t.Fatal("a resolved conflict must clear suppression")
 	}
+	step.lastFixedChecks = encodeLastFixedChecks(nil, false, "", "")
+	if step.lastRepairStillUnverified(nil, true, "base-a", "repair-head") {
+		t.Fatal("a repair without target-incorporation proof must not suppress a conflict")
+	}
+}
+
+func TestCIStep_NeedsConflictRepairBase(t *testing.T) {
+	t.Parallel()
+
+	step := &CIStep{lastFixedChecks: encodeLastFixedChecks(nil, true, "base-a", "repair-head")}
+	if !step.needsConflictRepairBase("repair-head") {
+		t.Fatal("verified conflict repair binding must request a current base")
+	}
+	if step.needsConflictRepairBase("different-head") {
+		t.Fatal("a different head must not spend a base lookup on an old repair")
+	}
+	step.lastFixedChecks = encodeLastFixedChecks(nil, true, "", "")
+	if step.needsConflictRepairBase("repair-head") {
+		t.Fatal("an unverified conflict repair must not claim a base binding")
+	}
 }
 
 // A cancelled check can be a fix target, so the completion snapshot that lets
