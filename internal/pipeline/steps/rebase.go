@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
+	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/testguidance"
@@ -379,8 +380,53 @@ func isRemoteBranchRewritten(ctx context.Context, workDir, remoteRef string) boo
 	return errors.As(err, &exitErr) && exitErr.ExitCode() == 1
 }
 
-// tryRebase attempts a rebase onto targetRef. Returns conflicted files when the
-// rebase stops on merge conflicts. The rebase is aborted before returning.
+// syncCommand returns the git porcelain subcommand that integrates targetRef
+// into HEAD under strategy: "rebase" rewrites history, "merge" never does
+// (an ordinary merge commit, or a fast-forward). See config.RepoConfig.SyncStrategy.
+func syncCommand(strategy string) string {
+	if strategy == config.SyncStrategyMerge {
+		return "merge"
+	}
+	return "rebase"
+}
+
+func syncAbort(ctx context.Context, workDir, strategy string) {
+	_, _ = git.Run(ctx, workDir, syncCommand(strategy), "--abort")
+}
+
+// syncInProgress reports whether a rebase or merge (matching strategy) is
+// still in progress in workDir.
+func syncInProgress(ctx context.Context, workDir, strategy string) bool {
+	if strategy == config.SyncStrategyMerge {
+		return mergeInProgress(ctx, workDir)
+	}
+	return rebaseInProgress(ctx, workDir)
+}
+
+// assertSyncPreservesAncestry fails closed when a merge-strategy sync left
+// beforeHead unreachable from the new HEAD. An ordinary git merge (or the
+// fast-forward path in shouldSkipRebase) cannot produce that outcome, so this
+// is a defense-in-depth check on the captain's actual requirement - the
+// submitted head must remain an ancestor of the new head - rather than a
+// condition expected to trigger. Rebase strategy is exempt: rewriting history
+// so the old head is no longer an ancestor is its entire, expected purpose.
+func assertSyncPreservesAncestry(ctx context.Context, workDir, strategy, beforeHead string) error {
+	if strategy != config.SyncStrategyMerge {
+		return nil
+	}
+	afterHead, err := git.HeadSHA(ctx, workDir)
+	if err != nil {
+		return fmt.Errorf("resolve head after merge: %w", err)
+	}
+	if !isAncestor(ctx, workDir, beforeHead, afterHead) {
+		return fmt.Errorf("merge sync left %s unreachable from the new head %s", shortSHA(beforeHead), shortSHA(afterHead))
+	}
+	return nil
+}
+
+// tryRebase attempts to integrate targetRef under the configured sync
+// strategy. Returns conflicted files when the attempt stops on conflicts. The
+// attempt is aborted before returning on conflict.
 func tryRebase(ctx context.Context, sctx *pipeline.StepContext, targetRef string) ([]string, error) {
 	skip, err := shouldSkipRebase(ctx, sctx, targetRef)
 	if err != nil {
@@ -389,21 +435,36 @@ func tryRebase(ctx context.Context, sctx *pipeline.StepContext, targetRef string
 	if skip {
 		return nil, nil
 	}
+	strategy := sctx.Config.EffectiveSyncStrategy()
+	beforeHead, err := git.HeadSHA(ctx, sctx.WorkDir)
+	if err != nil {
+		return nil, fmt.Errorf("get local head: %w", err)
+	}
 
-	sctx.Log(fmt.Sprintf("rebasing onto %s...", targetRef))
-	if _, err := git.Run(ctx, sctx.WorkDir, "rebase", targetRef); err != nil {
+	args := []string{"rebase", targetRef}
+	if strategy == config.SyncStrategyMerge {
+		args = []string{"merge", "--no-edit", targetRef}
+		sctx.Log(fmt.Sprintf("merging %s...", targetRef))
+	} else {
+		sctx.Log(fmt.Sprintf("rebasing onto %s...", targetRef))
+	}
+	if _, err := git.Run(ctx, sctx.WorkDir, args...); err != nil {
 		conflictFiles := rebaseConflictFiles(ctx, sctx.WorkDir)
-		_, _ = git.Run(ctx, sctx.WorkDir, "rebase", "--abort")
+		syncAbort(ctx, sctx.WorkDir, strategy)
 
 		if len(conflictFiles) == 0 {
-			return nil, fmt.Errorf("rebase onto %s: %w", targetRef, err)
+			return nil, fmt.Errorf("%s onto %s: %w", syncCommand(strategy), targetRef, err)
 		}
 		return conflictFiles, nil
+	}
+	if err := assertSyncPreservesAncestry(ctx, sctx.WorkDir, strategy, beforeHead); err != nil {
+		return nil, err
 	}
 	return nil, nil
 }
 
-// rebaseWithAgent performs a rebase and uses the agent to resolve any conflicts.
+// rebaseWithAgent integrates targetRef under the configured sync strategy and
+// uses the agent to resolve any conflicts.
 func rebaseWithAgent(ctx context.Context, sctx *pipeline.StepContext, targetRef string) error {
 	skip, err := shouldSkipRebase(ctx, sctx, targetRef)
 	if err != nil {
@@ -412,20 +473,86 @@ func rebaseWithAgent(ctx context.Context, sctx *pipeline.StepContext, targetRef 
 	if skip {
 		return nil
 	}
+	strategy := sctx.Config.EffectiveSyncStrategy()
+	beforeHead, err := git.HeadSHA(ctx, sctx.WorkDir)
+	if err != nil {
+		return fmt.Errorf("get local head: %w", err)
+	}
 
-	sctx.Log(fmt.Sprintf("rebasing onto %s...", targetRef))
-	if _, err := git.Run(ctx, sctx.WorkDir, "rebase", targetRef); err == nil {
-		return nil
+	args := []string{"rebase", targetRef}
+	if strategy == config.SyncStrategyMerge {
+		args = []string{"merge", "--no-edit", targetRef}
+		sctx.Log(fmt.Sprintf("merging %s...", targetRef))
+	} else {
+		sctx.Log(fmt.Sprintf("rebasing onto %s...", targetRef))
+	}
+	if _, err := git.Run(ctx, sctx.WorkDir, args...); err == nil {
+		return assertSyncPreservesAncestry(ctx, sctx.WorkDir, strategy, beforeHead)
 	}
 
 	if len(rebaseConflictFiles(ctx, sctx.WorkDir)) == 0 {
-		_, _ = git.Run(ctx, sctx.WorkDir, "rebase", "--abort")
-		return fmt.Errorf("rebase onto %s failed (no conflicts detected)", targetRef)
+		syncAbort(ctx, sctx.WorkDir, strategy)
+		return fmt.Errorf("%s onto %s failed (no conflicts detected)", syncCommand(strategy), targetRef)
 	}
 	sctx.Log("conflicts detected, asking agent to resolve...")
 	conflictFiles := rebaseConflictFiles(ctx, sctx.WorkDir)
 
-	prompt := fmt.Sprintf(
+	prompt := rebaseConflictPrompt(strategy, targetRef, conflictFiles)
+	if sctx.PreviousFindings != "" {
+		prompt += "\n\nPrevious findings:\n" + sctx.PreviousFindings
+	}
+	prompt += userIntentPromptSection(sctx)
+	prompt += executionContextPromptSection(sctx.WorkDir)
+	prompt = testguidance.LateRepairPrompt(string(types.StepRebase), prompt)
+
+	_, err = sctx.RunAgentContext(ctx, agent.RunOpts{
+		Prompt:     prompt,
+		CWD:        sctx.WorkDir,
+		JSONSchema: commitSummarySchema,
+		OnChunk:    sctx.LogChunk,
+	})
+	if err != nil {
+		syncAbort(ctx, sctx.WorkDir, strategy)
+		return fmt.Errorf("agent resolve conflicts: %w", err)
+	}
+
+	// Verify the rebase/merge completed (nothing still in progress).
+	if syncInProgress(ctx, sctx.WorkDir, strategy) {
+		syncAbort(ctx, sctx.WorkDir, strategy)
+		return fmt.Errorf("agent did not complete the %s", syncCommand(strategy))
+	}
+
+	return assertSyncPreservesAncestry(ctx, sctx.WorkDir, strategy, beforeHead)
+}
+
+// rebaseConflictPrompt builds the conflict-resolution prompt for the
+// configured sync strategy. The merge variant explicitly forbids git rebase,
+// a git reset --hard onto another commit, and a force-push, so a repository
+// that has opted into sync_strategy: merge never gets its history rewritten
+// through this path either.
+func rebaseConflictPrompt(strategy, targetRef string, conflictFiles []string) string {
+	if strategy == config.SyncStrategyMerge {
+		return fmt.Sprintf(
+			`Resolve git merge conflicts. Merging %s into the current branch has conflicts.
+
+Current conflicted files:
+- %s
+
+Instructions:
+- Find all conflicting files and resolve the conflict markers (<<<<<<< ======= >>>>>>>).
+- After resolving each file, stage it with: git add <file>
+- After all conflicts are resolved, run: git commit --no-edit
+- If additional conflicts arise, resolve those too.
+- Do not modify any files that don't have conflicts.
+- Preserve the intent of both the current branch changes and the upstream changes.
+- Do not run git rebase, git reset --hard onto another commit, or force-push; this repository requires an ordinary merge.
+- Return JSON with a single "summary" field describing what you resolved.
+- Keep the summary under 10 words.`,
+			targetRef,
+			strings.Join(conflictFiles, "\n- "),
+		)
+	}
+	return fmt.Sprintf(
 		`Resolve git rebase conflicts. The rebase of the current branch onto %s has conflicts.
 
 Current conflicted files:
@@ -443,35 +570,14 @@ Instructions:
 		targetRef,
 		strings.Join(conflictFiles, "\n- "),
 	)
-	if sctx.PreviousFindings != "" {
-		prompt += "\n\nPrevious findings:\n" + sctx.PreviousFindings
-	}
-	prompt += userIntentPromptSection(sctx)
-	prompt += executionContextPromptSection(sctx.WorkDir)
-	prompt = testguidance.LateRepairPrompt(string(types.StepRebase), prompt)
-
-	_, err = sctx.RunAgentContext(ctx, agent.RunOpts{
-		Prompt:     prompt,
-		CWD:        sctx.WorkDir,
-		JSONSchema: commitSummarySchema,
-		OnChunk:    sctx.LogChunk,
-	})
-	if err != nil {
-		_, _ = git.Run(ctx, sctx.WorkDir, "rebase", "--abort")
-		return fmt.Errorf("agent resolve conflicts: %w", err)
-	}
-
-	// Verify rebase completed (no rebase still in progress)
-	if rebaseInProgress(ctx, sctx.WorkDir) {
-		_, _ = git.Run(ctx, sctx.WorkDir, "rebase", "--abort")
-		return fmt.Errorf("agent did not complete the rebase")
-	}
-
-	return nil
 }
 
-// shouldSkipRebase checks whether a rebase onto targetRef can be skipped.
-// Returns true if targetRef doesn't exist, is already merged, or can be fast-forwarded.
+// shouldSkipRebase checks whether integrating targetRef can be skipped.
+// Returns true if targetRef doesn't exist, is already merged, or can be
+// fast-forwarded. The fast-forward path never rewrites history, so it applies
+// identically under either sync strategy; under sync_strategy: merge it moves
+// HEAD with git merge --ff-only instead of a hard reset, so no branch-moving
+// call in this step ever runs a bare git reset --hard.
 func shouldSkipRebase(ctx context.Context, sctx *pipeline.StepContext, targetRef string) (bool, error) {
 	if _, err := git.Run(ctx, sctx.WorkDir, "rev-parse", "--verify", targetRef); err != nil {
 		return true, nil
@@ -494,6 +600,12 @@ func shouldSkipRebase(ctx context.Context, sctx *pipeline.StepContext, targetRef
 	}
 	if _, err := git.Run(ctx, sctx.WorkDir, "merge-base", "--is-ancestor", "HEAD", targetRef); err == nil {
 		sctx.Log(fmt.Sprintf("fast-forwarding to %s", targetRef))
+		if sctx.Config.EffectiveSyncStrategy() == config.SyncStrategyMerge {
+			if _, err := git.Run(ctx, sctx.WorkDir, "merge", "--ff-only", "--no-edit", targetRef); err != nil {
+				return false, fmt.Errorf("fast-forward to %s: %w", targetRef, err)
+			}
+			return true, nil
+		}
 		if _, err := git.Run(ctx, sctx.WorkDir, "reset", "--hard", targetRef); err != nil {
 			return false, fmt.Errorf("fast-forward to %s: %w", targetRef, err)
 		}
@@ -518,6 +630,21 @@ func rebaseInProgress(ctx context.Context, workDir string) bool {
 		}
 	}
 	return false
+}
+
+// mergeInProgress returns true if a git merge is currently in progress
+// (MERGE_HEAD exists), the merge counterpart of rebaseInProgress.
+func mergeInProgress(ctx context.Context, workDir string) bool {
+	p, err := git.Run(ctx, workDir, "rev-parse", "--git-path", "MERGE_HEAD")
+	if err != nil {
+		return false
+	}
+	p = strings.TrimSpace(p)
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(workDir, p)
+	}
+	_, statErr := os.Stat(p)
+	return statErr == nil
 }
 
 func rebaseConflictFiles(ctx context.Context, workDir string) []string {

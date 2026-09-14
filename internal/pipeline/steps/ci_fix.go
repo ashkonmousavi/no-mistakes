@@ -41,6 +41,11 @@ const ciFailingCheckFixRules = `- If a failing check is caused by this PR's code
 		- Do not refactor beyond what is needed for that root-cause fix.
 		- Verify the fix by running the most relevant commands locally before finishing.`
 
+// ciConflictMergeOnlyRule is appended to the CI conflict-repair prompt when
+// the repository's sync_strategy is "merge", so the agent is told explicitly
+// not to fall back to the pipeline's rebase-based default.
+const ciConflictMergeOnlyRule = `- Use git merge, not git rebase, to integrate the base branch; do not run git reset --hard onto another commit or force-push. This repository requires an ordinary merge that preserves history.`
+
 // repairFromFindings runs one CI fix round over the findings the executor
 // selected for it (sctx.PreviousFindings): the auto-fix subset of the last
 // settled observation for an automatic round, or whatever the human selected
@@ -177,18 +182,36 @@ func (s *CIStep) autoFixCI(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR
 		logOutput = fetchCILogOutput(ctx, host, pr, sctx.Run.Branch, sctx.Run.HeadSHA, targets.Checks, maxLogBytes)
 	}
 
-	// Build prompt based on what issues are present
+	// Build prompt based on what issues are present. The integration verb
+	// (rebase vs. merge) follows the repository's configured sync strategy
+	// (sctx.Config.EffectiveSyncStrategy) so a repository that has forbidden
+	// history rewriting (sync_strategy: merge) never has its own CI
+	// conflict-repair agent told to rebase.
+	mergeStrategy := sctx.Config.EffectiveSyncStrategy() == config.SyncStrategyMerge
 	var promptIntro string
 	var promptRules string
 	switch {
 	case len(failingNames) > 0 && mergeConflict:
-		promptIntro = "The following CI checks have failed and the PR has merge conflicts with the base branch. Diagnose and fix the CI issues, then rebase onto the base branch and resolve the merge conflicts."
-		promptRules = ciFailingCheckFixRules
+		if mergeStrategy {
+			promptIntro = "The following CI checks have failed and the PR has merge conflicts with the base branch. Diagnose and fix the CI issues, then merge the base branch and resolve the merge conflicts."
+			promptRules = ciFailingCheckFixRules + "\n\t\t" + ciConflictMergeOnlyRule
+		} else {
+			promptIntro = "The following CI checks have failed and the PR has merge conflicts with the base branch. Diagnose and fix the CI issues, then rebase onto the base branch and resolve the merge conflicts."
+			promptRules = ciFailingCheckFixRules
+		}
 	case mergeConflict:
-		promptIntro = "The PR has merge conflicts with the base branch. Rebase onto the base branch and resolve the merge conflicts."
-		promptRules = `- Resolve the merge conflicts by applying the minimal necessary changes.
+		if mergeStrategy {
+			promptIntro = "The PR has merge conflicts with the base branch. Merge the base branch and resolve the merge conflicts."
+			promptRules = `- Resolve the merge conflicts by applying the minimal necessary changes.
+		- Do not make unrelated file edits.
+		- Verify the merge completes cleanly before finishing.
+		` + ciConflictMergeOnlyRule
+		} else {
+			promptIntro = "The PR has merge conflicts with the base branch. Rebase onto the base branch and resolve the merge conflicts."
+			promptRules = `- Resolve the merge conflicts by applying the minimal necessary changes.
 		- Do not make unrelated file edits.
 		- Verify the rebase completes cleanly before finishing.`
+		}
 	case len(failingNames) == 0:
 		promptIntro = "Address the following findings selected at the CI gate of this PR."
 		promptRules = ciFailingCheckFixRules
@@ -220,7 +243,11 @@ Context:
 		promptRules,
 	)
 	if mergeConflict {
-		prompt += fmt.Sprintf("\n- rebase target commit: %s", rebaseBaseSHA)
+		targetLabel := "rebase target commit"
+		if mergeStrategy {
+			targetLabel = "merge target commit"
+		}
+		prompt += fmt.Sprintf("\n- %s: %s", targetLabel, rebaseBaseSHA)
 	}
 	if logOutput != "" {
 		prompt += fmt.Sprintf(`
@@ -631,14 +658,20 @@ func ciRepairPolicyDescription(sctx *pipeline.StepContext) string {
 //
 // ci.revalidate_repairs governs intent identically on every path: true asks for
 // revalidation outright, false asks to publish when it is safe to do so. Merge
-// conflict repairs are not carved out - they simply always land in the
-// cannot-be-proven half, because a rebase makes the repaired head a
-// non-descendant of the reviewed head, resolving a conflict changes the
-// commit's patch-id, and no content-based guard can separate "rebased and
-// resolved" from "dropped the work". Provenance cannot stand in for that proof
-// either: the repair that deleted a reviewed commit in the reproduction behind
-// this rule was authored by the CI repair agent itself. Who wrote the repair
-// says nothing about what it did to the reviewed commits.
+// conflict repairs are not carved out, but under the default rebase sync
+// strategy they always land in the cannot-be-proven half in practice, because
+// a rebase makes the repaired head a non-descendant of the reviewed head,
+// resolving a conflict changes the commit's patch-id, and no content-based
+// guard can separate "rebased and resolved" from "dropped the work".
+// Provenance cannot stand in for that proof either: the repair that deleted a
+// reviewed commit in the reproduction behind this rule was authored by the CI
+// repair agent itself. Who wrote the repair says nothing about what it did to
+// the reviewed commits. Under sync_strategy: merge the premise changes: an
+// ordinary merge keeps the reviewed head reachable as the first parent of the
+// repair commit, so ciRepairContinuityGap's ancestry check legitimately
+// succeeds and a merge-strategy conflict repair CAN publish without
+// revalidating - the same uniform rule, evaluated honestly against a
+// mechanism that does not rewrite history.
 //
 // Once recording or publication succeeds, the run's recorded head advances;
 // the two paths differ in whether the repair is published now or held until

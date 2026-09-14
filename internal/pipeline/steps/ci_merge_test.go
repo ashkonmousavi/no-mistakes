@@ -325,6 +325,94 @@ func TestCIStep_MergeConflictOnly_AutoFix(t *testing.T) {
 	}
 }
 
+// TestCIStep_MergeConflictOnly_AutoFix_SyncStrategyMerge proves that under
+// sync_strategy: merge the CI conflict-repair prompt tells the agent to
+// integrate with an ordinary merge, never a rebase, and explicitly forbids
+// git rebase, git reset --hard onto another commit, and a force-push - the
+// same repair path TestCIStep_MergeConflictOnly_AutoFix exercises under the
+// default rebase strategy.
+func TestCIStep_MergeConflictOnly_AutoFix_SyncStrategyMerge(t *testing.T) {
+	t.Parallel()
+	upstream := t.TempDir()
+	gitCmd(t, upstream, "init", "--bare")
+
+	dir := t.TempDir()
+	gitCmd(t, dir, "init")
+	gitCmd(t, dir, "config", "user.name", "test")
+	gitCmd(t, dir, "config", "user.email", "test@test.com")
+	gitCmd(t, dir, "checkout", "-b", "main")
+	os.WriteFile(filepath.Join(dir, "init.txt"), []byte("init"), 0o644)
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "initial")
+	baseSHA := gitCmd(t, dir, "rev-parse", "HEAD")
+	gitCmd(t, dir, "remote", "add", "origin", upstream)
+	gitCmd(t, dir, "push", "origin", "main")
+
+	gitCmd(t, dir, "checkout", "-b", "feature")
+	os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("feature"), 0o644)
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "feature")
+	headSHA := gitCmd(t, dir, "rev-parse", "HEAD")
+	gitCmd(t, dir, "push", "origin", "feature")
+
+	// All checks pass, but merge conflict.
+	checksJSON := `[{"name":"build","state":"SUCCESS","bucket":"pass"},{"name":"test","state":"SUCCESS","bucket":"pass"}]`
+	env := fakeCIGHMergeable(t, "OPEN", checksJSON, "CONFLICTING")
+
+	agentCalled := false
+	var capturedPrompt string
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			agentCalled = true
+			capturedPrompt = opts.Prompt
+			os.WriteFile(filepath.Join(opts.CWD, "conflict-fix.txt"), []byte("resolved"), 0o644)
+			return &agent.Result{}, nil
+		},
+	}
+
+	prURL := "https://github.com/test/repo/pull/42"
+	sctx := newTestContext(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = env
+	sctx.Run.PRURL = &prURL
+	sctx.Repo.UpstreamURL = upstream
+	sctx.Run.Branch = "refs/heads/feature"
+	sctx.Config.CITimeout = 30 * time.Second
+	sctx.Config.AutoFix = config.AutoFix{CI: 3}
+	sctx.Config.SyncStrategy = config.SyncStrategyMerge
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sctx.Ctx = ctx
+
+	step := &CIStep{
+		waitForNextPoll: func(ctx context.Context, interval time.Duration) error {
+			cancel()
+			return ctx.Err()
+		},
+	}
+	driveCI(t, step, sctx)
+
+	if !agentCalled {
+		t.Fatal("expected agent to be called to resolve merge conflict")
+	}
+	if strings.Contains(capturedPrompt, "You MUST produce file changes that fix the failing checks") {
+		t.Fatalf("merge-conflict-only prompt should not require file changes for failing checks, got:\n%s", capturedPrompt)
+	}
+	if !strings.Contains(capturedPrompt, "Merge the base branch and resolve the merge conflicts") {
+		t.Fatalf("expected merge-strategy prompt to focus on merge flow, got:\n%s", capturedPrompt)
+	}
+	if strings.Contains(capturedPrompt, "Rebase onto the base branch") {
+		t.Fatalf("expected merge-strategy prompt to never say rebase, got:\n%s", capturedPrompt)
+	}
+	if !strings.Contains(capturedPrompt, "Use git merge, not git rebase") {
+		t.Fatalf("expected prompt to explicitly forbid rebase/reset --hard/force-push, got:\n%s", capturedPrompt)
+	}
+	if !strings.Contains(capturedPrompt, "merge target commit:") {
+		t.Fatalf("expected prompt to label the target commit for a merge, got:\n%s", capturedPrompt)
+	}
+}
+
 func TestCIStep_MergeConflictAutoFixPromptUsesBaseBranchTip(t *testing.T) {
 	t.Parallel()
 	upstream := t.TempDir()

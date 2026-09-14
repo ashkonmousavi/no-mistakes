@@ -679,3 +679,81 @@ func TestLoadRepoFromBytes_DocumentCorrectionPathsRejectsInvalidGlob(t *testing.
 		t.Fatalf("CorrectionPaths = %#v, want trimmed patterns", cfg.Document.CorrectionPaths)
 	}
 }
+
+// TestLoadRepoConfig_SyncStrategy proves sync_strategy parses both recognized
+// values and that an empty value stays empty (EffectiveSyncStrategy is where
+// the "rebase" default is applied).
+func TestLoadRepoConfig_SyncStrategy(t *testing.T) {
+	cases := map[string]string{
+		"":       "",
+		"merge":  "merge",
+		"rebase": "rebase",
+	}
+	for value, want := range cases {
+		cfg, err := LoadRepoFromBytes([]byte("sync_strategy: \"" + value + "\"\n"))
+		if err != nil {
+			t.Fatalf("sync_strategy %q: %v", value, err)
+		}
+		if cfg.SyncStrategy != want {
+			t.Fatalf("sync_strategy %q: SyncStrategy = %q, want %q", value, cfg.SyncStrategy, want)
+		}
+	}
+}
+
+// TestLoadRepoConfig_SyncStrategyRejectsInvalidValue proves the config fails
+// closed on a sync_strategy value that is neither "merge" nor "rebase",
+// naming the field in the error.
+func TestLoadRepoConfig_SyncStrategyRejectsInvalidValue(t *testing.T) {
+	_, err := LoadRepoFromBytes([]byte("sync_strategy: squash\n"))
+	if err == nil {
+		t.Fatal("expected error for invalid sync_strategy, got nil")
+	}
+	if !strings.Contains(err.Error(), "sync_strategy") {
+		t.Fatalf("error = %v, want it to name sync_strategy", err)
+	}
+}
+
+// TestEffectiveRepoConfig_SyncStrategyTrustedOnly proves sync_strategy is
+// honored only from the trusted default-branch copy, regardless of
+// allow_repo_commands, matching no_ci and disable_project_settings: a pushed
+// branch must not be able to switch itself back to a history-rewriting
+// rebase after a maintainer has forbidden one, nor force merge on a
+// repository that expects the default.
+func TestEffectiveRepoConfig_SyncStrategyTrustedOnly(t *testing.T) {
+	// Contributor pushes rebase; trusted default-branch forbids it.
+	got := EffectiveRepoConfig(&RepoConfig{SyncStrategy: "rebase"}, &RepoConfig{SyncStrategy: "merge"}, false)
+	if got.SyncStrategy != "merge" {
+		t.Errorf("SyncStrategy = %q, want trusted merge (pushed cannot re-enable rebase)", got.SyncStrategy)
+	}
+	// Contributor pushes merge; trusted default-branch has no opinion (rebase default).
+	got = EffectiveRepoConfig(&RepoConfig{SyncStrategy: "merge"}, &RepoConfig{SyncStrategy: ""}, false)
+	if got.SyncStrategy != "" {
+		t.Errorf("SyncStrategy = %q, want empty trusted fallback (pushed cannot force merge)", got.SyncStrategy)
+	}
+	// allow_repo_commands must NOT leak the pushed value through.
+	got = EffectiveRepoConfig(&RepoConfig{SyncStrategy: "rebase"}, &RepoConfig{SyncStrategy: "merge"}, true)
+	if got.SyncStrategy != "merge" {
+		t.Errorf("SyncStrategy = %q, want trusted merge even with allow_repo_commands", got.SyncStrategy)
+	}
+	// No trusted copy -> empty (rebase default), regardless of the pushed value.
+	got = EffectiveRepoConfig(&RepoConfig{SyncStrategy: "merge"}, nil, false)
+	if got.SyncStrategy != "" {
+		t.Errorf("SyncStrategy = %q, want empty without a trusted copy", got.SyncStrategy)
+	}
+}
+
+// TestConfig_EffectiveSyncStrategy proves the resolved Config defaults an
+// unset sync strategy to SyncStrategyRebase, preserving the pipeline's
+// original rebase behavior for repositories that never set the key.
+func TestConfig_EffectiveSyncStrategy(t *testing.T) {
+	if got := (&Config{}).EffectiveSyncStrategy(); got != SyncStrategyRebase {
+		t.Errorf("EffectiveSyncStrategy() = %q, want %q for an unset config", got, SyncStrategyRebase)
+	}
+	if got := (&Config{SyncStrategy: "merge"}).EffectiveSyncStrategy(); got != SyncStrategyMerge {
+		t.Errorf("EffectiveSyncStrategy() = %q, want %q", got, SyncStrategyMerge)
+	}
+	var nilCfg *Config
+	if got := nilCfg.EffectiveSyncStrategy(); got != SyncStrategyRebase {
+		t.Errorf("EffectiveSyncStrategy() on nil config = %q, want %q", got, SyncStrategyRebase)
+	}
+}
