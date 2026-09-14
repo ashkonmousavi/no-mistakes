@@ -85,7 +85,6 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 	issueDesc := targets.description()
 	sctx.Log(fmt.Sprintf("repairing: %s...", issueDesc))
 	previousHeadSHA := sctx.Run.HeadSHA
-	fixKey := encodeLastFixedChecks(targets.Checks, targets.MergeConflict)
 	fixCompletedAt := completionTimesForTargets(s.observedCompletedAt, targets.Checks)
 	repair, err := s.autoFixCI(sctx, host, pr, targets)
 	if outcome := pipeline.ProtectedPathOutcome(err); outcome != nil {
@@ -106,7 +105,12 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 		return nil, nil
 	}
 	if repair.HeadAdvanced || sctx.Run.HeadSHA != previousHeadSHA {
-		s.lastFixedChecks = fixKey
+		// A conflict can be suppressed only after the repair demonstrably
+		// incorporated the verified target. Keep ordinary check tracking when
+		// that proof is absent, but let the unresolved conflict re-enter the
+		// existing findings and repair policy after Review revalidation.
+		suppressConflict := targets.MergeConflict && repair.ConflictRepairBaseSHA != "" && repair.ConflictRepairHeadSHA != ""
+		s.lastFixedChecks = encodeLastFixedChecks(targets.Checks, suppressConflict, repair.ConflictRepairBaseSHA, repair.ConflictRepairHeadSHA)
 		s.lastFixedCompletedAt = fixCompletedAt
 		s.pendingFixSummary = repair.Summary
 		s.pendingRepairPublish = true
@@ -161,7 +165,7 @@ func (s *CIStep) autoFixCI(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR
 		baseBranch = strings.TrimSpace(pr.BaseBranch)
 	}
 	baseSHA := resolveBranchBaseSHA(ctx, sctx.WorkDir, sctx.Run.BaseSHA, baseBranch)
-	rebaseBaseSHA := resolveRunDefaultBranchTipSHA(ctx, sctx, sctx.Run.BaseSHA, baseBranch)
+	rebaseBaseSHA, rebaseBaseVerified := resolveRunDefaultBranchTip(ctx, sctx, sctx.Run.BaseSHA, baseBranch)
 	promptBaseSHA := baseSHA
 	if mergeConflict {
 		promptBaseSHA = rebaseBaseSHA
@@ -269,6 +273,12 @@ CI logs:
 	}
 	if repair.HeadAdvanced {
 		repair.Summary = conclusion.Summary
+		if mergeConflict {
+			repair.ConflictRepairBaseSHA, repair.ConflictRepairHeadSHA = conflictRepairBinding(ctx, sctx.WorkDir, rebaseBaseSHA, rebaseBaseVerified, sctx.Run.HeadSHA)
+			if repair.ConflictRepairBaseSHA == "" {
+				sctx.Log("CI conflict repair did not prove the requested rebase target was incorporated; leaving conflict eligible for revalidation findings")
+			}
+		}
 		return repair, nil
 	}
 	if !mergeConflict && conclusion.CodeChangeNeeded != nil && !*conclusion.CodeChangeNeeded {
@@ -276,6 +286,13 @@ CI logs:
 		repair.Summary = conclusion.Summary
 	}
 	return repair, nil
+}
+
+func conflictRepairBinding(ctx context.Context, workDir, baseSHA string, baseVerified bool, repairHeadSHA string) (string, string) {
+	if !baseVerified || strings.TrimSpace(baseSHA) == "" || strings.TrimSpace(repairHeadSHA) == "" || !isAncestor(ctx, workDir, baseSHA, repairHeadSHA) {
+		return "", ""
+	}
+	return baseSHA, repairHeadSHA
 }
 
 func fetchCILogOutput(ctx context.Context, host scm.Host, pr *scm.PR, branch, headSHA string, targets []scm.CheckTarget, maxBytes int) string {
@@ -519,6 +536,11 @@ type ciRepairResult struct {
 	Revalidate         bool
 	NoCodeChangeNeeded bool
 	Summary            string
+	// ConflictRepairBaseSHA and ConflictRepairHeadSHA bind conflict-only
+	// suppression to the exact verified base and resulting repair head.
+	// They remain empty when the base could not be resolved.
+	ConflictRepairBaseSHA string
+	ConflictRepairHeadSHA string
 }
 
 // commitAndPush remains as the narrow test seam for the default summary.

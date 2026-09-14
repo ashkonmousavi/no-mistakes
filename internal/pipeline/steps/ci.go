@@ -460,7 +460,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 		// immutable tip is part of infrastructure-retry admission; a branch name
 		// cannot prove that the candidate still has the base from attempt 1.
 		pr.BaseSHA = ""
-		if !unlimited || sctx.Config.CI.RerunInfrastructure > 0 {
+		if !unlimited || sctx.Config.CI.RerunInfrastructure > 0 || s.needsConflictRepairBase(sctx.Run.HeadSHA) {
 			resolveWindow := defaultBaseBranchTipResolveWindow
 			if !unlimited {
 				if remaining := timeout - now().Sub(timeoutAnchor); remaining <= 0 {
@@ -718,7 +718,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 				sctx.Log("issues detected but checks still pending, waiting for all checks to complete...")
 			} else if hasIssues {
 				lastMonitorLog = ""
-				if s.lastRepairStillUnverified(checks, mergeConflict) {
+				if s.lastRepairStillUnverified(checks, mergeConflict, pr.BaseSHA, sctx.Run.HeadSHA) {
 					// The provider has not re-run the checks the last
 					// published repair targeted: the failures on screen are
 					// the ones that repair was for, not a verdict on it.

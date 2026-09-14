@@ -59,7 +59,7 @@ func TestCITimeoutFindingsPreserveSameNamedCheckIdentity(t *testing.T) {
 func TestPendingCheckMatchesLastFixed_SpecialCheckNames(t *testing.T) {
 	t.Parallel()
 
-	lastFixedChecks := encodeLastFixedChecks([]scm.CheckTarget{{Name: "lint,unit"}, {Name: "deploy+conflict"}}, true)
+	lastFixedChecks := encodeLastFixedChecks([]scm.CheckTarget{{Name: "lint,unit"}, {Name: "deploy+conflict"}}, true, "", "")
 	checks := []scm.Check{
 		{Name: "lint,unit", Bucket: "pending"},
 	}
@@ -82,11 +82,11 @@ func TestLastFixedTrackingUsesProviderIdentityForSameNamedChecks(t *testing.T) {
 	code := scm.Check{Name: "build", ProviderID: "github-check-run:41", Bucket: scm.CheckBucketFail, CompletedAt: completed}
 	bot := scm.Check{Name: "build", ProviderID: "github-check-run:42", Bucket: scm.CheckBucketFail, CompletedAt: completed}
 	step := &CIStep{
-		lastFixedChecks:      encodeLastFixedChecks([]scm.CheckTarget{{Name: code.Name, ProviderID: code.ProviderID}}, false),
+		lastFixedChecks:      encodeLastFixedChecks([]scm.CheckTarget{{Name: code.Name, ProviderID: code.ProviderID}}, false, "", ""),
 		lastFixedCompletedAt: terminalFailureCompletionTimes([]scm.Check{code, bot}),
 	}
 
-	if step.lastRepairStillUnverified([]scm.Check{bot}, false) {
+	if step.lastRepairStillUnverified([]scm.Check{bot}, false, "", "") {
 		t.Fatal("same-named bot failure must not stand in for the repaired check")
 	}
 	bot.Bucket = scm.CheckBucketPending
@@ -102,6 +102,47 @@ func TestLastFixedTrackingUsesProviderIdentityForSameNamedChecks(t *testing.T) {
 	selectedCompletions := completionTimesForTargets(terminalFailureCompletionTimes([]scm.Check{code, bot}), []scm.CheckTarget{{Name: code.Name, ProviderID: code.ProviderID}})
 	if terminalFailureCompletedAfter([]scm.Check{bot}, selectedCompletions) {
 		t.Fatal("same-named bot completion must not look like the repaired check reran")
+	}
+}
+
+func TestLastRepairStillUnverified_ConflictRepairBindsBaseAndHead(t *testing.T) {
+	t.Parallel()
+
+	step := &CIStep{lastFixedChecks: encodeLastFixedChecks(nil, true, "base-a", "repair-head")}
+	if !step.lastRepairStillUnverified(nil, true, "base-a", "repair-head") {
+		t.Fatal("unchanged verified base and repair head must keep the conflict suppression")
+	}
+	if step.lastRepairStillUnverified(nil, true, "base-b", "repair-head") {
+		t.Fatal("a verified new base must expose the new conflict finding")
+	}
+	if !step.lastRepairStillUnverified(nil, true, "", "repair-head") {
+		t.Fatal("an unresolved base must not invent a new conflict repair")
+	}
+	if step.lastRepairStillUnverified(nil, true, "base-a", "different-head") {
+		t.Fatal("a different repair head must not inherit conflict suppression")
+	}
+	if step.lastRepairStillUnverified(nil, false, "base-a", "repair-head") {
+		t.Fatal("a resolved conflict must clear suppression")
+	}
+	step.lastFixedChecks = encodeLastFixedChecks(nil, false, "", "")
+	if step.lastRepairStillUnverified(nil, true, "base-a", "repair-head") {
+		t.Fatal("a repair without target-incorporation proof must not suppress a conflict")
+	}
+}
+
+func TestCIStep_NeedsConflictRepairBase(t *testing.T) {
+	t.Parallel()
+
+	step := &CIStep{lastFixedChecks: encodeLastFixedChecks(nil, true, "base-a", "repair-head")}
+	if !step.needsConflictRepairBase("repair-head") {
+		t.Fatal("verified conflict repair binding must request a current base")
+	}
+	if step.needsConflictRepairBase("different-head") {
+		t.Fatal("a different head must not spend a base lookup on an old repair")
+	}
+	step.lastFixedChecks = encodeLastFixedChecks(nil, true, "", "")
+	if step.needsConflictRepairBase("repair-head") {
+		t.Fatal("an unverified conflict repair must not claim a base binding")
 	}
 }
 
