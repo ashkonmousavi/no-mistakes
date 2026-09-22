@@ -878,21 +878,6 @@ func gitPathExists(ctx context.Context, workDir string, names ...string) bool {
 	return false
 }
 
-// mergeInProgress returns true if a git merge is currently in progress
-// (MERGE_HEAD exists), the merge counterpart of rebaseInProgress.
-func mergeInProgress(ctx context.Context, workDir string) bool {
-	p, err := git.Run(ctx, workDir, "rev-parse", "--git-path", "MERGE_HEAD")
-	if err != nil {
-		return false
-	}
-	p = strings.TrimSpace(p)
-	if !filepath.IsAbs(p) {
-		p = filepath.Join(workDir, p)
-	}
-	_, statErr := os.Stat(p)
-	return statErr == nil
-}
-
 func rebaseConflictFiles(ctx context.Context, workDir string) []string {
 	out, err := git.Run(ctx, workDir, "diff", "--name-only", "--diff-filter=U")
 	if err != nil {

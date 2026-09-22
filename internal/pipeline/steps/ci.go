@@ -572,7 +572,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					invalidateInfrastructurePRTarget(pr)
 				} else if mismatch != "" {
 					clearCIMonitorReady(sctx)
-					return ciFailureOutcome(failingCheckNames(checks), false, mismatch), nil
+					return ciFailureOutcome(terminalCheckTargetsForNames(checks, failingCheckNames(checks)), false, mismatch), nil
 				}
 			}
 			// A failure the provider produced before the repository's own steps
@@ -636,7 +636,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 				if !rerunIssued {
 					if unsafe := infrastructureFailuresWithoutExactRerun(checks); len(unsafe) > 0 {
 						clearCIMonitorReady(sctx)
-						return ciFailureOutcome(unsafe, false, "provider retry scope includes work outside the proven failed-job population; infrastructure rerun remains disabled"), nil
+						return ciFailureOutcome(terminalCheckTargetsForNames(checks, unsafe), false, "provider retry scope includes work outside the proven failed-job population; infrastructure rerun remains disabled"), nil
 					}
 				}
 				if !rerunIssued {
