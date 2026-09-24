@@ -455,6 +455,15 @@ func restoreCase(ctx context.Context, store *Store, c Case, root string) (string
 	if defaultBranch == "" {
 		defaultBranch = "main"
 	}
+	// Review now fetches the base branch before computing its diff. Keep that
+	// fetch inside the isolated replay gate, with the captured trusted commit
+	// as its branch tip, rather than reaching the source repository.
+	if _, err := git.Run(ctx, gateDir, "update-ref", "refs/heads/"+defaultBranch, c.TrustedConfigSHA); err != nil {
+		return "", fmt.Errorf("restore replay default branch: %w", err)
+	}
+	if err := git.EnsureRemote(ctx, gateDir, "origin", gateDir); err != nil {
+		return "", fmt.Errorf("point replay origin at isolated gate: %w", err)
+	}
 	if _, err := git.Run(ctx, gateDir, "update-ref", "refs/remotes/origin/"+defaultBranch, c.TrustedConfigSHA); err != nil {
 		return "", fmt.Errorf("restore trusted default branch: %w", err)
 	}

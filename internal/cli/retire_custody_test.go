@@ -172,7 +172,7 @@ func TestAxiRetireCustodyReleasesTheBindingAndReportsACleanBranch(t *testing.T) 
 	syncCmd := &cobra.Command{}
 	syncCmd.SetContext(context.Background())
 	syncCmd.SetOut(&syncOut)
-	if err := runAxiSync(syncCmd, true, false, false, ""); err != nil {
+	if err := runAxiSync(syncCmd, true, false, false, false, ""); err != nil {
 		t.Fatalf("axi sync --check after retirement: %v\n%s", err, syncOut.String())
 	}
 	if !strings.Contains(syncOut.String(), "state: custody_returned") {

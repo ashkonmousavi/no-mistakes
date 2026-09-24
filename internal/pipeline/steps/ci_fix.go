@@ -50,6 +50,11 @@ const ciMergeConflictFixRules = `- Resolve the merge conflicts by applying the m
 		- Do not make unrelated file edits.
 ` + ciFixerClassRules + `
 		- Verify the rebase completes cleanly before finishing.`
+const ciMergeConflictMergeRules = `- Resolve the merge conflicts by applying the minimal necessary changes.
+		- Do not make unrelated file edits.
+` + ciFixerClassRules + `
+		- Verify the merge completes cleanly before finishing.`
+
 // ciConflictMergeOnlyRule is appended to the CI conflict-repair prompt when
 // the repository's sync_strategy is "merge", so the agent is told explicitly
 // not to fall back to the pipeline's rebase-based default.
@@ -214,15 +219,10 @@ func (s *CIStep) autoFixCI(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR
 	case mergeConflict:
 		if mergeStrategy {
 			promptIntro = "The PR has merge conflicts with the base branch. Merge the base branch and resolve the merge conflicts."
-			promptRules = `- Resolve the merge conflicts by applying the minimal necessary changes.
-		- Do not make unrelated file edits.
-		- Verify the merge completes cleanly before finishing.
-		` + ciConflictMergeOnlyRule
+			promptRules = ciMergeConflictMergeRules + "\n\t\t" + ciConflictMergeOnlyRule
 		} else {
 			promptIntro = "The PR has merge conflicts with the base branch. Rebase onto the base branch and resolve the merge conflicts."
-			promptRules = `- Resolve the merge conflicts by applying the minimal necessary changes.
-		- Do not make unrelated file edits.
-		- Verify the rebase completes cleanly before finishing.`
+			promptRules = ciMergeConflictFixRules
 		}
 	case len(failingNames) == 0:
 		promptIntro = "Address the following findings selected at the CI gate of this PR."

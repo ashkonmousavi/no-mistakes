@@ -632,6 +632,7 @@ func TestMerge_CarriesDisableProjectSettings(t *testing.T) {
 		t.Error("Merge must leave DisableProjectSettings false by default")
 	}
 }
+
 // TestLoadRepoConfig_SyncStrategy proves sync_strategy parses both recognized
 // values and that an empty value stays empty (EffectiveSyncStrategy is where
 // the "rebase" default is applied).
