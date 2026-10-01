@@ -777,6 +777,143 @@ func TestAxiCustodyRecoveryAfterRebaseJourney(t *testing.T) {
 	}
 }
 
+// TestAxiFreshRunAfterLineRewritingRebaseJourney is the shape behind the
+// 2026-10-01 private-mirror stalls, driven through the real binary. The default
+// branch advanced, so the pipeline rebased the operator's commit, and the fix
+// round then rewrote the operator's own line. Cancellation verified that head
+// before Push, so the gate branch still holds the submitted head and no content
+// proof can tell the rewrite from a dropped change. Supported recovery
+// rightly refuses to adopt the rewrite; once the operator adopts that exact
+// verified head and recovery returns custody, a fresh submission on the same
+// branch must reconcile the mirror the run placed (archiving it first) and
+// start a new run, instead of refusing every future submission.
+func TestAxiFreshRunAfterLineRewritingRebaseJourney(t *testing.T) {
+	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: branchSyncScenario(t)})
+	h.CommitChange("init-lineage-rewrite", "seed.txt", "seed\n", "seed lineage rewrite init")
+	initWorktree := h.AddWorktree("init-lineage-rewrite")
+	if out, err := h.RunInDir(initWorktree, "init"); err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+
+	branch := "feature/lineage-rewrite"
+	submitted := h.CommitChange(branch, "feature.txt", "unsafe\n", "add unsafe feature")
+	h.CommitChange("main", "upstream-advance.txt", "advance\n", "upstream advance")
+	if out, err := h.runGit(context.Background(), h.WorkDir, "push", "origin", "main"); err != nil {
+		t.Fatalf("advance upstream main: %v\n%s", err, out)
+	}
+
+	operator := h.AddWorktree(branch)
+	gateOut, err := h.RunInDir(operator, "axi", "run", "--intent", "guard the feature across a rebased base")
+	if err != nil || !strings.Contains(gateOut, "sync-1") {
+		t.Fatalf("initial review gate: %v\n%s", err, gateOut)
+	}
+	// The fix round rewrites the operator's own line on top of the rebase.
+	if fixOut, err := h.RunInDir(operator, "axi", "respond", "--action", "fix", "--findings", "sync-1"); err != nil {
+		t.Fatalf("review fix: %v\n%s", err, fixOut)
+	}
+	if abortOut, abortErr := h.RunInDir(operator, "axi", "abort"); abortErr != nil {
+		t.Fatalf("axi abort: %v\n%s", abortErr, abortOut)
+	}
+	run := h.WaitForRun(branch, 30*time.Second)
+	if run.Status != types.RunCancelled {
+		t.Fatalf("run status after abort = %s", run.Status)
+	}
+
+	gateDir := filepath.Join(h.NMHome, "repos", h.repoID()+".git")
+	preservedBytes, err := h.runGit(context.Background(), gateDir, "rev-parse", custody.RecoveryRef(run.ID))
+	if err != nil {
+		t.Fatalf("gate preserved head: %v\n%s", err, preservedBytes)
+	}
+	preserved := strings.TrimSpace(string(preservedBytes))
+	if preserved != run.HeadSHA {
+		t.Fatalf("recovery ref = %s, want recorded run head %s", preserved, run.HeadSHA)
+	}
+	database, err := db.OpenReadOnly(paths.WithRoot(h.NMHome).DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded, err := database.GetRun(run.ID)
+	if closeErr := database.Close(); err != nil || closeErr != nil || recorded == nil {
+		t.Fatalf("read terminal run: %#v, %v, close %v", recorded, err, closeErr)
+	}
+	if recorded.TerminalHeadVerifiedAt == nil || recorded.HeadSHA != preserved || recorded.LastPushedSHA != nil ||
+		recorded.SubmittedHeadSHA == nil || *recorded.SubmittedHeadSHA != submitted {
+		t.Fatalf("terminalization did not verify the unpublished rewritten head: %+v", recorded)
+	}
+	if got, err := h.runGit(context.Background(), gateDir, "rev-parse", "refs/heads/"+branch); err != nil || strings.TrimSpace(string(got)) != submitted {
+		t.Fatalf("unpublished gate branch = %s (err %v), want submitted head %s", got, err, submitted)
+	}
+	if _, ancErr := h.runGit(context.Background(), gateDir, "merge-base", "--is-ancestor", submitted, preserved); ancErr == nil {
+		t.Fatalf("pipeline did not rebase: preserved %s still descends from submitted %s", preserved, submitted)
+	}
+	if content, err := h.runGit(context.Background(), gateDir, "show", preserved+":feature.txt"); err != nil || strings.TrimSpace(string(content)) != "safe" {
+		t.Fatalf("fix round did not rewrite the operator's line: %q (err %v)", content, err)
+	}
+
+	// Supported recovery does not adopt a head that rewrote the operator's line.
+	refusedOut, refusedErr := h.RunInDir(operator, "axi", "sync", "--recover")
+	t.Logf("supported recovery of the rewrite shape:\n%s", refusedOut)
+	if refusedErr == nil || strings.Contains(refusedOut, "recovered: true") {
+		t.Fatalf("recovery adopted a head that rewrote the operator's line: %v\n%s", refusedErr, refusedOut)
+	}
+	if got := strings.TrimSpace(h.WorktreeRefSHA(branch)); got != submitted {
+		t.Fatalf("refused recovery moved the operator branch to %s", got)
+	}
+
+	// The operator adopts the exact verified head by hand, inside this
+	// disposable harness only, keeping the original head under its own ref.
+	for _, args := range [][]string{
+		{"update-ref", "refs/e2e/original-head", submitted},
+		{"fetch", gateDir, custody.RecoveryRef(run.ID)},
+		{"reset", "--hard", preserved},
+	} {
+		if out, gitErr := h.runGit(context.Background(), operator, args...); gitErr != nil {
+			t.Fatalf("manual adoption git %v: %v\n%s", args, gitErr, out)
+		}
+	}
+	// With the operator at the preserved head, the supported command returns
+	// custody; nothing writes the custody stamp behind its back.
+	recoverOut, err := h.RunInDir(operator, "axi", "sync", "--recover")
+	if err != nil {
+		t.Fatalf("custody return after adopting the verified head: %v\n%s", err, recoverOut)
+	}
+	for _, want := range []string{"recovered: true", "state: custody_returned"} {
+		if !strings.Contains(recoverOut, want) {
+			t.Errorf("recover output missing %q:\n%s", want, recoverOut)
+		}
+	}
+
+	runsBefore := map[string]bool{}
+	for _, existing := range h.Runs() {
+		runsBefore[existing.ID] = true
+	}
+	freshOut, err := h.RunInDir(operator, "axi", "run", "--intent", "validate the adopted line-rewriting head")
+	if err != nil || strings.Contains(freshOut, "refusing to reconcile private mirror ref") || !strings.Contains(freshOut, "gate:") {
+		t.Fatalf("fresh submission of the run's verified head did not start: %v\n%s", err, freshOut)
+	}
+	t.Logf("fresh submission after legitimate custody return:\n%s", freshOut)
+	var fresh *ipc.RunInfo
+	for _, candidate := range h.Runs() {
+		if !runsBefore[candidate.ID] {
+			candidate := candidate
+			fresh = &candidate
+		}
+	}
+	if fresh == nil || fresh.ID == run.ID || fresh.Branch != branch || fresh.SubmittedHeadSHA == nil || *fresh.SubmittedHeadSHA != preserved {
+		t.Fatalf("fresh run = %+v, want a new run on %s submitted at %s", fresh, branch, preserved)
+	}
+	archive := "refs/tags/no-mistakes-abandoned/" + branch + "/" + submitted
+	if got, gitErr := h.runGit(context.Background(), gateDir, "rev-parse", archive); gitErr != nil || strings.TrimSpace(string(got)) != submitted {
+		t.Fatalf("replaced mirror head archive %s = %s (err %v), want %s", archive, got, gitErr, submitted)
+	}
+	if got, gitErr := h.runGit(context.Background(), gateDir, "rev-parse", "refs/heads/"+branch); gitErr != nil || strings.TrimSpace(string(got)) != preserved {
+		t.Fatalf("gate branch = %s (err %v), want submitted verified head %s", got, gitErr, preserved)
+	}
+	if got, gitErr := h.runGit(context.Background(), operator, "rev-parse", "refs/e2e/original-head"); gitErr != nil || strings.TrimSpace(string(got)) != submitted {
+		t.Fatalf("original operator head not preserved: %s (err %v)", got, gitErr)
+	}
+}
+
 // TestAxiPrePushAbortUnmovedHeadCustodyJourney reproduces the ownership gap
 // hit when delivery switches to a direct PR mid-validation: the worker aborts
 // the run at the review gate BEFORE the pipeline changes anything, so the

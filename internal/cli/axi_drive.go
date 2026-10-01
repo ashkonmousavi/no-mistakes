@@ -641,7 +641,14 @@ func triggerRun(ctx context.Context, env *axiEnv, branch string, skipSteps []typ
 	if _, err := verificationplan.Resolve(env.p.RunInputsDir(), planID, env.repo.ID, branch, submissionHead); err != nil {
 		return "", err
 	}
-	reconciliation, err := gate.ReconcileStaleBranch(ctx, env.p.RepoDir(env.repo.ID), ".", branch, submissionHead, "")
+	// The mirror heads a terminal lineage placed may be replaced without the
+	// content proof only when this submission is exactly that lineage's
+	// verified recorded head (Decision 41-A). A failed read refuses here.
+	lineageHeads, err := env.d.LineageMirrorHeads(env.repo.ID, branch, submissionHead, "")
+	if err != nil {
+		return "", fmt.Errorf("prepare private mirror for %q: %w", branch, err)
+	}
+	reconciliation, err := gate.ReconcileStaleBranch(ctx, env.p.RepoDir(env.repo.ID), ".", branch, submissionHead, lineageHeads...)
 	if err != nil {
 		return "", fmt.Errorf("prepare private mirror for %q: %w", branch, err)
 	}

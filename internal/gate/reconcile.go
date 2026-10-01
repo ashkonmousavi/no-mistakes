@@ -34,8 +34,8 @@ type StaleBranchPlan struct {
 // reconciliation. It removes the branch only after Git proves the live head
 // contains all of its content, or under the exact run-owned-head exception
 // described in docs/src/content/docs/concepts/gate-model.md.
-func ReconcileStaleBranch(ctx context.Context, gateDir, workDir, branch, liveHead, runOwnedHead string) (StaleBranchReconciliation, error) {
-	plan, err := PlanStaleBranchReconciliation(ctx, gateDir, workDir, branch, liveHead, runOwnedHead)
+func ReconcileStaleBranch(ctx context.Context, gateDir, workDir, branch, liveHead string, runOwnedHeads ...string) (StaleBranchReconciliation, error) {
+	plan, err := PlanStaleBranchReconciliation(ctx, gateDir, workDir, branch, liveHead, runOwnedHeads...)
 	if err != nil || !plan.Reconcile {
 		return StaleBranchReconciliation{}, err
 	}
@@ -48,22 +48,26 @@ func ReconcileStaleBranch(ctx context.Context, gateDir, workDir, branch, liveHea
 // exception, an unproven private head is refused before publication.
 //
 // Rewritten histories require both stable per-file patch identities and final
-// tree survival. runOwnedHead is a policy exception, not containment evidence:
-// fresh submissions must leave it empty, and pipeline publication goes through
+// tree survival. runOwnedHeads are a policy exception, not containment
+// evidence: a fresh submission passes only the mirror heads that terminal runs
+// placed when the submission is exactly the verified recorded head of that
+// lineage (db.LineageMirrorHeads), and pipeline publication goes through
 // PlanMirrorPublicationReconciliation instead. The contract and rationale are
 // owned by docs/src/content/docs/concepts/gate-model.md (Private mirror
 // reconciliation).
-func PlanStaleBranchReconciliation(ctx context.Context, gateDir, workDir, branch, liveHead, runOwnedHead string) (StaleBranchPlan, error) {
-	return planStaleBranchReconciliation(ctx, gateDir, workDir, branch, liveHead, false, runOwnedHead)
+func PlanStaleBranchReconciliation(ctx context.Context, gateDir, workDir, branch, liveHead string, runOwnedHeads ...string) (StaleBranchPlan, error) {
+	return planStaleBranchReconciliation(ctx, gateDir, workDir, branch, liveHead, false, runOwnedHeads...)
 }
 
 // PlanMirrorPublicationReconciliation is the pipeline-publication variant of
 // PlanStaleBranchReconciliation: it also leaves a newer descendant of the live
 // head in place. runOwnedHeads are the exact heads the publishing run itself
 // placed on the private mirror - Run.SubmittedHeadSHA and, once the run has
-// published, its durable Run.LastPushedSHA - and nothing else. Neither an
-// agent-created head nor any other recorded head is eligible; every other
-// mirror head still needs the full preservation proof.
+// published, its durable Run.LastPushedSHA - plus the heads its terminal
+// predecessors placed when the run was submitted exactly at their verified
+// recorded head (db.LineageMirrorHeads). Neither an agent-created head nor any
+// other recorded head is eligible; every other mirror head still needs the
+// full preservation proof.
 func PlanMirrorPublicationReconciliation(ctx context.Context, gateDir, workDir, branch, liveHead string, runOwnedHeads ...string) (StaleBranchPlan, error) {
 	return planStaleBranchReconciliation(ctx, gateDir, workDir, branch, liveHead, true, runOwnedHeads...)
 }

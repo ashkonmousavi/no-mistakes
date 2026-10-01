@@ -435,6 +435,87 @@ func (d *DB) GetRunsByRepoHead(repoID, branch, headSHA string) ([]*Run, error) {
 	return runs, rows.Err()
 }
 
+// LineageMirrorHeads returns the exact heads that terminal runs on branch
+// placed on the private mirror - their SubmittedHeadSHA and durable
+// LastPushedSHA - when that run's verified recorded head is exactly
+// continuationHead. It then walks back through each such run's own submitted
+// head, so a rerun of a rerun keeps its lineage. Every hop applies the same
+// filters: the same repository and branch (short or refs/heads/ form), a
+// terminal status, a verified terminal head, and an ID other than
+// excludeRunID. An ineligible row contributes nothing and opens no edge, and a
+// last-pushed head is a candidate but never a continuation. The policy that
+// lets these heads skip the content proof is Decision 41-A, owned by
+// docs/src/content/docs/concepts/gate-model.md. Any read failure returns no
+// candidates.
+func (d *DB) LineageMirrorHeads(repoID, branch, continuationHead, excludeRunID string) ([]string, error) {
+	short := strings.TrimPrefix(strings.TrimSpace(branch), "refs/heads/")
+	start := strings.TrimSpace(continuationHead)
+	if short == "" || start == "" {
+		return nil, nil
+	}
+	var heads []string
+	seen := map[string]bool{}
+	visited := map[string]bool{}
+	next := []string{start}
+	for len(next) > 0 {
+		head := next[0]
+		next = next[1:]
+		if visited[head] {
+			continue
+		}
+		visited[head] = true
+		runs, err := d.verifiedTerminalRunsEndingAt(repoID, short, head, excludeRunID)
+		if err != nil {
+			return nil, fmt.Errorf("get lineage mirror heads: %w", err)
+		}
+		for _, r := range runs {
+			var submitted, pushed string
+			if r.SubmittedHeadSHA != nil {
+				submitted = strings.TrimSpace(*r.SubmittedHeadSHA)
+			}
+			if r.LastPushedSHA != nil {
+				pushed = strings.TrimSpace(*r.LastPushedSHA)
+			}
+			for _, placed := range []string{submitted, pushed} {
+				if placed != "" && !seen[placed] {
+					seen[placed] = true
+					heads = append(heads, placed)
+				}
+			}
+			if submitted != "" {
+				next = append(next, submitted)
+			}
+		}
+	}
+	return heads, nil
+}
+
+// verifiedTerminalRunsEndingAt returns the terminal runs on branch, other than
+// excludeRunID, whose verified recorded head is exactly head. The rows are
+// fully read and closed before it returns, because the database uses a single
+// connection and the lineage walk issues the next query afterwards.
+func (d *DB) verifiedTerminalRunsEndingAt(repoID, short, head, excludeRunID string) ([]*Run, error) {
+	rows, err := d.sql.Query(
+		`SELECT `+runColumns+` FROM runs WHERE repo_id = ? AND branch IN (?, ?) AND head_sha = ? AND terminal_head_verified_at IS NOT NULL AND id != ? ORDER BY created_at DESC, id DESC`,
+		repoID, short, "refs/heads/"+short, head, excludeRunID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var runs []*Run
+	for rows.Next() {
+		r := &Run{}
+		if err := scanRun(rows, r); err != nil {
+			return nil, fmt.Errorf("scan run: %w", err)
+		}
+		if r.Status.Terminal() {
+			runs = append(runs, r)
+		}
+	}
+	return runs, rows.Err()
+}
+
 // GetActiveRun returns the currently active run (pending or running) for a repo,
 // if any. When branch is non-empty, only a run on that exact branch is returned
 // - the setup wizard relies on this to decide whether a new run is needed for

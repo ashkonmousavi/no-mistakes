@@ -104,20 +104,26 @@ discarded by a merge or revert from being counted as surviving content. If that
 survival check cannot prove preservation, the private-only range is reported
 as at risk.
 
-**Accepted Decision 41-A (issue #983):** pipeline publication may replace a
-private mirror head that is **exactly equal to a head the publishing run itself
-placed on the mirror** without patch-ID or tree-survival proof: its
-`Run.SubmittedHeadSHA`, or, once it has published, its durable
-`Run.LastPushedSHA`. The last pushed head is recorded only after a verified push to the configured
-push target and mirror settlement, so it is never an external or newer head.
-This narrow policy exception permits reviewed rebases and conflict resolutions
-to change the submitted patch, including a CI merge-conflict repair that is
-revalidated from Review after the run has already published. The replacement
-head must still be review-approved, and the force push to the configured target
-stays leased on the same last pushed head. Ownership is not containment evidence. The
-exception does not extend to another recorded head, an agent-created head, an
-abbreviated SHA, or an external, newer, or divergent private head. Fresh AXI
-submissions do not receive this exception.
+**Accepted Decision 41-A (issue #983, extended to recorded terminal lineage):** a private mirror head that is **exactly equal to a head the pipeline itself placed on the mirror** may be replaced without patch-ID or tree-survival proof.
+For pipeline publication, the publishing run's own heads qualify: its `Run.SubmittedHeadSHA`, or, once it has published, its durable `Run.LastPushedSHA`.
+The last pushed head is recorded only after a verified push to the configured push target and mirror settlement, so it is never an external or newer head.
+This narrow policy exception permits reviewed rebases and conflict resolutions to change the submitted patch, including a CI merge-conflict repair that is revalidated from Review after the run has already published.
+
+The exception also follows recorded terminal-run lineage (`db.LineageMirrorHeads`).
+A run contributes only when it is on the same repository and branch, is terminal, has a verified terminal head (`terminal_head_verified_at`), and that head equals the continuation head as an exact full object ID.
+It contributes its exact submitted head and durable last pushed head, and the walk continues backwards only through its submitted head, applying every filter again at every hop.
+A last pushed head is a candidate but never a continuation, and an unverified, active, other-repository, other-branch, or excluded row contributes nothing and opens no further hop.
+Publication starts the walk from the publishing run's immutable submitted head and excludes the run itself, so a rerun that resumed its predecessor's exact verified head can replace the heads that predecessor placed.
+A fresh AXI submission starts the walk from the exact submitted head, so an operator who adopted a terminal run's exact verified head can submit it on the same branch.
+Every existing admission check runs first: a branch the pipeline still owns, an active run, or an in-flight push refuses before the lineage read, and lineage never returns custody.
+A lineage read that fails refuses before any ref change or publication; it never falls back to an empty candidate list.
+
+Ownership is not containment evidence.
+Terminal verification records which head a run ended at; it does not mean a review certified that head or that no content was dropped, so the exception keeps the risk that an authorized pipeline rebase or fix changed or dropped content.
+A fresh submission can therefore archive the replaced mirror head before the new run has reviewed the submitted head; publishing that head still requires the new run's review approval and the remote lease.
+The replacement head must still be review-approved before publication, and the force push to the configured target stays leased on the same last pushed head.
+The exception does not extend to another recorded head (a terminal, review-approved, or recovery head), an agent-created head, an abbreviated SHA, a submission that is not exactly a lineage's verified head (including an operator's own rewrite of a head the run left unchanged), or an external, newer, or divergent private head.
+Each of those keeps the preservation proof above.
 
 Reconciliation requires direct private branch and archive refs; symbolic refs,
 including dangling symbolic refs, are refused before containment checks. Ref
