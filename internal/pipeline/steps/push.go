@@ -234,8 +234,11 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 
 // planGateMirrorReconciliation inspects the gate mirror without mutating it.
 // Only the heads this run itself placed on the mirror - its exact submitted
-// head and its exact durable last-published head - are eligible for the policy
-// exception owned by docs/src/content/docs/concepts/gate-model.md. Do not
+// head and its exact durable last-published head - and the heads its terminal
+// predecessors placed, when this run was submitted exactly at their verified
+// recorded head (db.LineageMirrorHeads), are eligible for the policy exception
+// owned by docs/src/content/docs/concepts/gate-model.md. The lineage starts
+// from the immutable submitted head, never the head being published. Do not
 // substitute an agent-created or other recorded head: those still require
 // preservation checks.
 func planGateMirrorReconciliation(ctx context.Context, sctx *pipeline.StepContext, ref, branch, headBeingPushed string) (gatepkg.StaleBranchPlan, error) {
@@ -254,7 +257,12 @@ func planGateMirrorReconciliation(ctx context.Context, sctx *pipeline.StepContex
 	if err != nil {
 		return plan, fmt.Errorf("update gate mirror ref %s before push: %w", ref, err)
 	}
-	plan, err = gatepkg.PlanMirrorPublicationReconciliation(ctx, gateDir, sctx.WorkDir, branch, headBeingPushed, runOwnedSubmittedHead(sctx), publishedHead)
+	lineageHeads, err := sctx.DB.LineageMirrorHeads(sctx.Repo.ID, sctx.Run.Branch, runOwnedSubmittedHead(sctx), sctx.Run.ID)
+	if err != nil {
+		return plan, fmt.Errorf("update gate mirror ref %s before push: %w", ref, err)
+	}
+	ownedHeads := append([]string{runOwnedSubmittedHead(sctx), publishedHead}, lineageHeads...)
+	plan, err = gatepkg.PlanMirrorPublicationReconciliation(ctx, gateDir, sctx.WorkDir, branch, headBeingPushed, ownedHeads...)
 	if err != nil {
 		return gatepkg.StaleBranchPlan{}, fmt.Errorf("update gate mirror ref %s before push: %w", ref, err)
 	}
