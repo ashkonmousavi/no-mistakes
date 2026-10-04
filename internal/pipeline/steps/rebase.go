@@ -492,9 +492,10 @@ Instructions:
 
 // mergesMovedBase reports whether this run integrates a moved base with a merge
 // commit instead of rebasing onto it. The value is resolved config
-// (rebase.strategy), trusted-only for a repository, and defaults to rebasing.
+// (sync_strategy and rebase.strategy), trusted-only for a repository. A merge
+// requirement in either setting wins; otherwise integration defaults to rebase.
 func mergesMovedBase(sctx *pipeline.StepContext) bool {
-	return sctx.Config != nil && sctx.Config.Rebase.Strategy == config.RebaseStrategyMerge
+	return sctx.Config.EffectiveSyncStrategy() == config.SyncStrategyMerge
 }
 
 // integrationVerb names the shape in log lines and findings, so a run reads as
@@ -605,6 +606,7 @@ Instructions:
 		targetRef,
 		strings.Join(conflictFiles, "\n- "),
 	)
+	prompt += "\n" + ciConflictMergeOnlyRule
 	prompt += "\n" + agent.MemoryFilesConflictRule
 	if sctx.PreviousFindings != "" {
 		prompt += "\n\nPrevious findings:\n" + sctx.PreviousFindings
@@ -731,6 +733,12 @@ func shouldSkipRebase(ctx context.Context, sctx *pipeline.StepContext, targetRef
 	}
 	if _, err := git.Run(ctx, sctx.WorkDir, "merge-base", "--is-ancestor", "HEAD", targetRef); err == nil {
 		sctx.Log(fmt.Sprintf("fast-forwarding to %s", targetRef))
+		if mergesMovedBase(sctx) {
+			if _, err := git.Run(ctx, sctx.WorkDir, "merge", "--ff-only", "--no-edit", targetRef); err != nil {
+				return false, fmt.Errorf("fast-forward to %s: %w", targetRef, err)
+			}
+			return true, nil
+		}
 		if _, err := git.Run(ctx, sctx.WorkDir, "reset", "--hard", targetRef); err != nil {
 			return false, fmt.Errorf("fast-forward to %s: %w", targetRef, err)
 		}

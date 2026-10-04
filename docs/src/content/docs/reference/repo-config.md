@@ -8,7 +8,7 @@ Per-repo configuration lives in `.no-mistakes.yaml` at the root of your reposito
 :::caution[Security: gate-control fields are read from the default branch]
 `commands.*` and `gates[].command` execute arbitrary shell on the daemon host via `sh -c` / `cmd.exe /c`, and `agent` selects which process launches there (including ordered fallback lists, ACP aliases such as `cursor` and `devin`, and `acp:` targets) with the maintainer's credentials.
 To prevent a supply-chain attack where a contributor lands a hostile value on a gated branch, the daemon always reads **`commands` and `agent` from your default branch** (e.g. `origin/main`), never from the pushed SHA, and reads them at the exact commit a fresh fetch resolved (so a stale `origin/<default>` ref cannot serve a value the live default branch removed).
-The daemon also reads `document.instructions`, `review.conversation`, `review.path_instructions`, `gates`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.revalidate_repairs`, `rebase.strategy`, `test.prepare`, `test.instructions`, `test.allow_approve_over_failure`, `test.evidence.branch`, `pr.template`, `pr.publish_intent`, and `pr.appendix` only from that trusted copy.
+The daemon also reads `document.instructions`, `review.conversation`, `review.path_instructions`, `gates`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.revalidate_repairs`, `sync_strategy`, `rebase.strategy`, `test.prepare`, `test.instructions`, `test.allow_approve_over_failure`, `test.evidence.branch`, `pr.template`, `pr.publish_intent`, and `pr.appendix` only from that trusted copy.
 `pr.base_branch` is trusted-default-branch-only as well, but unlike those fields it follows the same `allow_repo_commands: true` opt-in exception as `commands`/`agent` (see [`pr.base_branch`](#prbase_branch) below).
 If the default branch cannot be fetched and resolved to a readable commit, or its present `.no-mistakes.yaml` cannot be read and parsed, the run aborts before launching an agent.
 A readable default-branch tree with no `.no-mistakes.yaml` is valid and uses defaults.
@@ -739,6 +739,30 @@ A pushed branch cannot turn a maintainer's revalidation requirement off for its 
 A value set here always wins over the operator's own [`ci.revalidate_repairs`](/no-mistakes/reference/global-config/#cirevalidate_repairs), in both directions: `true` here enables revalidation even when the global value is `false`, and an explicit `false` here opts out even when the global value is `true`.
 With no trusted copy of this file, the operator's global value applies, then the built-in default of `false`.
 
+### sync_strategy
+
+Select the repository's branch integration policy.
+
+| | |
+| --- | --- |
+| Type | `string` (`rebase` or `merge`) |
+| Default | `rebase` |
+
+```yaml
+sync_strategy: merge
+```
+
+This setting is read only from the trusted default-branch copy, even with `allow_repo_commands: true`.
+An unknown value refuses configuration loading; a pushed branch cannot enable history rewriting or choose its own integration policy.
+A merge requirement in either `sync_strategy` or [`rebase.strategy`](#rebasestrategy) wins; an unset or explicit `rebase` value in the other setting cannot weaken it.
+Repository `rebase.strategy` still overrides the operator's corresponding global default before the two settings are resolved together.
+When neither resolved setting requires merge, the existing rebase behavior applies.
+
+The policy covers every Rebase-step target and both CI conflict-repair prompt forms: conflicts alone and conflicts combined with failing checks.
+Merge mode fast-forwards with `git merge --ff-only` and integrates diverged targets through the existing merge resolver, which verifies both pre-merge snapshots remain ancestors after an agent resolves conflicts.
+Both CI conflict prompts explicitly require an ordinary merge and forbid rebase, reset onto another commit, and force-push.
+Existing post-review continuity, force-push safety, and `ci.revalidate_repairs` checks continue to govern publication; merge does not bypass them.
+
 ### rebase.strategy
 
 How the [Rebase step](/no-mistakes/reference/pipeline-steps/#rebase) integrates a base branch that moved under the gated branch.
@@ -768,7 +792,8 @@ The two differ in what survives the integration, which matters in three places:
 | Evidence of what a conflict resolution did | none; the result is just commits | the merge commit's two parents and their merge base |
 | Cost | none | one merge commit per integration |
 
-Integration publishes as a fast-forward under `merge`. A CI merge-conflict repair is the exception: it rebases onto the base branch whichever strategy is set, so that repair still force-pushes and still revalidates in full.
+Integration publishes as a fast-forward under `merge`.
+CI conflict repair follows the same effective policy described under [`sync_strategy`](#sync_strategy), including when merge is selected only through `rebase.strategy`.
 
 **Continuity.** The CI step publishes a repair without a full revalidation cycle only when it can prove the repaired head continues the reviewed head (see [`ci.revalidate_repairs`](#cirevalidate_repairs)). Under `merge` that proof is plain ancestry, because the reviewed head is a parent. Under `rebase` there is nothing to prove it with.
 

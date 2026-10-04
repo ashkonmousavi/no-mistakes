@@ -132,6 +132,15 @@ const (
 	// of age, so a burst of parallel runs that all land inside the retention
 	// window still cannot grow the directory without bound.
 	DefaultEvidenceMaxRuns = 200
+	// SyncStrategyRebase integrates the pushed branch with its target by
+	// rewriting history (git rebase). It is the default, preserving the
+	// pipeline's original behavior when neither integration setting requires
+	// a merge.
+	SyncStrategyRebase = "rebase"
+	// SyncStrategyMerge integrates the pushed branch with its target by an
+	// ordinary git merge: a merge commit (or a fast-forward when possible),
+	// never rewriting existing commits. See RepoConfig.SyncStrategy.
+	SyncStrategyMerge = "merge"
 )
 
 // GlobalConfig represents ~/.no-mistakes/config.yaml.
@@ -367,6 +376,17 @@ type RepoConfig struct {
 	// registered pending or failing check. No inference from workflow files,
 	// prior history, branch names, or grace-period expiry.
 	NoCI bool `yaml:"no_ci"`
+	// SyncStrategy selects how the pipeline integrates the pushed branch with
+	// its target branch: SyncStrategyRebase (default) rewrites history, and
+	// SyncStrategyMerge always integrates with an ordinary merge instead. It
+	// governs every place the pipeline moves or rewrites the pushed branch -
+	// the rebase step and the CI conflict-repair agent's instructions. It is a
+	// safety boundary honored ONLY from the trusted default-branch copy of
+	// .no-mistakes.yaml (see EffectiveRepoConfig), regardless of
+	// allow_repo_commands: a contributor's pushed branch must not be able to
+	// re-enable history rewriting a maintainer has forbidden. An empty value
+	// leaves rebase.strategy to decide (rebase by default).
+	SyncStrategy string `yaml:"sync_strategy"`
 }
 
 // DocumentRaw is the YAML representation of document-step settings.
@@ -544,6 +564,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 		Gates                  []Gate       `yaml:"gates"`
 		DisableProjectSettings bool         `yaml:"disable_project_settings"`
 		NoCI                   bool         `yaml:"no_ci"`
+		SyncStrategy           string       `yaml:"sync_strategy"`
 		Providers              ProvidersRaw `yaml:"providers"`
 	}
 	var raw repoConfigRaw
@@ -568,6 +589,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 	c.Gates = raw.Gates
 	c.DisableProjectSettings = raw.DisableProjectSettings
 	c.NoCI = raw.NoCI
+	c.SyncStrategy = raw.SyncStrategy
 	c.Providers = raw.Providers
 	return nil
 }
@@ -733,8 +755,25 @@ type Config struct {
 	// intentionally has no CI (see the RepoConfig field). When true and the
 	// forge reports zero checks, the CI monitor treats that as all-checks-passed.
 	NoCI bool
+	// SyncStrategy is the resolved, trusted-only branch-integration strategy
+	// (see the RepoConfig field). May be empty; use EffectiveSyncStrategy to
+	// read the defaulted value.
+	SyncStrategy string
 	// Providers holds the resolved provider-specific settings.
 	Providers Providers
+}
+
+// EffectiveSyncStrategy resolves both trusted integration settings. A merge
+// requirement in either setting wins, so a legacy rebase default cannot undo
+// a repository or operator policy that preserves history.
+func (c *Config) EffectiveSyncStrategy() string {
+	if c == nil {
+		return SyncStrategyRebase
+	}
+	if c.SyncStrategy == SyncStrategyMerge || c.Rebase.Strategy == RebaseStrategyMerge {
+		return SyncStrategyMerge
+	}
+	return SyncStrategyRebase
 }
 
 // ProvidersRaw is the YAML representation of provider-specific settings,
@@ -2467,6 +2506,10 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 	if err := validatePRRaw(cfg.PR); err != nil {
 		return nil, fmt.Errorf("parse repo config: %w", err)
 	}
+	cfg.SyncStrategy = strings.TrimSpace(cfg.SyncStrategy)
+	if err := validateSyncStrategy(cfg.SyncStrategy); err != nil {
+		return nil, fmt.Errorf("parse repo config: %w", err)
+	}
 	if cfg.AutoFix.CI == nil {
 		cfg.AutoFix.CI = cfg.AutoFix.Babysit
 	}
@@ -2497,6 +2540,18 @@ func validatePRRaw(pr PRRaw) error {
 		return err
 	}
 	return nil
+}
+
+// validateSyncStrategy fails the config closed on a sync_strategy value other
+// than the two recognized strategies. An empty value is valid and leaves the
+// other integration setting to decide (see EffectiveSyncStrategy).
+func validateSyncStrategy(strategy string) error {
+	switch strategy {
+	case "", SyncStrategyRebase, SyncStrategyMerge:
+		return nil
+	default:
+		return fmt.Errorf("sync_strategy: must be %q or %q, got %q", SyncStrategyRebase, SyncStrategyMerge, strategy)
+	}
 }
 
 // validateReviewRaw fails the config closed on a review.path_instructions list
@@ -2637,6 +2692,12 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		// default-branch copy so a pushed branch cannot self-declare no-CI and
 		// bypass checks that the default branch still expects.
 		effective.NoCI = trusted.NoCI
+		// sync_strategy is a safety boundary, honored ONLY from the trusted
+		// default-branch copy regardless of allow_repo_commands (same shape as
+		// no_ci and disable_project_settings): a pushed branch must not be able
+		// to switch itself back to a history-rewriting rebase after a
+		// maintainer has forbidden one.
+		effective.SyncStrategy = trusted.SyncStrategy
 		// The whole ci block is trusted-only. ci.rerun_transient spends the
 		// maintainer's resources rather than the contributor's: every rerun is
 		// another provider-side workflow run billed to the repository, so a
@@ -2697,6 +2758,7 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		effective.Gates = nil
 		effective.DisableProjectSettings = false
 		effective.NoCI = false
+		effective.SyncStrategy = ""
 		effective.CI = CIRaw{}
 		effective.Rebase = RebaseRaw{}
 		effective.Test.Evidence.Branch = nil
@@ -3218,6 +3280,7 @@ func merge(global *GlobalConfig, repo *RepoConfig, override *RepositoryOverride)
 		// trusted-only (EffectiveRepoConfig sourced it from the trusted copy).
 		DisableProjectSettings: repo.DisableProjectSettings,
 		NoCI:                   repo.NoCI,
+		SyncStrategy:           repo.SyncStrategy,
 	}
 
 	if repo.Agent != "" {
