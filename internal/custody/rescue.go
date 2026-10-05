@@ -12,7 +12,8 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
-var rescueIdentifier = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+var rescueIdentifier = regexp.MustCompile(`^[A-Za-z0-9_-]+([.][A-Za-z0-9_-]+)*$`)
+var rescueObjectID = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
 
 // PreservePartialWork requires quiescent writers. It uses raw blobs and private
 // indexes: no filters, signing, hooks, shared stash, live index or HEAD writes.
@@ -40,10 +41,12 @@ func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (
 	}
 	defer os.RemoveAll(scratch)
 	indexEnv := []string{"GIT_INDEX_FILE=" + filepath.Join(scratch, "index"), "GIT_OPTIONAL_LOCKS=0"}
-	run := func(args ...string) (string, error) { return git.RunWithEnv(ctx, dir, indexEnv, args...) }
+	run := func(args ...string) (string, error) {
+		return git.RunWithEnv(ctx, dir, indexEnv, append([]string{"-c", "core.fsmonitor=false"}, args...)...)
+	}
 	// Stage-zero entries preserve staged content. Conflict entries are omitted
 	// only from the best-effort snapshot; the original index must then survive.
-	entries, err := git.RunRaw(ctx, dir, "ls-files", "--stage", "-z")
+	entries, err := git.RunRaw(ctx, dir, "-c", "core.fsmonitor=false", "ls-files", "--stage", "-z")
 	if err != nil {
 		return p, err
 	}
@@ -54,6 +57,7 @@ func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (
 		_, e := run("update-index", "--add", "--cacheinfo", mode, blob, path)
 		return e
 	}
+	indexModes := map[string]string{}
 	for _, entry := range strings.Split(string(entries), "\x00") {
 		if entry == "" {
 			continue
@@ -73,6 +77,7 @@ func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (
 		if fields[0] == "160000" {
 			p.Reason = "nested repository or submodule requires original checkout"
 		}
+		indexModes[parts[1]] = fields[0]
 		if err = add(fields[0], fields[1], parts[1]); err != nil {
 			return p, err
 		}
@@ -81,7 +86,9 @@ func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (
 	if err != nil {
 		return p, err
 	}
-	identity := append(indexEnv, "GIT_AUTHOR_NAME=no-mistakes", "GIT_AUTHOR_EMAIL=local@no-mistakes.invalid", "GIT_COMMITTER_NAME=no-mistakes", "GIT_COMMITTER_EMAIL=local@no-mistakes.invalid")
+	// Stop identity records time. Fixed object dates make exact recapture
+	// idempotent even when cleanup retries later or inherited dates change.
+	identity := append(indexEnv, "GIT_AUTHOR_NAME=no-mistakes", "GIT_AUTHOR_EMAIL=local@no-mistakes.invalid", "GIT_COMMITTER_NAME=no-mistakes", "GIT_COMMITTER_EMAIL=local@no-mistakes.invalid", "GIT_AUTHOR_DATE=1970-01-01T00:00:00Z", "GIT_COMMITTER_DATE=1970-01-01T00:00:00Z")
 	commit := func(tree string, parents ...string) (string, error) {
 		args := []string{"-c", "commit.gpgsign=false", "commit-tree", tree}
 		for _, parent := range parents {
@@ -97,7 +104,15 @@ func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (
 	if _, err = run("read-tree", "--empty"); err != nil {
 		return p, err
 	}
-	files, err := git.RunRaw(ctx, dir, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+	files, err := git.RunRaw(ctx, dir, "-c", "core.fsmonitor=false", "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return p, err
+	}
+	filemode, err := git.Run(ctx, dir, "config", "--type=bool", "--default", "true", "--get", "core.filemode")
+	if err != nil {
+		return p, err
+	}
+	symlinks, err := git.Run(ctx, dir, "config", "--type=bool", "--default", "true", "--get", "core.symlinks")
 	if err != nil {
 		return p, err
 	}
@@ -133,7 +148,9 @@ func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (
 		} else if !info.Mode().IsRegular() {
 			p.Reason = "unsupported file type"
 			continue
-		} else if info.Mode()&0o111 != 0 {
+		} else if symlinks == "false" && indexModes[name] == "120000" {
+			mode = "120000"
+		} else if (filemode == "false" && indexModes[name] == "100755") || (filemode != "false" && info.Mode()&0o111 != 0) || (indexModes[name] == "" && info.Mode()&0o111 != 0) {
 			mode = "100755"
 		}
 		blob, e := run("hash-object", "-w", "--no-filters", "--", content)
@@ -144,7 +161,7 @@ func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (
 			return p, e
 		}
 	}
-	ignored, err := git.RunRaw(ctx, dir, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
+	ignored, err := git.RunRaw(ctx, dir, "-c", "core.fsmonitor=false", "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
 	if err != nil {
 		return p, err
 	}
@@ -161,6 +178,17 @@ func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (
 	tree, err := run("write-tree")
 	if err != nil {
 		return p, err
+	}
+	headTree, err := git.Run(ctx, dir, "rev-parse", head+"^{tree}")
+	if err != nil {
+		return p, err
+	}
+	if p.Reason == "" && tree == headTree && indexTree == headTree {
+		p.State = "settled"
+		p.Ref = ""
+		p.IndexSHA = ""
+		p.Path = ""
+		return p, nil
 	}
 	p.SHA, err = commit(tree, head, p.IndexSHA)
 	if err != nil {
@@ -183,6 +211,16 @@ func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (
 func ValidatePartialWork(ctx context.Context, dir string, p *types.PartialWork) error {
 	if p == nil || p.Version != 1 || p.Ref != "refs/no-mistakes/rescue/"+p.RunID+"/"+p.Step+"/"+p.StopID {
 		return fmt.Errorf("unknown or cross-bound rescue")
+	}
+	for _, id := range []string{p.RunID, p.Step, p.StopID} {
+		if !rescueIdentifier.MatchString(id) {
+			return fmt.Errorf("invalid rescue identity")
+		}
+	}
+	for _, sha := range []string{p.SHA, p.ParentHead, p.IndexSHA} {
+		if !rescueObjectID.MatchString(sha) {
+			return fmt.Errorf("invalid rescue object ID")
+		}
 	}
 	if target, e := git.Run(ctx, dir, "symbolic-ref", "-q", p.Ref); e == nil {
 		return fmt.Errorf("symbolic rescue ref %s targets %s", p.Ref, target)
