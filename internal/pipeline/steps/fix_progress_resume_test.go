@@ -3,10 +3,13 @@ package steps
 import (
 	"context"
 	"errors"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
@@ -167,5 +170,151 @@ func TestFixProgressAuthorityRetryRejectsReusedIDAndChangedInstructions(t *testi
 				t.Fatal("scope refusal lost original ref")
 			}
 		})
+	}
+}
+
+type savedSnapshotHost struct {
+	completionSnapshotHost
+	reads    int
+	expected string
+}
+
+func (h *savedSnapshotHost) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
+	h.reads++
+	if pr.HeadSHA != h.expected {
+		return nil, errors.New("attempted a fresh snapshot on an unpublished local checkpoint")
+	}
+	return h.completionSnapshotHost.GetChecks(ctx, pr)
+}
+
+func TestFixProgressCIContinuationKeepsOriginalCheckFreshness(t *testing.T) {
+	dir, base, head := setupGitRepo(t)
+	a, b, verification := 0, 0, 0
+	ag := &mockAgent{runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+		if opts.Purpose == "ci-fix-verification" {
+			verification++
+			return &agent.Result{Output: []byte(`{"summary":"focused check passed"}`)}, nil
+		}
+		id := "A"
+		if strings.Contains(opts.Prompt, "Authorized repair finding: B.") {
+			id = "B"
+		}
+		if id == "A" {
+			a++
+			if a != 1 {
+				t.Fatal("replayed first CI cause")
+			}
+		} else {
+			b++
+		}
+		if err := os.WriteFile(filepath.Join(dir, id+".txt"), []byte("repaired"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if id == "B" && b == 1 {
+			opts.OnLifecycle(agent.LifecycleEvent{Phase: agent.LifecyclePhaseStart, PID: 123456789})
+			<-ctx.Done()
+			opts.OnLifecycle(agent.LifecycleEvent{Phase: agent.LifecyclePhaseExit, PID: 123456789})
+			return nil, ctx.Err()
+		}
+		return &agent.Result{Output: []byte(`{"summary":"repair check cause","code_change_needed":true}`)}, nil
+	}}
+	sctx := newTestContextWithDBRecords(t, ag, dir, base, head, config.Commands{})
+	bindStepResult(t, sctx, types.StepCI)
+	sctx.Config.AgentTimeout = 100 * time.Millisecond
+	sctx.Config.CI.RevalidateRepairs = true
+	sctx.PreviousFindings = `{"findings":[{"id":"A","description":"cause A","category":"ci-check","check":"A","check_id":"a"},{"id":"B","description":"cause B","category":"ci-check","check":"B","check_id":"b"}]}`
+	host := &savedSnapshotHost{expected: head, completionSnapshotHost: completionSnapshotHost{checks: []scm.Check{{Name: "A", ProviderID: "a", ExecutionID: "attempt-one-a", Bucket: scm.CheckBucketFail, CompletedAt: time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)}, {Name: "B", ProviderID: "b", ExecutionID: "attempt-one-b", Bucket: scm.CheckBucketFail, CompletedAt: time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)}}}}
+	cut, err := (&CIStep{}).repairFromFindings(sctx, host, &scm.PR{Number: "1"})
+	if err != nil || cut == nil || !cut.NeedsApproval {
+		t.Fatalf("CI cut %+v %v", cut, err)
+	}
+	resumed := &CIStep{}
+	sctx.Config.AgentTimeout = time.Second
+	result, err := resumed.repairFromFindings(sctx, host, &scm.PR{Number: "1"})
+	if err != nil || result == nil || result.RestartFrom != types.StepReview {
+		t.Fatalf("resumed CI lost revalidation policy: %+v %v", result, err)
+	}
+	if host.reads != 1 || a != 1 || b != 2 || verification != 1 {
+		t.Fatalf("freshness/replay reads=%d A=%d B=%d verification=%d", host.reads, a, b, verification)
+	}
+	if got := resumed.observedCompletedAt["id:b"].ExecutionID; got != "attempt-one-b" {
+		t.Fatalf("freshness changed: %q", got)
+	}
+}
+
+func TestFixProgressTestNewRunCarriesSourceRegressionPaths(t *testing.T) {
+	dir, base, head := setupGitRepo(t)
+	sourceCalls := 0
+	sourceAgent := &mockAgent{runFn: func(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+		sourceCalls++
+		name := string(rune('A'+sourceCalls-1)) + "_test.go"
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("package fixture\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if sourceCalls == 3 {
+			opts.OnLifecycle(agent.LifecycleEvent{Phase: agent.LifecyclePhaseStart, PID: 123456789})
+			opts.OnLifecycle(agent.LifecycleEvent{Phase: agent.LifecyclePhaseExit, PID: 123456789})
+			return nil, errTestAgentTimeout
+		}
+		return &agent.Result{Output: []byte(`{"summary":"add cause regression"}`)}, nil
+	}}
+	source := newTestContextWithDBRecords(t, sourceAgent, dir, base, head, config.Commands{})
+	bindStepResult(t, source, types.StepTest)
+	source.Fixing = true
+	source.PreviousFindings = `{"findings":[{"id":"A","severity":"error","description":"cause A"},{"id":"B","severity":"error","description":"cause B"},{"id":"C","severity":"error","description":"cause C"}]}`
+	cut, err := (&TestStep{}).Execute(source)
+	if err != nil || cut == nil || !cut.NeedsApproval {
+		t.Fatalf("source cut %+v %v", cut, err)
+	}
+	p, err := source.DB.LatestWorkRescue(source.Run.ID)
+	if err != nil || p == nil || p.State != "saved" {
+		t.Fatalf("source rescue %+v %v", p, err)
+	}
+	if err = source.DB.UpdateRunStatusWithVerifiedHead(source.Run.ID, types.RunFailed, source.Run.HeadSHA); err != nil {
+		t.Fatal(err)
+	}
+	next, err := source.DB.InsertRun(source.Run.RepoID, source.Run.Branch, source.Run.HeadSHA, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.State = "consumed"
+	p.ConsumedBy = next.ID
+	if err = source.DB.SaveWorkRescue(p); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	source.Agent = &mockAgent{runFn: func(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+		calls++
+		if calls == 1 {
+			if got, err := os.ReadFile(filepath.Join(dir, "C_test.go")); err != nil || string(got) != "package fixture\n" {
+				t.Fatal("unfinished C not restored")
+			}
+			if err := os.WriteFile(filepath.Join(dir, "C_test.go"), []byte("package fixture\n// completed C\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			return &agent.Result{Output: []byte(`{"summary":"complete cause C regression"}`)}, nil
+		}
+		for _, path := range []string{"A_test.go", "B_test.go", "C_test.go"} {
+			if !strings.Contains(opts.Prompt, path) {
+				t.Fatalf("new run evidence omitted %s", path)
+			}
+		}
+		return &agent.Result{Output: []byte(`{"findings":[],"summary":"fixture source inspected","tested":["inspected regression files"],"artifacts":[],"testing_summary":"fixture has no deployed surface","scenarios":[{"name":"pending installed acceptance","result":"untested","live":false,"evidence":"","reason":"fixture cannot drive installed product"}],"verdict":"inconclusive"}`)}, nil
+	}}
+	source.Run = next
+	bindStepResult(t, source, types.StepTest)
+	source.PreviousFindings = `{"findings":[{"id":"new-C","severity":"error","description":"cause C"}]}`
+	if err = source.BindInheritedWork(); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := (&TestStep{}).Execute(source)
+	if err != nil || completed == nil || !completed.NeedsApproval {
+		t.Fatalf("new run evidence %+v %v", completed, err)
+	}
+	if sourceCalls != 3 || calls != 2 {
+		t.Fatalf("source causes repeated: old=%d new=%d", sourceCalls, calls)
+	}
+	if err = pipeline.CompleteInheritedWork(source.Ctx, source.DB, source.Run, dir, p); err != nil {
+		t.Fatalf("reminted finding identity could not consume its exact scoped cause: %v", err)
 	}
 }

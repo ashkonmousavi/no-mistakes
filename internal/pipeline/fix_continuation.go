@@ -38,6 +38,15 @@ func (sctx *StepContext) PrepareFixContinuation(step types.StepName, requested t
 		if err != nil {
 			return requested, err
 		}
+		if len(units) > 0 && units[len(units)-1].ContinuationCompleted {
+			units = nil
+		}
+		if len(units) == 0 {
+			if p != nil {
+				return requested, fmt.Errorf("saved work at %s has no unfinished matching repair scope", p.Ref)
+			}
+			return requested, nil
+		}
 		if err = ValidateFixCheckpointRefs(sctx.Ctx, sctx.DB, sctx.Run.ID, sctx.WorkDir); err != nil {
 			return requested, err
 		}
@@ -121,12 +130,20 @@ func (sctx *StepContext) FinishFixValidation(step types.StepName) error {
 
 // SavedFixTests returns the exact regression paths captured before prior commits.
 func (sctx *StepContext) SavedFixTests(step types.StepName) ([]string, error) {
-	if sctx.FixSelectionID == "" {
-		return nil, nil
-	}
-	units, err := sctx.DB.GetFixCheckpoints(sctx.Run.ID, string(step), sctx.FixSelectionID)
+	units, err := sctx.DB.GetFixCheckpoints(sctx.Run.ID, string(step), "")
 	if err != nil {
 		return nil, err
+	}
+	inherited, err := sctx.DB.InheritedWorkRescue(sctx.Run.ID)
+	if err != nil {
+		return nil, err
+	}
+	if inherited != nil && inherited.Step == string(step) {
+		source, err := sctx.DB.GetFixCheckpoints(inherited.RunID, inherited.Step, inherited.Selection)
+		if err != nil {
+			return nil, err
+		}
+		units = append(source, units...)
 	}
 	var paths []string
 	seen := map[string]bool{}

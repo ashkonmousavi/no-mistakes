@@ -10,24 +10,24 @@ import (
 
 // FixCheckpoint binds one selected cause to its exact local head and anchor.
 type FixCheckpoint struct {
-	ID                  string
-	RunID               string
-	Step                string
-	StepResultID        string
-	Selection           string
-	Ordinal             int
-	Total               int
-	FindingID           string
-	FindingDigest       string
-	SelectionJSON       string
-	ParentHead          string
-	AppliedHead         string
-	Ref                 string
-	Summary             string
-	NewTests            []string
-	State               string
-	ValidationCompleted bool
-	CISnapshotJSON      string
+	ID                    string
+	RunID                 string
+	Step                  string
+	StepResultID          string
+	Selection             string
+	Ordinal               int
+	Total                 int
+	FindingID             string
+	FindingDigest         string
+	SelectionJSON         string
+	ParentHead            string
+	AppliedHead           string
+	Ref                   string
+	Summary               string
+	NewTests              []string
+	State                 string
+	ContinuationCompleted bool
+	CISnapshotJSON        string
 }
 
 func (d *DB) BeginFixCheckpoint(c *FixCheckpoint) error {
@@ -107,7 +107,7 @@ func (d *DB) ApplyFixCheckpoint(c *FixCheckpoint) error {
 }
 
 func (d *DB) GetFixCheckpoints(runID, step, selection string) ([]*FixCheckpoint, error) {
-	rows, e := d.sql.Query(`SELECT payload FROM fix_checkpoints WHERE run_id=? AND (?='' OR step=?) AND (?='' OR selection_id=?) ORDER BY id`, runID, step, step, selection, selection)
+	rows, e := d.sql.Query(`SELECT payload FROM fix_checkpoints WHERE run_id=? AND (?='' OR step=?) AND (?='' OR selection_id=?) ORDER BY step,selection_id,ordinal`, runID, step, step, selection, selection)
 	if e != nil {
 		return nil, e
 	}
@@ -132,7 +132,7 @@ func (d *DB) GetFixCheckpoints(runID, step, selection string) ([]*FixCheckpoint,
 
 func (d *DB) FixProgress(runID string) (*types.FixProgress, error) {
 	var step, selection string
-	e := d.sql.QueryRow(`SELECT step,selection_id FROM fix_checkpoints WHERE run_id=? ORDER BY id DESC LIMIT 1`, runID).Scan(&step, &selection)
+	e := d.sql.QueryRow(`SELECT step,selection_id FROM fix_checkpoints WHERE run_id=? ORDER BY rowid DESC LIMIT 1`, runID).Scan(&step, &selection)
 	if errors.Is(e, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -153,10 +153,7 @@ func (d *DB) FixProgress(runID string) (*types.FixProgress, error) {
 			p.Current = c.FindingID
 		}
 	}
-	if len(units) > 0 && units[len(units)-1].ValidationCompleted {
-		p.ValidationPending = false
-	}
-	if p.Applied == p.Total && len(units) > 0 && units[0].StepResultID != "" {
+	if len(units) > 0 && units[0].StepResultID != "" {
 		step, err := d.GetStepResult(units[0].StepResultID)
 		if err != nil {
 			return nil, err
@@ -188,14 +185,14 @@ func (d *DB) FinishFixValidation(runID, step, selection, head string) error {
 	}
 	last := units[len(units)-1]
 	if len(units) != last.Total || last.AppliedHead != head {
-		return fmt.Errorf("unfinished repair selection cannot finish validation")
+		return fmt.Errorf("unfinished repair selection cannot finish validation: units=%d total=%d recorded_head=%s validation_head=%s", len(units), last.Total, last.AppliedHead, head)
 	}
 	for _, c := range units {
 		if c.State != "applied" {
 			return fmt.Errorf("unfinished repair unit %s", c.FindingID)
 		}
 	}
-	last.ValidationCompleted = true
+	last.ContinuationCompleted = true
 	raw, err := json.Marshal(last)
 	if err != nil {
 		return err

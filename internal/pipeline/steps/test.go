@@ -78,10 +78,10 @@ func (s *TestStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 		if _, err = sctx.PrepareFixContinuation(s.Name(), repair); err != nil {
 			return nil, err
 		}
-		newTestsFromFix, err = sctx.SavedFixTests(s.Name())
-		if err != nil {
-			return nil, err
-		}
+	}
+	newTestsFromFix, err = sctx.SavedFixTests(s.Name())
+	if err != nil {
+		return nil, err
 	}
 	var fixSummary string
 	var repairCut error

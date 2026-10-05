@@ -477,7 +477,7 @@ func fixResultSummary(committed bool) string {
 
 func extractCommitSummary(result *agent.Result) (string, error) {
 	var summary commitSummary
-	if result.Output == nil {
+	if result == nil || result.Output == nil {
 		return "", fmt.Errorf("agent returned no structured summary")
 	}
 	if !utf8.Valid(result.Output) {
@@ -565,8 +565,15 @@ func verifyFixBatch(sctx *pipeline.StepContext, opts fixExecutionOptions, purpos
 	if err != nil {
 		return err
 	}
-	summary, err := extractCommitSummary(result)
-	if err != nil || summary == "" {
+	var summary string
+	if result != nil {
+		summary, err = extractCommitSummary(result)
+	} else {
+		err = fmt.Errorf("agent returned no structured summary")
+	}
+	if purpose == "ci-fix-verification" && (result == nil || len(result.Output) == 0 || err == nil && summary == "") {
+		sctx.Log("focused CI verification returned no structured summary; required head validation remains pending")
+	} else if err != nil || summary == "" {
 		return fmt.Errorf("invalid focused-verification summary: %v", err)
 	}
 	head, err := git.HeadSHA(sctx.Ctx, sctx.WorkDir)
