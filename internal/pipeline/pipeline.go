@@ -13,6 +13,14 @@ import (
 
 var ErrFatalGateReconciliation = errors.New("fatal gate reconciliation")
 
+// ErrDaemonShutdown is the manager's cancellation cause. Only a durable parked
+// gate can suspend under this cause; operator cancellation remains terminal.
+var ErrDaemonShutdown = errors.New("daemon shutting down")
+
+// ErrRunSuspended ends an in-process gate wait without erasing its durable
+// state. The manager retains that run's checkout and evidence for recovery.
+var ErrRunSuspended = errors.New("parked run suspended for daemon restart")
+
 // StepContext provides shared resources to pipeline steps during execution.
 type StepContext struct {
 	Ctx              context.Context
@@ -61,7 +69,14 @@ type StepContext struct {
 	DeferredFindings string // JSON findings left unselected when the current fix round began
 	// StepResultID is the DB row ID of the current step's step_results record.
 	// Steps use it to query their own round history for multi-round prompts.
-	StepResultID string
+	StepResultID            string
+	FixSelectionID          string
+	CurrentFixUnit          *db.FixCheckpoint
+	FixSelectionFindings    string
+	FixAppliedOrdinals      map[int]bool
+	CompletedFixSelectionID string
+	FixStartingHead         string
+	CIFixSnapshotJSON       string
 	// EvidenceDir is where this run's test-evidence artifacts belong, always
 	// outside the worktree. The executor resolves it once from the app root
 	// (honoring test.evidence.local_root) so every consumer - the test step's

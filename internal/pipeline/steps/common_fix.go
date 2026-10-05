@@ -23,6 +23,7 @@ type fixExecutionOptions struct {
 	MissingFindingsError    string
 	LogMessage              string
 	Prompt                  string
+	SelectedFindings        string
 	ErrorPrefix             string
 	FallbackSummary         string
 	AfterAgentRun           func(*agent.Result) error
@@ -428,6 +429,22 @@ func commitAgentFixesWithResult(sctx *pipeline.StepContext, stepName types.StepN
 }
 
 func recordAgentFixHead(sctx *pipeline.StepContext, stepName types.StepName, headSHA string) error {
+	if sctx.CurrentFixUnit != nil {
+		if err := assertPipelineHeadContinuity(sctx, stepName); err != nil {
+			return err
+		}
+		if err := updateNonSharedBranchRef(sctx, headSHA); err != nil {
+			return err
+		}
+		parent := sctx.Run.HeadSHA
+		if err := sctx.RecordFixUnitHead(headSHA); err != nil {
+			return err
+		}
+		if stepName == types.StepReview {
+			pipeline.PersistUncertifiedPipelineRange(sctx, parent, headSHA)
+		}
+		return nil
+	}
 	if headSHA == sctx.Run.HeadSHA {
 		return nil
 	}
@@ -460,7 +477,7 @@ func fixResultSummary(committed bool) string {
 
 func extractCommitSummary(result *agent.Result) (string, error) {
 	var summary commitSummary
-	if result.Output == nil {
+	if result == nil || result.Output == nil {
 		return "", fmt.Errorf("agent returned no structured summary")
 	}
 	if !utf8.Valid(result.Output) {
@@ -478,6 +495,102 @@ func extractCommitSummary(result *agent.Result) (string, error) {
 }
 
 func executeFixMode(sctx *pipeline.StepContext, stepName types.StepName, opts fixExecutionOptions) (string, error) {
+	var selected types.Findings
+	if sctx.Fixing && (stepName == types.StepReview || stepName == types.StepTest) && sctx.PreviousFindings != "" {
+		raw := sctx.PreviousFindings
+		if opts.SelectedFindings != "" {
+			raw = opts.SelectedFindings
+		}
+		if err := json.Unmarshal([]byte(raw), &selected); err != nil {
+			return "", err
+		}
+	}
+	selected = types.NormalizeFindings(selected, string(stepName))
+	if len(selected.Items) > 0 {
+		var err error
+		selected, err = sctx.PrepareFixContinuation(stepName, selected)
+		if err != nil {
+			return "", err
+		}
+	}
+	if len(selected.Items) == 0 || (len(selected.Items) == 1 && sctx.StepResultID == "") {
+		return executeFixTurn(sctx, stepName, opts)
+	}
+	defer func() { sctx.CurrentFixUnit = nil; sctx.FixSelectionID = "" }()
+	changed := false
+	for i, finding := range selected.Items {
+		if sctx.FixAppliedOrdinals[i+1] {
+			continue
+		}
+		if err := sctx.BeginFixUnit(stepName, finding, i+1, len(selected.Items)); err != nil {
+			return "", err
+		}
+		unitOpts := opts
+		unitJSON, _ := json.Marshal(finding)
+		unitOpts.Prompt = opts.Prompt
+		if len(selected.Items) > 1 {
+			unitOpts.Prompt = strings.ReplaceAll(unitOpts.Prompt, "- Apply all the fixes you intend to make first; do not run any verification in between individual fixes.", "- Apply only the authorized cause and its sibling sites in this turn.")
+			unitOpts.Prompt = strings.ReplaceAll(unitOpts.Prompt, "- After all fixes are applied, run one focused verification limited to the changed area (the specific package, file, or test you touched) at the end of the fix round to confirm the fixes hold.", "- The pipeline runs one focused verification for the union after the final checkpoint.")
+		}
+		unitOpts.Prompt += "\n\nCurrent repair finding ID: " + finding.ID + "\nCurrent checkpoint head: " + sctx.Run.HeadSHA + " (the original context above names the batch starting head).\nAuthorized repair finding (other selected/deferred findings remain context only):\n" + string(unitJSON) + "\nClose this finding's cause at every sibling site. Do not commit, rebase, reset or push."
+		if len(selected.Items) > 1 {
+			unitOpts.Prompt += "\nThis is an edit-only unit. Do not run verification in this turn; one focused verification for the union follows all checkpoints."
+		}
+		summary, err := executeFixTurn(sctx, stepName, unitOpts)
+		if err != nil {
+			return "", err
+		}
+		changed = changed || summary == changesAppliedSummary
+	}
+	sctx.CurrentFixUnit = nil
+	if stepName == types.StepReview && len(selected.Items) > 1 {
+		if err := verifyFixBatch(sctx, opts, "review-fix-verification"); err != nil {
+			return "", err
+		}
+	}
+	sctx.CompletedFixSelectionID = sctx.FixSelectionID
+	return fixResultSummary(changed), nil
+}
+
+// Verification remains a separate bounded turn after all local checkpoints.
+func verifyFixBatch(sctx *pipeline.StepContext, opts fixExecutionOptions, purpose string) error {
+	runOpts := agent.RunOpts{CWD: sctx.WorkDir, Prompt: fixerPrompt("Run one focused verification for the union of the completed repair causes below. Do not edit files or run the full suite. Return a concise JSON summary of the checks actually run and their results.\n" + opts.Prompt), JSONSchema: commitSummarySchema, OnChunk: sctx.LogChunk, Purpose: purpose}
+	var result *agent.Result
+	var err error
+	if opts.RunAgent != nil {
+		result, err = opts.RunAgent(runOpts)
+	} else {
+		result, err = sctx.RunAgent(runOpts)
+	}
+	if err != nil {
+		return err
+	}
+	var summary string
+	if result != nil {
+		summary, err = extractCommitSummary(result)
+	} else {
+		err = fmt.Errorf("agent returned no structured summary")
+	}
+	if purpose == "ci-fix-verification" && (result == nil || len(result.Output) == 0 || err == nil && summary == "") {
+		sctx.Log("focused CI verification returned no structured summary; required head validation remains pending")
+	} else if err != nil || summary == "" {
+		return fmt.Errorf("invalid focused-verification summary: %v", err)
+	}
+	head, err := git.HeadSHA(sctx.Ctx, sctx.WorkDir)
+	if err != nil {
+		return err
+	}
+	status, err := git.Run(sctx.Ctx, sctx.WorkDir, "status", "--porcelain")
+	if err != nil {
+		return err
+	}
+	if head != sctx.Run.HeadSHA || status != "" {
+		return fmt.Errorf("focused verification changed saved repair work; retain for reconciliation")
+	}
+	return nil
+}
+
+func executeFixTurn(sctx *pipeline.StepContext, stepName types.StepName, opts fixExecutionOptions) (string, error) {
 	if !sctx.Fixing {
 		return "", nil
 	}
@@ -519,10 +632,19 @@ func executeFixMode(sctx *pipeline.StepContext, stepName types.StepName, opts fi
 	}
 	summary, err := extractCommitSummary(result)
 	if err != nil {
+		if sctx.CurrentFixUnit != nil {
+			return "", fmt.Errorf("invalid repair-unit summary: %w", err)
+		}
 		if errors.Is(err, errRejectedCommitSummary) {
 			return "", fmt.Errorf("validate %s fix summary: %w", stepName, err)
 		}
 		sctx.Log(fmt.Sprintf("warning: could not parse fix summary: %v", err))
+	}
+	if sctx.CurrentFixUnit != nil {
+		if summary == "" {
+			return "", fmt.Errorf("empty repair-unit summary")
+		}
+		sctx.CurrentFixUnit.Summary = summary
 	}
 	committed, err := commitAgentFixesWithResult(sctx, stepName, summary, opts.FallbackSummary)
 	if err != nil {

@@ -1,6 +1,16 @@
 package db
 
 const schemaSQL = `
+CREATE TABLE IF NOT EXISTS fix_checkpoints (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    step TEXT NOT NULL,
+    selection_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    UNIQUE(run_id,step,selection_id,ordinal)
+);
+
 CREATE TABLE IF NOT EXISTS repos (
     id             TEXT PRIMARY KEY,
     working_path   TEXT NOT NULL UNIQUE,

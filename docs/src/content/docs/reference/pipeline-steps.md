@@ -141,7 +141,11 @@ The fixer's unit of work is the invariant a finding violates, not the reported i
 Closing sibling sites is the fix; the fixer does not grow it into machinery, preferring to address a deeper architectural reason and simplify it over adding handling, state, fallbacks, retries, or a subsystem for the symptoms.
 After applying its fixes and before verifying, it re-traces each finding's failing sequence through the edited code and the ordinary path through every changed function and its callers, and removes any alias, branch, parameter, or helper the fix made unreachable.
 It follows the shared removal-first rule described above; the Review-specific guard against reverting the author's intentional code protects only code the intent requires, while genuine doubt about whether the intent requires a path leaves it in place and reports the finding unresolved.
-It applies all selected fixes before running one focused verification limited to the changed area, and it is instructed not to run the complete repository test or lint suite during the fix round.
+Each selected cause runs in its own editing turn and is committed and privately anchored before the next cause starts.
+The pipeline sizes each turn against the existing effective invocation bound, using successful local repair timings when available and an explicitly unmeasured estimate otherwise.
+A cause that does not fit parks before launch; explicit retries keep completed causes out of the editing loop.
+A multi-cause Review repair runs one focused verification for the union after its checkpoints and does not run the complete repository test or lint suite.
+Continuation requires matching selected scope and checkpoint anchors; unfinished working bytes require reconciliation rather than automatic restoration.
 The dedicated Test and Lint steps after review remain the authoritative gates, although their coverage may be focused when commands are unconfigured.
 Follow-up review passes use the history to avoid re-reporting user-ignored findings unless the code now has a materially different problem.
 
