@@ -225,3 +225,20 @@ func TestFixSizingResumeKeepsCompletedCommitAndRechecksUnfinishedCause(t *testin
 		t.Fatalf("retry replayed repairs or failed to validate: calls=%v outcome=%+v error=%v", calls, outcome, err)
 	}
 }
+
+func TestFixSizingMarkerAloneDoesNotLaunchARepair(t *testing.T) {
+	dir, base, head := setupGitRepo(t)
+	calls := 0
+	ag := &mockAgent{name: "test", runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+		calls++
+		return &agent.Result{Output: []byte(`{"summary":"a warning is not a repair"}`)}, nil
+	}}
+	sctx := newTestContextWithDBRecords(t, ag, dir, base, head, config.Commands{})
+	bindStepResult(t, sctx, types.StepReview)
+	sctx.Fixing = true
+	sctx.PreviousFindings = `{"findings":[{"id":"fix-estimate-exceeds-deadline","description":"repair was not launched","action":"ask-user"}]}`
+	_, err := (&ReviewStep{}).Execute(sctx)
+	if calls != 0 || err == nil {
+		t.Fatalf("scheduling warning dispatched as a cause: calls=%d error=%v", calls, err)
+	}
+}

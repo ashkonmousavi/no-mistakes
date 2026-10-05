@@ -52,6 +52,10 @@ metadata:
 Multi-cause Review and CI verify once after the batch; Test retains its baseline/evidence turn and all new-test paths.
 CI calls its usual final `recordRepair` policy once and never publishes an intermediate unit.
 The executor still owns the one round and its limits.
+Before a checkpointed repair launch, `sizeFixCall` compares a size-scaled successful repair maximum (repository/step/adapter) with the existing absolute bound minus a 10% margin, respecting inherited deadlines and working caps.
+Absent timing is explicitly an unmeasured size heuristic, never a successful measurement.
+An oversized individual cause parks before launch and is not decomposed; `HasFixSizingRefusal` keeps AXI/TUI automatic responses and gate reconciliation from resolving it.
+The scheduling marker is excluded from repair selection and review carry, while original findings and applied receipts keep their existing authority rules.
 - `PrepareFixContinuation` validates original scoped identity/instructions, exact refs and parent, skips only applied edit turns, and leaves independent findings/validation intact.
 `ContinuationCompleted` closes a completed repair attempt so re-reported defects start fresh work; AXI's `validation_pending` remains tied to the actual step status.
 `InheritedFixSelection` carries only unfinished causes into a verified matching rerun, and the executor runs the required independent gates afterwards.

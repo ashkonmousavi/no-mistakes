@@ -12,12 +12,16 @@ import (
 // actions may change at a timeout gate; cause identity and human instructions
 // cannot. Receipt completion excludes dispatch, never independent validation.
 func (sctx *StepContext) PrepareFixContinuation(step types.StepName, requested types.Findings) (types.Findings, error) {
+	requestedCount := len(requested.Items)
 	for i := 0; i < len(requested.Items); {
 		if requested.Items[i].ID == FixSizingFindingID {
 			requested.Items = append(requested.Items[:i], requested.Items[i+1:]...)
 		} else {
 			i++
 		}
+	}
+	if requestedCount > 0 && len(requested.Items) == 0 {
+		return requested, fmt.Errorf("select original finding IDs to retry; a repair sizing warning is not a repair cause")
 	}
 	requested = types.NormalizeFindings(requested, string(step))
 	raw, err := types.MarshalFindingsJSON(requested)

@@ -392,6 +392,13 @@ Immediate, startup, and retention cleanup must preserve dirty bytes durably or r
 For the saved and retained fields, see [`axi status`](/no-mistakes/reference/cli/#no-mistakes-axi-status).
 
 Review, Test, and CI repair each selected finding's cause in a separate bounded editing turn, including its sibling sites.
+Before each checkpointed repair call, the pipeline logs a time estimate from successful applied units for this repository, step, and adapter, scaled by the authorized finding's size in blocks of 1024 runes of JSON.
+It uses the slowest measured time per block; failed turns and older receipts without timing contribute no fabricated measurements.
+Without measurements, the explicitly unmeasured size estimate reserves one quarter of the call's absolute bound per block, capped at five minutes per block.
+The usable time is the existing absolute invocation bound minus a 10% safety margin: an inherited deadline wins, otherwise a larger configured working cap applies, or the silent budget is the absolute bound.
+An estimate beyond the usable time parks the finding before agent launch, preserves completed checkpoints and all outstanding findings, and requires an explicit response; `--yes` and TUI automatic approval leave this gate parked.
+Inspect the scope or adjust the existing invocation budget before explicitly retrying the original finding IDs.
+The pipeline neither combines findings nor decomposes an individual cause, and an estimate does not guarantee completion before the deadline.
 The pipeline uses normal staging and configured correction messages, creates an exact local checkpoint ref under `refs/no-mistakes/fix/<run>/<step>/<selection>/<ordinal>`, and records the completed unit before starting the next one.
 A completed no-change unit records progress without creating a commit.
 Applied units remain unverified until the existing validation completes; they do not clear findings or confer approval.
