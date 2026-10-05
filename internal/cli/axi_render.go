@@ -506,6 +506,8 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 			toon.Field{Key: "sha", Value: p.SHA},
 			toon.Field{Key: "parent_head", Value: p.ParentHead},
 			toon.Field{Key: "source_run", Value: p.RunID},
+			toon.Field{Key: "consumed_by", Value: p.ConsumedBy},
+			toon.Field{Key: "consumption_completed", Value: p.ConsumptionCompleted},
 			toon.Field{Key: "path", Value: p.Path},
 			toon.Field{Key: "reason", Value: p.Reason},
 		)})
@@ -593,6 +595,12 @@ func gateFields(gate stepView) []toon.Field {
 		}
 	}
 	skip := "Run `no-mistakes axi respond --action skip` to skip this step"
+	if pipeline.HasFixSizingRefusal(gate.FindingsJSON) {
+		help = []string{
+			"The fixer was not launched because its estimate exceeded the invocation deadline after a safety margin. Completed correction commits and outstanding findings are preserved.",
+			"Inspect the finding's scope or adjust the existing invocation budget, then explicitly retry with `no-mistakes axi respond --action fix --findings <original finding ids>`. No cause is automatically decomposed or retried.",
+		}
+	}
 	if pipeline.HasUnvalidatedWorkRefusal(gate.FindingsJSON) {
 		help = []string{
 			"Approve is rejected: the run worktree holds work a timed-out Test agent left that no Test turn validated, and approval would publish it. The findings name that work and how to inspect it.",

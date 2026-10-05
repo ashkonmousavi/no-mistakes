@@ -191,6 +191,17 @@ Run the pipeline and decide on its findings as they come up:
    pending validation, not cleared findings. Review, Test and CI checkpoint
    each completed cause before another repair starts; CI checkpoints stay local
    until the completed batch follows its usual final publication policy.
+   A `fix-estimate-exceeds-deadline` gate means the fixer was not
+   launched: its measured or explicitly unmeasured size estimate exceeded
+   the existing invocation deadline after a safety margin. Inspect scope or
+   adjust the existing invocation budget, then explicitly retry the original
+   finding IDs. Automatic approval leaves this gate parked; the scheduling
+   warning is not a repair cause. Completed checkpoints remain stored.
+   Fix continues only the unfinished causes in the original selected scope,
+   and rerun can restore a matching terminal snapshot at its exact parent.
+   Changed scope, ownership, intent or refs refuse restoration; inspect that
+   evidence instead of restarting from an older submission. Consumed refs
+   stay local. Completion of an edit turn never replaces independent validation.
 2. If the output contains a `gate:` object, the pipeline is waiting on you.
    Read its `findings` table. Each finding has an `id`, `severity`,
    `file`, `description`, and an `action` that tells you how the

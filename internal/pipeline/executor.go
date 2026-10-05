@@ -255,6 +255,52 @@ func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, work
 		stepRecords[step.Name()] = sr
 	}
 
+	inherited, err := e.db.InheritedWorkRescue(run.ID)
+	if err != nil {
+		return e.failRun(run, repo, err)
+	}
+	var inheritedState stepExecutionState
+	inheritedIndex := -1
+	if inherited != nil && !inherited.ConsumptionCompleted {
+		if err = ValidateInheritedWork(ctx, e.db, run, workDir, inherited); err != nil {
+			return e.failRun(run, repo, err)
+		}
+		selected, err := InheritedFixSelection(e.db, inherited)
+		if err != nil {
+			return e.failRun(run, repo, err)
+		}
+		raw, err := types.MarshalFindingsJSON(selected)
+		if err != nil {
+			return e.failRun(run, repo, err)
+		}
+		inheritedState = stepExecutionState{fixing: true, previousFindings: raw, outstandingFindings: raw, continued: true}
+		for _, f := range selected.Items {
+			inheritedState.selectedOutstandingIDs = append(inheritedState.selectedOutstandingIDs, f.ID)
+		}
+		inheritedIndex, err = e.stepIndex(types.StepName(inherited.Step))
+		if err != nil {
+			return e.failRun(run, repo, err)
+		}
+		if e.skips[types.StepName(inherited.Step)] {
+			return e.failRun(run, repo, fmt.Errorf("cannot skip unfinished rescue %s", inherited.Ref))
+		}
+		if err = e.db.StartStepFixRound(stepRecords[e.steps[inheritedIndex].Name()].ID, e.autoFixLimit(e.steps[inheritedIndex].Name())); err != nil {
+			return e.failRun(run, repo, err)
+		}
+		if inherited.Step != string(types.StepReview) {
+			if _, _, err = e.executeStep(ctx, e.steps[inheritedIndex], stepRecords[e.steps[inheritedIndex].Name()], run, repo, workDir, logDir, inheritedState); err != nil {
+				return e.failRun(run, repo, err, ctx)
+			}
+			if err = CompleteInheritedWork(ctx, e.db, run, workDir, inherited); err != nil {
+				return e.failRun(run, repo, err, ctx)
+			}
+			if err = e.db.ResetStepsFrom(run.ID, types.StepReview.Order()); err != nil {
+				return e.failRun(run, repo, err, ctx)
+			}
+			inheritedIndex = -1
+		}
+	}
+
 	// Execute steps sequentially. A late repair may send the same run back
 	// through validation before any new head is published.
 	revalidating := false
@@ -279,6 +325,9 @@ func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, work
 		if err != nil {
 			return e.failRun(run, repo, fmt.Errorf("restore step %s execution state: %w", step.Name(), err), ctx)
 		}
+		if i == inheritedIndex {
+			state = inheritedState
+		}
 		if revalidating && step.Name() == types.StepReview {
 			state.outstandingFindings = ""
 			state.selectedOutstandingIDs = nil
@@ -286,6 +335,12 @@ func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, work
 		skipRemaining, restartFrom, err := e.executeStep(ctx, step, sr, run, repo, workDir, logDir, state)
 		if err != nil {
 			return e.failRun(run, repo, err, ctx)
+		}
+		if i == inheritedIndex {
+			if err = CompleteInheritedWork(ctx, e.db, run, workDir, inherited); err != nil {
+				return e.failRun(run, repo, err, ctx)
+			}
+			inheritedIndex = -1
 		}
 		if skipRemaining {
 			// Mark all subsequent steps as skipped
@@ -346,7 +401,8 @@ func (e *Executor) initializeRunScopes(runID string) {
 }
 
 type stepExecutionState struct {
-	fixing bool
+	continued bool
+	fixing    bool
 	// skipFixExecution replays an already-completed fix round's review turn
 	// only, mirroring what the live loop sets alongside an answer. It exists so
 	// a recovered answer round can inherit its gate's fix-round context without
@@ -447,6 +503,9 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	parkStart := time.Unix(*run.AwaitingAgentSince, 0)
 	duration := recoveredStepDuration(gate.stepResult)
 	completeRecoveredGate := func() error {
+		if err := e.completeInheritedStep(ctx, run, workDir, gate.step.Name()); err != nil {
+			return err
+		}
 		if gate.step.Name() == types.StepReview {
 			if gate.reviewedHeadSHA == "" {
 				return fmt.Errorf("recovered review has no durable reviewed head candidate")
@@ -529,6 +588,9 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	)
 
 	response, reconciled, err := e.waitForApprovalOrReconcile(ctx, gate.step, reconcileCtx, gate.findings, false)
+	if err != nil && errors.Is(context.Cause(ctx), ErrDaemonShutdown) {
+		return ErrRunSuspended
+	}
 	if dbErr := e.db.CompleteRunAwaitingAgent(run.ID, time.Since(parkStart).Milliseconds()); dbErr != nil {
 		slog.Warn("failed to complete awaiting-agent state in db", "step", gate.step.Name(), "run", run.ID, "error", dbErr)
 	}
@@ -1108,6 +1170,9 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	// Every step, not just review: the steps that used to re-apply a declined
 	// change were precisely the ones a decision never reached.
 	BindBranchDecisions(sctx)
+	if err := sctx.BindInheritedWork(); err != nil {
+		return false, "", err
+	}
 
 	// The entry trigger has to read BOTH pieces of state, not just Fixing.
 	// Resume's ActionAnswer branch sets answering and deliberately leaves
@@ -1126,6 +1191,8 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	// round - which IsFixRound then reads as one.
 	case state.answering:
 		nextTrigger = "answer"
+	case state.continued:
+		nextTrigger = "user_fix"
 	case sctx.Fixing:
 		nextTrigger = "auto_fix"
 	}
@@ -1143,6 +1210,9 @@ rounds:
 		sctx.ReviewStartingHeadSHA = reviewStartingHeadSHA
 		outcome, err := step.Execute(sctx)
 		if refusal := ProtectedPathOutcome(err); refusal != nil {
+			outcome, err = refusal, nil
+		}
+		if refusal := FixSizingOutcome(err, sctx); refusal != nil {
 			outcome, err = refusal, nil
 		}
 		roundNum++
@@ -1214,6 +1284,8 @@ rounds:
 					writeLog(fmt.Sprintf("answers retracted finding %s: %s", w.ID, safeurl.RedactText(reason)))
 				}
 			}
+			outstandingFindings = DropFixSizingRefusal(outstandingFindings)
+			verificationFindings = DropFixSizingRefusal(verificationFindings)
 			outstandingFindings = resolveVerifiedFindingsJSON(outstandingFindings, pendingVerificationIDs, outcome.ReviewedPaths, outcome.ReviewablePaths, verificationFindings)
 			pendingVerificationIDs = retainFindingIDs(outstandingFindings, pendingVerificationIDs)
 			selectedOutstandingIDs = retainFindingIDs(outstandingFindings, selectedOutstandingIDs)
@@ -1362,6 +1434,9 @@ rounds:
 			e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(approvalStatus), effectiveFindings, "", &executionMS)
 
 			response, reconciled, err := e.waitForApprovalOrReconcile(ctx, step, sctx, effectiveFindings, true)
+			if err != nil && errors.Is(context.Cause(ctx), ErrDaemonShutdown) {
+				return false, "", ErrRunSuspended
+			}
 			if dbErr := e.db.CompleteRunAwaitingAgent(run.ID, time.Since(parkStart).Milliseconds()); dbErr != nil {
 				slog.Warn("failed to complete awaiting-agent state in db", "step", stepName, "run", run.ID, "error", dbErr)
 			}
@@ -1521,6 +1596,9 @@ rounds:
 	}
 
 done:
+	if err := e.completeInheritedStep(ctx, run, workDir, stepName); err != nil {
+		return false, "", err
+	}
 	// Mark step completed with execution-only timing.
 	durationMS := executionMS + time.Since(phaseStart).Milliseconds()
 	if durationOverrideMS > 0 {
@@ -1850,7 +1928,7 @@ func (e *Executor) resumeApprovalGate(ctx context.Context, step Step, sctx *Step
 	if !ok {
 		return "", false, nil
 	}
-	if HasProtectedPathRefusal(findingsJSON) {
+	if HasProtectedPathRefusal(findingsJSON) || HasFixSizingRefusal(findingsJSON) {
 		return "", false, nil
 	}
 	timeout := e.gateReconcileTimeout
@@ -1869,7 +1947,7 @@ func (e *Executor) reconcileApprovalGate(ctx context.Context, step Step, sctx *S
 	if !ok {
 		return false, nil
 	}
-	if HasProtectedPathRefusal(findingsJSON) {
+	if HasProtectedPathRefusal(findingsJSON) || HasFixSizingRefusal(findingsJSON) {
 		return false, nil
 	}
 	timeout := e.gateReconcileTimeout
@@ -1887,6 +1965,9 @@ func (e *Executor) reconcileApprovalGate(ctx context.Context, step Step, sctx *S
 // It accepts an optional context; if the context was cancelled with a cause,
 // the cause message is used as the run's error (more informative than "context canceled").
 func (e *Executor) failRun(run *db.Run, repo *db.Repo, err error, ctxs ...context.Context) error {
+	if errors.Is(err, ErrRunSuspended) {
+		return err
+	}
 	errMsg := err.Error()
 	for _, ctx := range ctxs {
 		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
@@ -1917,8 +1998,14 @@ func (e *Executor) failRun(run *db.Run, repo *db.Repo, err error, ctxs ...contex
 }
 
 func (e *Executor) completeRun(run *db.Run, repo *db.Repo) error {
+	p, err := e.db.InheritedWorkRescue(run.ID)
+	if err != nil {
+		return err
+	}
+	if p != nil && !p.ConsumptionCompleted {
+		return fmt.Errorf("unfinished inherited rescue %s cannot become a successful run", p.Ref)
+	}
 	verifiedHead, verified := e.reconcileTerminalRunHead(run)
-	var err error
 	if verified {
 		err = e.db.UpdateRunStatusWithVerifiedHead(run.ID, types.RunCompleted, verifiedHead)
 	} else {
@@ -2270,4 +2357,15 @@ func (e *Executor) ReviewConversationAnswerDir(runID string) string {
 		return ""
 	}
 	return dir
+}
+
+func (e *Executor) completeInheritedStep(ctx context.Context, run *db.Run, dir string, step types.StepName) error {
+	p, err := e.db.InheritedWorkRescue(run.ID)
+	if err != nil {
+		return err
+	}
+	if p != nil && p.Step == string(step) && !p.ConsumptionCompleted {
+		return CompleteInheritedWork(ctx, e.db, run, dir, p)
+	}
+	return nil
 }

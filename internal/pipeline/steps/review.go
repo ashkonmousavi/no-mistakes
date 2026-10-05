@@ -186,6 +186,9 @@ Previous review findings to address:
 			Workload:                workload,
 		})
 		if err != nil {
+			if outcome := pipeline.FixSizingOutcome(err, sctx); outcome != nil {
+				return outcome, nil
+			}
 			return nil, err
 		}
 		fixSummary = summary
@@ -531,6 +534,9 @@ Risk assessment (after listing all findings):
 			sctx.Log(uncoveredReviewMessage(findings.ReviewedPaths, reviewable))
 			needsApproval = true
 		}
+	}
+	if err := sctx.FinishFixValidation(s.Name()); err != nil {
+		return nil, err
 	}
 	findingsJSON, _ := json.Marshal(findings)
 

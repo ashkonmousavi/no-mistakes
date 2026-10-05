@@ -506,12 +506,22 @@ func executeFixMode(sctx *pipeline.StepContext, stepName types.StepName, opts fi
 		}
 	}
 	selected = types.NormalizeFindings(selected, string(stepName))
+	if len(selected.Items) > 0 {
+		var err error
+		selected, err = sctx.PrepareFixContinuation(stepName, selected)
+		if err != nil {
+			return "", err
+		}
+	}
 	if len(selected.Items) == 0 || (len(selected.Items) == 1 && sctx.StepResultID == "") {
 		return executeFixTurn(sctx, stepName, opts)
 	}
 	defer func() { sctx.CurrentFixUnit = nil; sctx.FixSelectionID = "" }()
 	changed := false
 	for i, finding := range selected.Items {
+		if sctx.FixAppliedOrdinals[i+1] {
+			continue
+		}
 		if err := sctx.BeginFixUnit(stepName, finding, i+1, len(selected.Items)); err != nil {
 			return "", err
 		}
@@ -538,6 +548,7 @@ func executeFixMode(sctx *pipeline.StepContext, stepName types.StepName, opts fi
 			return "", err
 		}
 	}
+	sctx.CompletedFixSelectionID = sctx.FixSelectionID
 	return fixResultSummary(changed), nil
 }
 

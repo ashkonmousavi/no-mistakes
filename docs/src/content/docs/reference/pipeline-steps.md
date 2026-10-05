@@ -392,6 +392,13 @@ Immediate, startup, and retention cleanup must preserve dirty bytes durably or r
 For the saved and retained fields, see [`axi status`](/no-mistakes/reference/cli/#no-mistakes-axi-status).
 
 Review, Test, and CI repair each selected finding's cause in a separate bounded editing turn, including its sibling sites.
+Before each checkpointed repair call, the pipeline logs a time estimate from successful applied units for this repository, step, and adapter, scaled by the authorized finding's size in blocks of 1024 runes of JSON.
+It uses the slowest measured time per block; failed turns and older receipts without timing contribute no fabricated measurements.
+Without measurements, the explicitly unmeasured size estimate reserves one quarter of the call's absolute bound per block, capped at five minutes per block.
+The usable time is the existing absolute invocation bound minus a 10% safety margin: an inherited deadline wins, otherwise a larger configured working cap applies, or the silent budget is the absolute bound.
+An estimate beyond the usable time parks the finding before agent launch, preserves completed checkpoints and all outstanding findings, and requires an explicit response; `--yes` and TUI automatic approval leave this gate parked.
+Inspect the scope or adjust the existing invocation budget before explicitly retrying the original finding IDs.
+The pipeline neither combines findings nor decomposes an individual cause, and an estimate does not guarantee completion before the deadline.
 The pipeline uses normal staging and configured correction messages, creates an exact local checkpoint ref under `refs/no-mistakes/fix/<run>/<step>/<selection>/<ordinal>`, and records the completed unit before starting the next one.
 A completed no-change unit records progress without creating a commit.
 Applied units remain unverified until the existing validation completes; they do not clear findings or confer approval.
@@ -400,6 +407,20 @@ Test keeps its configured command baseline and evidence turn, including new regr
 CI intermediate checkpoints stay local; the existing final publish or revalidation policy runs once for the completed batch.
 An external CI no-code conclusion still parks for a decision rather than counting as an applied repair.
 All these calls belong to the executor's one existing fix round and do not change automatic round limits.
+
+An explicit Fix response continues the original selected scope using exact applied receipts, excluding completed editing turns while retaining independent validation.
+A cut in final verification resumes validation without repeating repairs.
+Test carries the regression paths recorded before earlier commits, including into a matching terminal rerun.
+CI restores the selected batch's original check execution freshness before inspecting unpublished intermediate heads.
+
+A matching terminal rerun verifies source refs, branch, intent, custody, and the exact saved parent before restoring working and staged bytes into its clean checkout, before preparation or agent launch.
+The inherited source's unfinished causes finish through their owning step, and the new run still executes its required independent validation.
+A new review's re-reported defect remains outstanding regardless of older applied receipts or positional IDs.
+Inherited submitted commits do not count as published: later reruns follow the verified source chain to the actual publication baseline, preserving progress after repeated cuts.
+Restore never cherry-picks a rescue into HEAD and never executes checkout filters.
+A second restore accepts only the complete matching working/index state; an incomplete or conflicting restore refuses and preserves the evidence.
+Changed instructions or intent, returned custody, divergent author work, uncertain writers, unsupported Git state, and mismatched or symbolic refs refuse automatic continuation.
+Consumed refs remain local and reachable; consumption is not approval or permission to publish.
 
 Each step progresses through these statuses:
 

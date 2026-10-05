@@ -10,22 +10,46 @@ import (
 
 // FixCheckpoint binds one selected cause to its exact local head and anchor.
 type FixCheckpoint struct {
-	ID            string
-	RunID         string
-	Step          string
-	StepResultID  string
-	Selection     string
-	Ordinal       int
-	Total         int
-	FindingID     string
-	FindingDigest string
-	SelectionJSON string
-	ParentHead    string
-	AppliedHead   string
-	Ref           string
-	Summary       string
-	NewTests      []string
-	State         string
+	ID                    string
+	RunID                 string
+	Step                  string
+	StepResultID          string
+	Selection             string
+	Ordinal               int
+	Total                 int
+	FindingID             string
+	FindingDigest         string
+	SelectionJSON         string
+	ParentHead            string
+	AppliedHead           string
+	Ref                   string
+	Summary               string
+	NewTests              []string
+	State                 string
+	ContinuationCompleted bool
+	CISnapshotJSON        string
+	// Successful applied units supply local sizing evidence for future calls.
+	// Legacy receipts leave these unknown; no prompt or output is stored here.
+	FixDurationMS int64
+	FixSize       int
+	FixAgent      string
+}
+
+// FixDurationPerSize returns the slowest measured successful repair per size
+// unit on this repository, step and adapter. Failed and legacy turns contribute
+// no invented timing. A size unit is 1024 runes of the authorized finding JSON.
+func (d *DB) FixDurationPerSize(repoID, step, adapter string) (int64, error) {
+	var duration int64
+	err := d.sql.QueryRow(`SELECT COALESCE(MAX(
+		(json_extract(c.payload,'$.FixDurationMS') + json_extract(c.payload,'$.FixSize') - 1)
+		/ json_extract(c.payload,'$.FixSize')),0)
+		FROM fix_checkpoints c JOIN runs r ON r.id=c.run_id
+		WHERE r.repo_id=? AND c.step=?
+		AND json_extract(c.payload,'$.State')='applied'
+		AND json_extract(c.payload,'$.FixAgent')=?
+		AND json_extract(c.payload,'$.FixDurationMS')>0
+		AND json_extract(c.payload,'$.FixSize')>0`, repoID, step, adapter).Scan(&duration)
+	return duration, err
 }
 
 func (d *DB) BeginFixCheckpoint(c *FixCheckpoint) error {
@@ -105,7 +129,7 @@ func (d *DB) ApplyFixCheckpoint(c *FixCheckpoint) error {
 }
 
 func (d *DB) GetFixCheckpoints(runID, step, selection string) ([]*FixCheckpoint, error) {
-	rows, e := d.sql.Query(`SELECT payload FROM fix_checkpoints WHERE run_id=? AND (?='' OR step=?) AND (?='' OR selection_id=?) ORDER BY id`, runID, step, step, selection, selection)
+	rows, e := d.sql.Query(`SELECT payload FROM fix_checkpoints WHERE run_id=? AND (?='' OR step=?) AND (?='' OR selection_id=?) ORDER BY step,selection_id,ordinal`, runID, step, step, selection, selection)
 	if e != nil {
 		return nil, e
 	}
@@ -130,7 +154,7 @@ func (d *DB) GetFixCheckpoints(runID, step, selection string) ([]*FixCheckpoint,
 
 func (d *DB) FixProgress(runID string) (*types.FixProgress, error) {
 	var step, selection string
-	e := d.sql.QueryRow(`SELECT step,selection_id FROM fix_checkpoints WHERE run_id=? ORDER BY id DESC LIMIT 1`, runID).Scan(&step, &selection)
+	e := d.sql.QueryRow(`SELECT step,selection_id FROM fix_checkpoints WHERE run_id=? ORDER BY rowid DESC LIMIT 1`, runID).Scan(&step, &selection)
 	if errors.Is(e, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -151,7 +175,7 @@ func (d *DB) FixProgress(runID string) (*types.FixProgress, error) {
 			p.Current = c.FindingID
 		}
 	}
-	if p.Applied == p.Total && len(units) > 0 && units[0].StepResultID != "" {
+	if len(units) > 0 && units[0].StepResultID != "" {
 		step, err := d.GetStepResult(units[0].StepResultID)
 		if err != nil {
 			return nil, err
@@ -167,4 +191,44 @@ func (d *DB) UnfinishedFixBatch(runID string) (bool, error) {
 	var n int
 	e := d.sql.QueryRow(`SELECT COUNT(*) FROM (SELECT selection_id,step, MAX(json_extract(payload,'$.Total')) AS total, SUM(CASE WHEN json_extract(payload,'$.State')='applied' THEN 1 ELSE 0 END) AS applied FROM fix_checkpoints WHERE run_id=? GROUP BY selection_id,step) WHERE applied<total`, runID).Scan(&n)
 	return n > 0, e
+}
+
+// FinishFixValidation records a finished validation attempt, never approval.
+func (d *DB) FinishFixValidation(runID, step, selection, head string) error {
+	if selection == "" {
+		return nil
+	}
+	units, err := d.GetFixCheckpoints(runID, step, selection)
+	if err != nil {
+		return err
+	}
+	if len(units) == 0 {
+		return fmt.Errorf("missing repair selection")
+	}
+	last := units[len(units)-1]
+	if len(units) != last.Total || last.AppliedHead != head {
+		return fmt.Errorf("unfinished repair selection cannot finish validation: units=%d total=%d recorded_head=%s validation_head=%s", len(units), last.Total, last.AppliedHead, head)
+	}
+	for _, c := range units {
+		if c.State != "applied" {
+			return fmt.Errorf("unfinished repair unit %s", c.FindingID)
+		}
+	}
+	last.ContinuationCompleted = true
+	raw, err := json.Marshal(last)
+	if err != nil {
+		return err
+	}
+	res, err := d.sql.Exec(`UPDATE fix_checkpoints SET payload=? WHERE id=? AND EXISTS(SELECT 1 FROM runs WHERE id=? AND head_sha=?)`, string(raw), last.ID, runID, head)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("validation head changed")
+	}
+	return nil
 }

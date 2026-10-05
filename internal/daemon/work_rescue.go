@@ -17,6 +17,19 @@ func workRescueCleanupReason(d *db.DB, runID, dir string) string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	inherited, err := d.InheritedWorkRescue(runID)
+	if err != nil {
+		return fmt.Sprintf("cannot read inherited work; retained %s: %v", dir, err)
+	}
+	if inherited != nil && !inherited.ConsumptionCompleted {
+		run, e := d.GetRun(runID)
+		if e != nil || run == nil {
+			return fmt.Sprintf("cannot bind inherited work; retained %s: %v", dir, e)
+		}
+		if e = pipeline.ValidateInheritedWork(ctx, d, run, dir, inherited); e != nil {
+			return fmt.Sprintf("inherited work invalid; retained %s: %v", dir, e)
+		}
+	}
 	p, err := d.LatestWorkRescue(runID)
 	if err != nil {
 		return fmt.Sprintf("cannot read partial work; retained %s: %v", dir, err)

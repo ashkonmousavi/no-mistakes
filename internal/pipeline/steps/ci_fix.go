@@ -76,6 +76,28 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 		sctx.Log("fix requested with no CI findings to repair, resuming monitoring...")
 		return nil, nil
 	}
+	if s.observedCompletedAt == nil && sctx.CIFixSnapshotJSON != "" {
+		if err := json.Unmarshal([]byte(sctx.CIFixSnapshotJSON), &s.observedCompletedAt); err != nil {
+			return nil, err
+		}
+	}
+	if s.observedCompletedAt == nil {
+		progress, e := sctx.DB.FixProgress(sctx.Run.ID)
+		if e != nil {
+			return nil, e
+		}
+		if progress != nil && progress.Step == string(types.StepCI) && progress.ValidationPending {
+			units, e := sctx.DB.GetFixCheckpoints(sctx.Run.ID, string(types.StepCI), progress.Selection)
+			if e != nil {
+				return nil, e
+			}
+			if len(units) > 0 && units[0].CISnapshotJSON != "" {
+				if e = json.Unmarshal([]byte(units[0].CISnapshotJSON), &s.observedCompletedAt); e != nil {
+					return nil, e
+				}
+			}
+		}
+	}
 	if len(targets.Checks) > 0 && s.observedCompletedAt == nil {
 		expectedHeadSHA, err := stepGitHeadSHA(sctx)
 		if err != nil {
@@ -92,12 +114,20 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 		}
 		s.observedCompletedAt = terminalFailureCompletionTimes(checks)
 	}
+	snapshot, e := json.Marshal(s.observedCompletedAt)
+	if e != nil {
+		return nil, e
+	}
+	sctx.CIFixSnapshotJSON = string(snapshot)
 	issueDesc := targets.description()
 	sctx.Log(fmt.Sprintf("repairing: %s...", issueDesc))
 	previousHeadSHA := sctx.Run.HeadSHA
 	fixKey := encodeLastFixedChecks(targets.Checks, targets.MergeConflict)
 	fixCompletedAt := completionTimesForTargets(s.observedCompletedAt, targets.Checks)
 	repair, err := s.autoFixCI(sctx, host, pr, targets)
+	if outcome := pipeline.FixSizingOutcome(err, sctx); outcome != nil {
+		return outcome, nil
+	}
 	if outcome := pipeline.ProtectedPathOutcome(err); outcome != nil {
 		return ciTerminalRepairOutcome(outcome, targets.Findings, sctx.DeferredFindings), nil
 	}
@@ -172,14 +202,22 @@ func (s *CIStep) autoFixCI(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR
 	if len(targets.Findings.Items) == 0 || sctx.StepResultID == "" {
 		return s.autoFixCITurn(sctx, host, pr, targets, "")
 	}
+	selected, err := sctx.PrepareFixContinuation(types.StepCI, targets.Findings)
+	if err != nil {
+		return ciRepairResult{}, err
+	}
+	targets.Findings = selected
 	defer func() { sctx.CurrentFixUnit = nil; sctx.FixSelectionID = "" }()
-	start := sctx.Run.HeadSHA
+	start := sctx.FixStartingHead
 	var summaries []string
 	var logContext string
 	if host.Capabilities().FailedCheckLogs {
 		logContext = fetchCILogOutput(sctx.Ctx, host, pr, sctx.Run.Branch, start, targets.Checks, 32*1024)
 	}
 	for i, finding := range targets.Findings.Items {
+		if sctx.FixAppliedOrdinals[i+1] {
+			continue
+		}
 		if err := sctx.BeginFixUnit(types.StepCI, finding, i+1, len(targets.Findings.Items)); err != nil {
 			return ciRepairResult{}, err
 		}
@@ -210,6 +248,10 @@ func (s *CIStep) autoFixCI(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR
 		return ciRepairResult{}, nil
 	}
 	repair, err := s.recordRepair(sctx, sctx.Run.HeadSHA)
+	if err == nil {
+		sctx.CompletedFixSelectionID = sctx.FixSelectionID
+		err = sctx.FinishFixValidation(types.StepCI)
+	}
 	repair.Summary = strings.Join(summaries, "; ")
 	if repair.Revalidate {
 		pipeline.PersistUncertifiedPipelineRange(sctx, start, sctx.Run.HeadSHA)
