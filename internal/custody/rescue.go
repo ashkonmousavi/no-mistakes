@@ -26,18 +26,89 @@ func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (
 		}
 	}
 	p.Ref = "refs/no-mistakes/rescue/" + runID + "/" + step + "/" + stopID
-	head, err := git.HeadSHA(ctx, dir)
+	indexTree, tree, err := capturePartialWork(ctx, dir, p)
 	if err != nil {
 		return p, err
+	}
+	headTree, err := git.Run(ctx, dir, "rev-parse", p.ParentHead+"^{tree}")
+	if err != nil {
+		return p, err
+	}
+	if p.Reason == "" && tree == headTree && indexTree == headTree {
+		p.State = "settled"
+		p.Ref = ""
+		p.IndexSHA = ""
+		p.Path = ""
+		return p, nil
+	}
+	// Stop identity records time. Fixed object dates make exact recapture
+	// idempotent even when cleanup retries later or inherited dates change.
+	identity := []string{"GIT_OPTIONAL_LOCKS=0", "GIT_AUTHOR_NAME=no-mistakes", "GIT_AUTHOR_EMAIL=local@no-mistakes.invalid", "GIT_COMMITTER_NAME=no-mistakes", "GIT_COMMITTER_EMAIL=local@no-mistakes.invalid", "GIT_AUTHOR_DATE=1970-01-01T00:00:00Z", "GIT_COMMITTER_DATE=1970-01-01T00:00:00Z"}
+	commit := func(tree string, parents ...string) (string, error) {
+		args := []string{"-c", "commit.gpgsign=false", "commit-tree", tree}
+		for _, parent := range parents {
+			args = append(args, "-p", parent)
+		}
+		args = append(args, "-m", "no-mistakes partial work "+runID+"/"+step+"/"+stopID)
+		return git.RunWithEnv(ctx, dir, identity, args...)
+	}
+	p.IndexSHA, err = commit(indexTree, p.ParentHead)
+	if err != nil {
+		return p, err
+	}
+	p.SHA, err = commit(tree, p.ParentHead, p.IndexSHA)
+	if err != nil {
+		return p, err
+	}
+	if err = PreserveRecoveryAnchor(ctx, dir, p.Ref, p.SHA); err != nil {
+		return p, err
+	}
+	if err = ValidatePartialWork(ctx, dir, p); err != nil {
+		return p, err
+	}
+	if p.Reason == "" {
+		p.State = "saved"
+		p.Path = ""
+	}
+	return p, nil
+}
+
+func PartialWorkUnchanged(ctx context.Context, dir string, p *types.PartialWork) (bool, error) {
+	if err := ValidatePartialWork(ctx, dir, p); err != nil {
+		return false, err
+	}
+	current := &types.PartialWork{}
+	indexTree, tree, err := capturePartialWork(ctx, dir, current)
+	if err != nil {
+		return false, err
+	}
+	if current.Reason != "" || current.ParentHead != p.ParentHead {
+		return false, nil
+	}
+	savedIndex, err := git.Run(ctx, dir, "rev-parse", p.IndexSHA+"^{tree}")
+	if err != nil {
+		return false, err
+	}
+	savedWork, err := git.Run(ctx, dir, "rev-parse", p.SHA+"^{tree}")
+	if err != nil {
+		return false, err
+	}
+	return indexTree == savedIndex && tree == savedWork, nil
+}
+
+func capturePartialWork(ctx context.Context, dir string, p *types.PartialWork) (string, string, error) {
+	head, err := git.HeadSHA(ctx, dir)
+	if err != nil {
+		return "", "", err
 	}
 	p.ParentHead = head
 	gitDir, err := git.Run(ctx, dir, "rev-parse", "--absolute-git-dir")
 	if err != nil {
-		return p, err
+		return "", "", err
 	}
 	scratch, err := os.MkdirTemp(gitDir, "rescue-index-")
 	if err != nil {
-		return p, err
+		return "", "", err
 	}
 	defer os.RemoveAll(scratch)
 	indexEnv := []string{"GIT_INDEX_FILE=" + filepath.Join(scratch, "index"), "GIT_OPTIONAL_LOCKS=0"}
@@ -48,10 +119,10 @@ func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (
 	// only from the best-effort snapshot; the original index must then survive.
 	entries, err := git.RunRaw(ctx, dir, "-c", "core.fsmonitor=false", "ls-files", "--stage", "-z")
 	if err != nil {
-		return p, err
+		return "", "", err
 	}
 	if _, err = run("read-tree", "--empty"); err != nil {
-		return p, err
+		return "", "", err
 	}
 	add := func(mode, blob, path string) error {
 		_, e := run("update-index", "--add", "--cacheinfo", mode, blob, path)
@@ -64,11 +135,11 @@ func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (
 		}
 		parts := strings.SplitN(entry, "\t", 2)
 		if len(parts) != 2 {
-			return p, fmt.Errorf("invalid index entry")
+			return "", "", fmt.Errorf("invalid index entry")
 		}
 		fields := strings.Fields(parts[0])
 		if len(fields) != 3 {
-			return p, fmt.Errorf("invalid index metadata")
+			return "", "", fmt.Errorf("invalid index metadata")
 		}
 		if fields[2] != "0" {
 			p.Reason = "unmerged index"
@@ -79,42 +150,27 @@ func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (
 		}
 		indexModes[parts[1]] = fields[0]
 		if err = add(fields[0], fields[1], parts[1]); err != nil {
-			return p, err
+			return "", "", err
 		}
 	}
 	indexTree, err := run("write-tree")
 	if err != nil {
-		return p, err
-	}
-	// Stop identity records time. Fixed object dates make exact recapture
-	// idempotent even when cleanup retries later or inherited dates change.
-	identity := append(indexEnv, "GIT_AUTHOR_NAME=no-mistakes", "GIT_AUTHOR_EMAIL=local@no-mistakes.invalid", "GIT_COMMITTER_NAME=no-mistakes", "GIT_COMMITTER_EMAIL=local@no-mistakes.invalid", "GIT_AUTHOR_DATE=1970-01-01T00:00:00Z", "GIT_COMMITTER_DATE=1970-01-01T00:00:00Z")
-	commit := func(tree string, parents ...string) (string, error) {
-		args := []string{"-c", "commit.gpgsign=false", "commit-tree", tree}
-		for _, parent := range parents {
-			args = append(args, "-p", parent)
-		}
-		args = append(args, "-m", "no-mistakes partial work "+runID+"/"+step+"/"+stopID)
-		return git.RunWithEnv(ctx, dir, identity, args...)
-	}
-	p.IndexSHA, err = commit(indexTree, head)
-	if err != nil {
-		return p, err
+		return "", "", err
 	}
 	if _, err = run("read-tree", "--empty"); err != nil {
-		return p, err
+		return "", "", err
 	}
 	files, err := git.RunRaw(ctx, dir, "-c", "core.fsmonitor=false", "ls-files", "--cached", "--others", "--exclude-standard", "-z")
 	if err != nil {
-		return p, err
+		return "", "", err
 	}
 	filemode, err := git.Run(ctx, dir, "config", "--type=bool", "--default", "true", "--get", "core.filemode")
 	if err != nil {
-		return p, err
+		return "", "", err
 	}
 	symlinks, err := git.Run(ctx, dir, "config", "--type=bool", "--default", "true", "--get", "core.symlinks")
 	if err != nil {
-		return p, err
+		return "", "", err
 	}
 	seen := map[string]bool{}
 	for _, name := range strings.Split(string(files), "\x00") {
@@ -128,18 +184,18 @@ func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (
 			continue
 		}
 		if e != nil {
-			return p, e
+			return "", "", e
 		}
 		mode := "100644"
 		content := abs
 		if info.Mode()&os.ModeSymlink != 0 {
 			target, e := os.Readlink(abs)
 			if e != nil {
-				return p, e
+				return "", "", e
 			}
 			content = filepath.Join(scratch, "link")
 			if e = os.WriteFile(content, []byte(target), 0o600); e != nil {
-				return p, e
+				return "", "", e
 			}
 			mode = "120000"
 		} else if info.IsDir() {
@@ -155,54 +211,29 @@ func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (
 		}
 		blob, e := run("hash-object", "-w", "--no-filters", "--", content)
 		if e != nil {
-			return p, e
+			return "", "", e
 		}
 		if e = add(mode, blob, name); e != nil {
-			return p, e
+			return "", "", e
 		}
 	}
 	ignored, err := git.RunRaw(ctx, dir, "-c", "core.fsmonitor=false", "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
 	if err != nil {
-		return p, err
+		return "", "", err
 	}
 	if len(ignored) > 0 {
 		p.Reason = "ignored files require original checkout"
 	}
 	if unfinished, e := GitOperationInProgress(ctx, dir); e != nil {
-		return p, e
+		return "", "", e
 	} else if unfinished {
 		p.Reason = "unfinished Git operation"
 	}
 	tree, err := run("write-tree")
 	if err != nil {
-		return p, err
+		return "", "", err
 	}
-	headTree, err := git.Run(ctx, dir, "rev-parse", head+"^{tree}")
-	if err != nil {
-		return p, err
-	}
-	if p.Reason == "" && tree == headTree && indexTree == headTree {
-		p.State = "settled"
-		p.Ref = ""
-		p.IndexSHA = ""
-		p.Path = ""
-		return p, nil
-	}
-	p.SHA, err = commit(tree, head, p.IndexSHA)
-	if err != nil {
-		return p, err
-	}
-	if err = PreserveRecoveryAnchor(ctx, dir, p.Ref, p.SHA); err != nil {
-		return p, err
-	}
-	if err = ValidatePartialWork(ctx, dir, p); err != nil {
-		return p, err
-	}
-	if p.Reason == "" {
-		p.State = "saved"
-		p.Path = ""
-	}
-	return p, nil
+	return indexTree, tree, nil
 }
 
 // ValidatePartialWork binds the exact non-symbolic ref and both parents.

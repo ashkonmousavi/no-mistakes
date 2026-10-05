@@ -96,8 +96,26 @@ func PreserveRunWork(ctx context.Context, d *db.DB, run *db.Run, dir string, p *
 	sweepErr := procreap.Quiesce(ctx, procreap.Options{Worktrees: []procreap.Worktree{{Dir: dir, RepoID: run.RepoID, RunID: run.ID}}, Scopes: []string{dir}})
 	var inspectErr error
 	if sweepErr == nil && quiescent {
-		var needed bool
-		needed, inspectErr = custody.WorkNeedsRescue(ctx, dir)
+		if p == nil {
+			previous, err := d.LatestWorkRescue(run.ID)
+			if err != nil {
+				return fmt.Errorf("cannot read partial work; retained %s: %w", dir, err)
+			}
+			if previous != nil {
+				if previous.State != "saved" {
+					return fmt.Errorf("partial work retained %s: %s", dir, previous.Reason)
+				}
+				unchanged, err := custody.PartialWorkUnchanged(ctx, dir, previous)
+				if err != nil {
+					inspectErr = err
+				}
+				if err == nil && unchanged {
+					return nil
+				}
+			}
+		}
+		needed, err := custody.WorkNeedsRescue(ctx, dir)
+		inspectErr = errors.Join(inspectErr, err)
 		if inspectErr == nil && !needed {
 			if p == nil {
 				return nil

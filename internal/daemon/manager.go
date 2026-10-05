@@ -661,6 +661,12 @@ func (m *RunManager) removeRunWorktree(repoID, runID, gateDir, wtDir, reason str
 		slog.Warn("preserving run worktree", "run_id", runID, "path", wtDir, "reason", refusal)
 		return
 	}
+	if run == nil {
+		if err := os.Remove(wtDir); err != nil && !os.IsNotExist(err) {
+			slog.Warn("failed to remove empty unbound storage", "path", wtDir, "error", err)
+		}
+		return
+	}
 	if err := git.WorktreeRemove(context.Background(), gateDir, wtDir); err != nil {
 		slog.Warn("failed to remove run worktree", "reason", reason, "run_id", runID, "path", wtDir, "error", err)
 	}

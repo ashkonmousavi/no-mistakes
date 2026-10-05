@@ -23,6 +23,9 @@ type PushStep struct{}
 func (s *PushStep) Name() types.StepName { return types.StepPush }
 
 func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	if err := sctx.CheckWorkRescue(); err != nil {
+		return nil, err
+	}
 	if err := assertPipelineHeadContinuity(sctx, s.Name()); err != nil {
 		return nil, err
 	}
@@ -41,6 +44,9 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 		sctx.Log(fmt.Sprintf("running formatter: %s", fmtCmd))
 		output, exitCode, err := runRepositoryCommand(sctx, "format", fmtCmd)
 		if err != nil {
+			if errors.Is(err, pipeline.ErrWorkRetained) {
+				return nil, err
+			}
 			sctx.Log(fmt.Sprintf("warning: format command failed: %v: %s", err, output))
 		} else if exitCode != 0 {
 			sctx.Log(fmt.Sprintf("warning: format command exited with code %d: %s", exitCode, output))
