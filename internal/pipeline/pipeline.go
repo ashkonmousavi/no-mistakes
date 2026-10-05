@@ -11,6 +11,10 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
+// Only a durable parked gate may suspend for graceful daemon shutdown.
+var ErrDaemonShutdown = errors.New("daemon shutting down")
+var ErrRunSuspended = errors.New("parked run suspended for daemon restart")
+
 var ErrFatalGateReconciliation = errors.New("fatal gate reconciliation")
 
 // RestartReason is a durable, machine-readable reason for restarting an
@@ -52,7 +56,14 @@ type StepContext struct {
 	DeferredFindings      string // JSON findings left unselected when the current fix round began
 	// StepResultID is the DB row ID of the current step's step_results record.
 	// Steps use it to query their own round history for multi-round prompts.
-	StepResultID string
+	CurrentFixUnit          *db.FixCheckpoint
+	FixSelectionID          string
+	CompletedFixSelectionID string
+	FixStartingHead         string
+	FixSelectionFindings    string
+	FixAppliedOrdinals      map[int]bool
+	CIFixSnapshotJSON       string
+	StepResultID            string
 	// EvidenceDir is where this run's test-evidence artifacts belong, always
 	// outside the worktree. The executor resolves it once from the app root
 	// (honoring test.evidence.local_root) so every consumer - the test step's

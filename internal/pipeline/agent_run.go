@@ -62,8 +62,12 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 		ag = sctx.Agent
 		timeout = AgentTimeout(sctx.Config)
 	}
+	if err := sctx.sizeFixCall(parent, timeout, 0); err != nil {
+		return nil, err
+	}
 	activity := observeAgentActivity(&opts)
-	return invokeAgent(parent, timeout, activity, func(ctx context.Context) (*agent.Result, error) {
+	started := time.Now()
+	result, runErr := invokeAgent(parent, timeout, activity, func(ctx context.Context) (*agent.Result, error) {
 		if sessionRole != "" && sctx != nil && sctx.Sessions != nil {
 			return sctx.Sessions.Run(ctx, ag, sessionRole, opts, sctx.Log)
 		}
@@ -72,6 +76,10 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 		}
 		return ag.Run(ctx, opts)
 	})
+	if runErr == nil && sctx != nil && sctx.CurrentFixUnit != nil {
+		sctx.CurrentFixUnit.FixDurationMS = max(int64(1), time.Since(started).Milliseconds())
+	}
+	return result, runErr
 }
 
 func invokeAgent(parent context.Context, timeout time.Duration, activity *agentActivity, run func(context.Context) (*agent.Result, error)) (*agent.Result, error) {

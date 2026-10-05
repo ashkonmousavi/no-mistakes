@@ -80,20 +80,40 @@ Rules:
 Previous test findings to address:
 ` + sanitizedPreviousFindingsForPrompt(sctx.PreviousFindings)
 		}
-		fixCtx, cancelFix, fixTimeout := testAgentContext(sctx)
+		savedTests, err := sctx.SavedFixTests(s.Name())
+		if err != nil {
+			return nil, err
+		}
+		newTestsFromFix = append(newTestsFromFix, savedTests...)
+		var fixCtx context.Context
+		var fixTimeout time.Duration
 		summary, err := executeFixMode(sctx, s.Name(), fixExecutionOptions{
 			LogMessage:      "asking agent to fix test failures...",
 			Prompt:          fixPrompt,
 			ErrorPrefix:     "agent fix tests",
 			FallbackSummary: "fix test failures",
-			AgentContext:    fixCtx,
+			RunAgent: func(runOpts agent.RunOpts) (*agent.Result, error) {
+				var cancel context.CancelFunc
+				fixCtx, cancel, fixTimeout = testAgentContext(sctx)
+				defer cancel()
+				return sctx.RunAgentContext(fixCtx, runOpts)
+			},
 			AfterAgentRun: func(*agent.Result) error {
-				newTestsFromFix = detectNewTestFiles(ctx, sctx.WorkDir)
+				paths := detectNewTestFiles(ctx, sctx.WorkDir)
+				newTestsFromFix = append(newTestsFromFix, paths...)
+				if sctx.CurrentFixUnit != nil {
+					sctx.CurrentFixUnit.NewTests = paths
+				}
 				return nil
 			},
 		})
-		cancelFix()
 		if err != nil {
+			if outcome := pipeline.FixSizingOutcome(err, sctx); outcome != nil {
+				return outcome, nil
+			}
+			if fixCtx == nil {
+				return nil, err
+			}
 			return nil, testAgentError(fixCtx, fixTimeout, "agent fix tests", err)
 		}
 		fixSummary = summary
@@ -219,6 +239,9 @@ Rules:
 		evidenceGuidance,
 		reassessHistory,
 	)
+	if len(newTestsFromFix) > 0 {
+		evidencePrompt += "\nRegression files added by the completed repair units:\n" + strings.Join(mergeNewTestFiles(newTestsFromFix, nil), "\n")
+	}
 	findings, err := runTestAnalyzer(sctx, evidencePrompt)
 	if err != nil {
 		return nil, err
@@ -250,6 +273,9 @@ Rules:
 		})
 	}
 
+	if err := sctx.FinishFixValidation(s.Name()); err != nil {
+		return nil, err
+	}
 	findingsJSON, _ := json.Marshal(findings)
 	return &pipeline.StepOutcome{
 		NeedsApproval: needsApproval,

@@ -118,7 +118,11 @@ AI code review of your diff. This is probabilistic evidence, not a security or c
 **Auto-fix:** the agent receives the selected previous findings plus any per-finding user notes, any selected user-authored findings from the TUI or AXI interface, and the shared [finding decision history](#finding-decision-history), including earlier fix summaries for this step.
 The fixer fixes the reported instance narrowly, preferring to do so by addressing a deeper architectural reason and simplifying it over introducing machinery that handles the symptoms.
 It follows the shared removal-first rule described above; the Review-specific guard against reverting the author's intentional code protects only code the intent requires, while genuine doubt about whether the intent requires a path leaves it in place and reports the finding unresolved.
-It applies all selected fixes before running one focused verification limited to the changed area, and it is instructed not to run the complete repository test or lint suite during the fix round.
+Each selected cause runs in its own editing turn and is committed and privately anchored before the next cause starts.
+The pipeline sizes each turn against its existing invocation deadline, using successful local repair timings when available and an explicitly unmeasured estimate otherwise.
+A cause that does not fit parks before launch; retry requires an explicit fix response and keeps already completed causes out of the editing loop.
+A multi-cause Review repair runs one focused verification for the union after its checkpoints, and it is instructed not to run the complete repository test or lint suite.
+Saved checkpoint scope and anchors must match on continuation; unfinished working bytes require reconciliation rather than automatic restoration.
 The dedicated Test and Lint steps after review remain the authoritative gates, although their coverage may be focused when commands are unconfigured.
 Follow-up review passes use the history to avoid re-reporting user-ignored findings unless the code now has a materially different problem.
 

@@ -71,6 +71,28 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 		sctx.Log("fix requested with no CI findings to repair, resuming monitoring...")
 		return nil, nil
 	}
+	if s.observedCompletedAt == nil && sctx.CIFixSnapshotJSON != "" {
+		if err := json.Unmarshal([]byte(sctx.CIFixSnapshotJSON), &s.observedCompletedAt); err != nil {
+			return nil, err
+		}
+	}
+	if s.observedCompletedAt == nil {
+		progress, e := sctx.DB.FixProgress(sctx.Run.ID)
+		if e != nil {
+			return nil, e
+		}
+		if progress != nil && progress.Step == string(types.StepCI) && progress.ValidationPending {
+			units, e := sctx.DB.GetFixCheckpoints(sctx.Run.ID, string(types.StepCI), progress.Selection)
+			if e != nil {
+				return nil, e
+			}
+			if len(units) > 0 && units[0].CISnapshotJSON != "" {
+				if e = json.Unmarshal([]byte(units[0].CISnapshotJSON), &s.observedCompletedAt); e != nil {
+					return nil, e
+				}
+			}
+		}
+	}
 	if len(targets.Checks) > 0 && s.observedCompletedAt == nil {
 		expectedHeadSHA, err := stepGitHeadSHA(sctx)
 		if err != nil {
@@ -87,11 +109,19 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 		}
 		s.observedCompletedAt = terminalFailureCompletionTimes(checks)
 	}
+	snapshot, err := json.Marshal(s.observedCompletedAt)
+	if err != nil {
+		return nil, err
+	}
+	sctx.CIFixSnapshotJSON = string(snapshot)
 	issueDesc := targets.description()
 	sctx.Log(fmt.Sprintf("repairing: %s...", issueDesc))
 	previousHeadSHA := sctx.Run.HeadSHA
 	fixCompletedAt := completionTimesForTargets(s.observedCompletedAt, targets.Checks)
 	repair, err := s.autoFixCI(sctx, host, pr, targets)
+	if outcome := pipeline.FixSizingOutcome(err, sctx); outcome != nil {
+		return outcome, nil
+	}
 	if outcome := pipeline.ProtectedPathOutcome(err); outcome != nil {
 		return ciTerminalRepairOutcome(outcome, targets.Findings, sctx.DeferredFindings), nil
 	}
@@ -108,6 +138,10 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 		// executor retries while auto_fix.ci allows.
 		sctx.Log(fmt.Sprintf("warning: CI fix failed: %v", err))
 		return nil, nil
+	}
+	if repair.NoCodeChangeNeeded {
+		sctx.Log(fmt.Sprintf("CI fixer concluded no code change is needed: %s", repair.Summary))
+		return ciRepairParkOutcome(targets.Findings, sctx.DeferredFindings, repair.Summary), nil
 	}
 	if repair.HeadAdvanced || sctx.Run.HeadSHA != previousHeadSHA {
 		// A conflict can be suppressed only after the repair demonstrably
@@ -142,10 +176,6 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 		}
 		return nil, nil
 	}
-	if repair.NoCodeChangeNeeded {
-		sctx.Log(fmt.Sprintf("CI fixer concluded no code change is needed: %s", repair.Summary))
-		return ciRepairParkOutcome(targets.Findings, sctx.DeferredFindings, repair.Summary), nil
-	}
 	sctx.Log("CI fix produced no changes, resuming monitoring...")
 	return nil, nil
 }
@@ -158,6 +188,77 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 // The result reports whether the recorded head advanced and whether the repair
 // must revalidate; a zero result means the agent produced no changes.
 func (s *CIStep) autoFixCI(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR, targets ciFixTargets) (ciRepairResult, error) {
+	// Budget diagnostics request another validation budget, not another repair cause.
+	var causes []types.Finding
+	for _, f := range targets.Findings.Items {
+		if f.ID != "ci-fix-agent-timeout" {
+			causes = append(causes, f)
+		}
+	}
+	targets.Findings.Items = causes
+	targets.Findings = types.NormalizeFindings(targets.Findings, "ci")
+	// Standalone/legacy callers without a persisted selection retain the original batch path.
+	if len(targets.Findings.Items) == 0 || sctx.StepResultID == "" {
+		return s.autoFixCITurn(sctx, host, pr, targets, "")
+	}
+	selected, err := sctx.PrepareFixContinuation(types.StepCI, targets.Findings)
+	if err != nil {
+		return ciRepairResult{}, err
+	}
+	targets.Findings = selected
+	defer func() { sctx.CurrentFixUnit = nil; sctx.FixSelectionID = "" }()
+	start := sctx.FixStartingHead
+	var summaries []string
+	var logContext string
+	if host.Capabilities().FailedCheckLogs {
+		logContext = fetchCILogOutput(sctx.Ctx, host, pr, sctx.Run.Branch, start, targets.Checks, 32*1024)
+	}
+	for i, finding := range targets.Findings.Items {
+		if sctx.FixAppliedOrdinals[i+1] {
+			continue
+		}
+		if err := sctx.BeginFixUnit(types.StepCI, finding, i+1, len(targets.Findings.Items)); err != nil {
+			return ciRepairResult{}, err
+		}
+		raw, err := types.MarshalFindingsJSON(types.Findings{Items: []types.Finding{finding}})
+		if err != nil {
+			return ciRepairResult{}, err
+		}
+		unit, err := parseCIFixTargets(raw)
+		if err != nil {
+			return ciRepairResult{}, err
+		}
+		repair, err := s.autoFixCITurn(sctx, host, pr, unit, logContext)
+		if err != nil {
+			return repair, err
+		}
+		if repair.NoCodeChangeNeeded {
+			return repair, nil
+		}
+		summaries = append(summaries, repair.Summary)
+	}
+	sctx.CurrentFixUnit = nil
+	if len(targets.Findings.Items) > 1 {
+		if err := verifyFixBatch(sctx, fixExecutionOptions{Prompt: ciSelectedFindingsPrompt(targets.Findings) + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx) + logContext}, "ci-fix-verification"); err != nil {
+			return ciRepairResult{}, err
+		}
+	}
+	if sctx.Run.HeadSHA == start {
+		return ciRepairResult{}, nil
+	}
+	repair, err := s.recordRepair(sctx, sctx.Run.HeadSHA)
+	if err == nil {
+		sctx.CompletedFixSelectionID = sctx.FixSelectionID
+		err = sctx.FinishFixValidation(types.StepCI)
+	}
+	repair.Summary = strings.Join(summaries, "; ")
+	if repair.Revalidate {
+		pipeline.PersistUncertifiedPipelineRange(sctx, start, sctx.Run.HeadSHA)
+	}
+	return repair, err
+}
+
+func (s *CIStep) autoFixCITurn(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR, targets ciFixTargets, logContext string) (ciRepairResult, error) {
 	ctx := sctx.Ctx
 	failingNames := targets.checkNames()
 	mergeConflict := targets.MergeConflict
@@ -177,8 +278,8 @@ func (s *CIStep) autoFixCI(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR
 	}
 
 	const maxLogBytes = 32 * 1024
-	var logOutput string
-	if host.Capabilities().FailedCheckLogs {
+	logOutput := logContext
+	if logOutput == "" && host.Capabilities().FailedCheckLogs {
 		logOutput = fetchCILogOutput(ctx, host, pr, sctx.Run.Branch, sctx.Run.HeadSHA, targets.Checks, maxLogBytes)
 	}
 
@@ -269,6 +370,12 @@ CI logs:
 	prompt += roundHistoryPromptSection(sctx)
 	prompt += userIntentPromptSection(sctx)
 	prompt += executionContextPromptSection(sctx.WorkDir)
+	if sctx.CurrentFixUnit != nil {
+		if sctx.CurrentFixUnit.Total > 1 {
+			prompt = strings.ReplaceAll(prompt, "- Verify the fix by running the most relevant commands locally before finishing.", "- This is an edit-only turn. The pipeline verifies the union once after the final checkpoint.")
+		}
+		prompt += "\nAuthorized repair finding: " + sctx.CurrentFixUnit.FindingID + ". Other selected findings are context only. Close this cause at sibling sites. Do not commit, reset, rebase or push except the selected integration operation.\nFull selected context:\n" + ciSelectedFindingsPrompt(mustParseRepairContext(sctx.PreviousFindings))
+	}
 	prompt = fixerPrompt(testguidance.LateRepairPrompt(string(s.Name()), prompt))
 
 	sctx.Log("running agent to fix CI issues...")
@@ -284,7 +391,27 @@ CI logs:
 
 	conclusion, conclusionErr := extractCIFixConclusion(result)
 	if conclusionErr != nil {
+		if sctx.CurrentFixUnit != nil && result != nil && len(result.Output) > 0 {
+			return ciRepairResult{}, conclusionErr
+		}
 		sctx.Log(fmt.Sprintf("warning: could not parse CI repair conclusion: %v", conclusionErr))
+	}
+	if sctx.CurrentFixUnit != nil {
+		if !mergeConflict && conclusion.CodeChangeNeeded != nil && !*conclusion.CodeChangeNeeded {
+			status, e := stepGitRun(sctx, "status", "--porcelain")
+			if e != nil {
+				return ciRepairResult{}, e
+			}
+			head, e := stepGitHeadSHA(sctx)
+			if e != nil {
+				return ciRepairResult{}, e
+			}
+			if status != "" || head != sctx.Run.HeadSHA {
+				return ciRepairResult{}, fmt.Errorf("no-code conclusion left changed work; validation required")
+			}
+			return ciRepairResult{NoCodeChangeNeeded: true, Summary: conclusion.Summary}, nil
+		}
+		sctx.CurrentFixUnit.Summary = conclusion.Summary
 	}
 	repair, err := s.commitRepair(sctx, conclusion.Summary)
 	var refusal *pipeline.ProtectedPathError
@@ -603,6 +730,9 @@ func (s *CIStep) commitRepair(sctx *pipeline.StepContext, summary string) (ciRep
 		if err == nil && headSHA != sctx.Run.HeadSHA {
 			return s.recordRepair(sctx, headSHA)
 		}
+		if sctx.CurrentFixUnit != nil {
+			return ciRepairResult{}, sctx.RecordFixUnitHead(sctx.Run.HeadSHA)
+		}
 		return ciRepairResult{}, nil
 	}
 
@@ -677,6 +807,16 @@ func ciRepairPolicyDescription(sctx *pipeline.StepContext) string {
 // the two paths differ in whether the repair is published now or held until
 // Review has approved it.
 func (s *CIStep) recordRepair(sctx *pipeline.StepContext, headSHA string) (ciRepairResult, error) {
+	if sctx.CurrentFixUnit != nil {
+		parent := sctx.Run.HeadSHA
+		if err := updateNonSharedBranchRef(sctx, headSHA); err != nil {
+			return ciRepairResult{}, err
+		}
+		if err := sctx.RecordFixUnitHead(headSHA); err != nil {
+			return ciRepairResult{}, err
+		}
+		return ciRepairResult{HeadAdvanced: parent != headSHA}, nil
+	}
 	if ciRevalidatesRepairs(sctx) {
 		return s.recordLocalRepair(sctx, headSHA)
 	}
@@ -892,4 +1032,9 @@ func restampPRAttestationWithSteps(ctx context.Context, host scm.Host, pr *scm.P
 		}
 	}
 	return fmt.Errorf("attestation rebind failed after %d attempts: %w", attempts, lastErr)
+}
+
+func mustParseRepairContext(raw string) types.Findings {
+	f, _ := types.ParseFindingsJSON(raw)
+	return f
 }
