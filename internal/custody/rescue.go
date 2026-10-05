@@ -178,6 +178,21 @@ func capturePartialWork(ctx context.Context, dir string, p *types.PartialWork) (
 			continue
 		}
 		seen[name] = true
+		components := strings.Split(filepath.FromSlash(name), string(filepath.Separator))
+		parent := dir
+		for _, component := range components[:len(components)-1] {
+			parent = filepath.Join(parent, component)
+			info, e := os.Lstat(parent)
+			if os.IsNotExist(e) {
+				break
+			}
+			if e != nil {
+				return "", "", e
+			}
+			if !info.IsDir() {
+				return "", "", fmt.Errorf("unsupported ancestor path %s requires original checkout", parent)
+			}
+		}
 		abs := filepath.Join(dir, filepath.FromSlash(name))
 		info, e := os.Lstat(abs)
 		if os.IsNotExist(e) {

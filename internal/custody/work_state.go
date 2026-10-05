@@ -35,12 +35,12 @@ func WorkNeedsRescue(ctx context.Context, dir string) (bool, error) {
 	} else if filters != "" {
 		return true, nil
 	}
-	index, err := git.RunRaw(ctx, dir, "-c", "core.fsmonitor=false", "ls-files", "--stage", "-z")
+	index, err := git.RunRaw(ctx, dir, "-c", "core.fsmonitor=false", "ls-files", "--stage", "-v", "-z")
 	if err != nil {
 		return true, err
 	}
 	for _, entry := range strings.Split(string(index), "\x00") {
-		if strings.HasPrefix(entry, "160000 ") {
+		if len(entry) >= 2 && (entry[0] == 'S' || (entry[0] >= 'a' && entry[0] <= 'z') || strings.HasPrefix(entry[2:], "160000 ")) {
 			return true, nil
 		}
 	}
