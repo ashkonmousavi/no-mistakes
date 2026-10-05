@@ -23,6 +23,14 @@ func (d *DB) BeginWorkRescue(run *Run, step, selection, parent, path string) (*t
 
 // SaveWorkRescue never changes the source binding or replaces saved evidence.
 func (d *DB) SaveWorkRescue(p *types.PartialWork) error {
+	if p == nil || p.Version != 1 {
+		return fmt.Errorf("unknown rescue format")
+	}
+	switch p.State {
+	case "active", "settled", "saved", "retained", "consumed":
+	default:
+		return fmt.Errorf("unknown rescue state %q", p.State)
+	}
 	tx, e := d.sql.Begin()
 	if e != nil {
 		return e
@@ -54,8 +62,12 @@ func (d *DB) SaveWorkRescue(p *types.PartialWork) error {
 
 // LatestWorkRescue exposes unfinished facts, never approval authority.
 func (d *DB) LatestWorkRescue(runID string) (*types.PartialWork, error) {
+	return d.latestWorkRescue(runID, false)
+}
+
+func (d *DB) latestWorkRescue(runID string, excludeActive bool) (*types.PartialWork, error) {
 	var raw string
-	e := d.sql.QueryRow(`SELECT payload FROM run_work_rescues WHERE run_id=? AND json_extract(payload,'$.state') IN ('active','saved','retained') ORDER BY stop_id DESC LIMIT 1`, runID).Scan(&raw)
+	e := d.sql.QueryRow(`SELECT payload FROM run_work_rescues WHERE run_id=? AND json_extract(payload,'$.state') NOT IN ('settled','consumed') AND (?=0 OR json_extract(payload,'$.state')!='active') ORDER BY stop_id DESC LIMIT 1`, runID, excludeActive).Scan(&raw)
 	if errors.Is(e, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -66,5 +78,33 @@ func (d *DB) LatestWorkRescue(runID string) (*types.PartialWork, error) {
 	if e = json.Unmarshal([]byte(raw), &p); e != nil {
 		return nil, e
 	}
+	if p.Version != 1 || p.RunID != runID {
+		return nil, fmt.Errorf("unknown or cross-bound partial work")
+	}
+	switch p.State {
+	case "active", "saved", "retained":
+	default:
+		return nil, fmt.Errorf("unknown partial work state %q", p.State)
+	}
 	return &p, nil
+}
+
+// WorkRescueStatus shares facts between daemon snapshots and disconnected AXI.
+func (d *DB) WorkRescueStatus(runID string) *types.PartialWork {
+	p, err := d.LatestWorkRescue(runID)
+	if err != nil {
+		return &types.PartialWork{RunID: runID, State: "retained", Reason: "cannot read partial work: " + err.Error()}
+	}
+	if p != nil && p.State == "active" {
+		r, err := d.GetRun(runID)
+		if err == nil && r != nil && (r.Status == types.RunRunning || r.Status == types.RunPending) {
+			previous, err := d.latestWorkRescue(runID, true)
+			if err != nil {
+				return &types.PartialWork{RunID: runID, State: "retained", Reason: "cannot read prior partial work: " + err.Error()}
+			}
+			return previous
+		}
+		p.State = "retained"
+	}
+	return p
 }

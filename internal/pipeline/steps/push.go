@@ -119,6 +119,15 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 // revalidation); pass this run's current steps (sctx.DB.GetStepsByRun) for
 // the ordinary Push step.
 func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate string, attestationSteps []*db.StepResult) error {
+	if sctx.DB != nil && sctx.Run != nil {
+		p, err := sctx.DB.LatestWorkRescue(sctx.Run.ID)
+		if err != nil {
+			return fmt.Errorf("check unfinished work before publication: %w", err)
+		}
+		if p != nil {
+			return fmt.Errorf("refusing to publish unfinished work: %s %s (source run %s)", p.State, p.Ref, p.RunID)
+		}
+	}
 	ctx := sctx.Ctx
 	ref := normalizedBranchRef(sctx.Run.Branch)
 	branch := strings.TrimPrefix(ref, "refs/heads/")
