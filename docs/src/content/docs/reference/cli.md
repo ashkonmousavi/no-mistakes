@@ -124,27 +124,51 @@ no-mistakes axi run --intent "the user's goal" --skip test,lint
 no-mistakes axi run --intent "the user's goal" --yes
 no-mistakes axi run --intent "the user's goal" --base-branch epic/foo
 no-mistakes axi run --intent "the user's goal" --no-publish-intent
+no-mistakes axi run --intent "the user's goal" --closes 95 --closes owner/repo#12
 ```
 
 | Flag            | Type     | Default | Description                                                                                          |
 | --------------- | -------- | ------- | ---------------------------------------------------------------------------------------------------- |
-| `--intent`      | `string` | (none)  | What the user set out to accomplish; required to start a new run                                     |
+| `--intent`      | `string` | (none)  | What the user set out to accomplish; `-` reads stdin to EOF; exclusive with `--intent-file` |
+| `--intent-file` | `string` | (none)  | Read intent from a file relative to the caller's working directory; exclusive with `--intent` |
 | `--verification-plan` | `string` | (none) | Path to a nonempty UTF-8 verification plan, at most 64 KiB (65,536 bytes), captured as separate evidence for a new run only |
 | `-y`, `--yes`   | `bool`   | `false` | Auto-resolve eligible gates until a decision point or outcome                                       |
 | `--skip`        | `string` | (none)  | Comma-separated pipeline steps to skip                                                               |
 | `--base-branch` | `string` | (none)  | Integration branch for this run only; overrides [`pr.base_branch`](/no-mistakes/reference/repo-config/#prbase_branch) |
 | `--no-publish-intent` | `bool` | `false` | Keep the generated `## Intent` section out of the PR body for this run; tighten-only, see below |
+| `--closes` | `string`, repeatable | (none) | GitHub issue the PR fully resolves (`95` or `owner/repo#95`); see [Closing issues](#closing-issues) |
 | `--model` | `string` | (none) | Pi provider/model ID for an immutable [per-run profile](/no-mistakes/reference/global-config/#per-run-pi-profiles) |
 | `--effort` | `string` | (none) | Pi reasoning effort for that profile; omitted fields inherit `agent_config.pi` |
 | `--wait`        | `duration` | `8m`    | Maximum time for active-run lookup and run driving before the caller must reattach |
 | `--launch-nonce` | `string` | (none) | Non-secret correlation identifier for a durable pre-drive receipt; requires `--validation-generation` |
 | `--validation-generation` | `string` | (none) | Caller-selected validation generation bound to `--launch-nonce`; requires that flag |
 
-`--intent` is not a description of the diff.
-It is the user's goal or request, and no-mistakes uses it verbatim instead of transcript inference.
+Explicit intent is the user's goal or request, not a description of the diff.
+no-mistakes uses the supplied text instead of transcript inference; see [Intent input](#intent-input) for transports and whitespace handling.
 Err on the side of completeness: include the goal, important decisions and tradeoffs, constraints or approaches ruled in or out, and explicit requests that might otherwise look surprising in the diff.
 When starting a new run, `axi run` refuses the default branch and uncommitted working trees with actionable errors instead of auto-branching or auto-committing.
-Ordinary reattachment to an in-flight run does not require `--intent`; [strict launch receipts](#strict-launch-receipts) require the original intent bytes on every retry.
+Ordinary reattachment to an in-flight run does not require intent input and never replaces that run's intent, even if new text is supplied. [Strict launch receipts](#strict-launch-receipts) require the original intent bytes on every retry, using any of the input transports below.
+
+### Intent input
+
+A new run requires exactly one of `--intent TEXT`, `--intent-file PATH`, or `--intent -` (stdin until EOF). Explicit empty or whitespace-only input is rejected, including on reattachment, and never falls back to transcript inference. `--intent` and `--intent-file` conflict even when either flag's value is empty. Missing/unreadable files and stdin read errors are rejected before starting a run or taking branch custody. No flag means stdin is not read.
+
+All three inputs must be valid UTF-8 and at most **49,122 bytes**, including whitespace. This ceiling comes from the existing single Git push-option transport: its 65,516-byte packet payload must hold the option prefix and base64-encoded intent. Oversized or malformed input is rejected before run resources open, never truncated or repaired. `--intent-file` requires a regular file (a symlink to one is allowed); directories, devices, and named pipes are rejected. Use `--intent -` for piped input: it reads until EOF, or rejects as soon as the size limit is exceeded, with no input timeout.
+
+File and stdin content reaches the existing run request unchanged, including quotes, backticks, dollar signs, Unicode, and multiline/trailing newline content. All three transports then follow the same existing run semantics: ordinary explicit intent is stored with leading/trailing whitespace removed; strict launches and runs with a verification-plan attachment preserve those bytes. This is not a universal persisted-byte guarantee. File paths are literal (`--intent-file -` names a file called `-`); only `--intent -` selects stdin. To supply the literal intent `-`, use a file or stdin.
+
+```sh
+no-mistakes axi run --intent-file ./intent.md
+no-mistakes axi run --intent - < ./intent.md
+# INTENT already contains the prose; quoting the expansion preserves it.
+printf '%s' "$INTENT" | no-mistakes axi run --intent -
+```
+
+The clean-worktree preflight still applies: keep an untracked intent file outside the worktree or ignore it.
+
+For programmatic callers, prefer a file or write the text to the process's stdin; an argument-array API without a shell also safely supports `--intent TEXT`. Avoid interpolating free-form prose into shell command source: substitutions inside double quotes (such as backticks and `$()`) run in the **caller's shell**, before no-mistakes sees the argument. File/stdin input is not shell-evaluated by no-mistakes, but does not make unrelated unsafe shell commands safe. These transports do not change intent storage, prompt use, or publication policy; they are not a privacy control. Downstream transport limits still apply.
+
+These options apply to `axi run`; the separate `no-mistakes rerun` command retains its existing inheritance and explicit-string override semantics.
 
 ### Verification plan attachment
 
@@ -152,7 +176,7 @@ Ordinary reattachment to an in-flight run does not require `--intent`; [strict l
 no-mistakes axi run --intent "the user's goal, unchanged" --verification-plan /path/to/verification-plan.txt
 ```
 
-The optional plan is author-supplied evidence, **not user intent or higher-priority instructions**. With this flag, the exact `--intent` bytes are preserved separately. Before pushing to the gate or taking branch custody, the daemon reads the source once and rejects missing, unreadable, nonregular, empty/whitespace-only, or non-UTF-8 files. Plans exceeding 64 KiB (65,536 bytes) are rejected, never truncated; accepted bytes are preserved unchanged. The read is bounded to 65,537 bytes to detect oversized input. Relative paths resolve from the caller's working directory. An older daemon that cannot capture this input is refused before the push.
+The optional plan is author-supplied evidence, **not user intent or higher-priority instructions**. With this flag, the exact intent bytes are preserved separately, as described in [Intent input](#intent-input). Before pushing to the gate or taking branch custody, the daemon reads the source once and rejects missing, unreadable, nonregular, empty/whitespace-only, or non-UTF-8 files. Plans exceeding 64 KiB (65,536 bytes) are rejected, never truncated; accepted bytes are preserved unchanged. The read is bounded to 65,537 bytes to detect oversized input. Relative paths resolve from the caller's working directory. An older daemon that cannot capture this input is refused before the push.
 
 The capture is bound to the repository, branch, and submitted commit. If HEAD advances during ordinary launch preparation and no longer matches the capture, launch is refused before changing the gate refs; retry the launch to capture the plan for the new commit.
 
@@ -164,12 +188,22 @@ Only attached runs receive plan-aware guidance. Review and Test assess the propo
 
 ### Other run options
 
-`--base-branch` is persisted on the run so rebase, PR, and CI honor it after resume.
+`--base-branch` is persisted on the run and honored after resume; the [Pipeline Steps scope rules](/no-mistakes/reference/pipeline-steps/) own its integration and change-scoping behavior.
 Reattaching with a `--base-branch` that differs from the active run's stored target is refused rather than silently discarded; omit the flag to reattach, or abort the active run first.
 `--no-publish-intent` is likewise persisted on the run, and reattaching with it against an active run started without it is refused rather than silently discarded; omit the flag to reattach, or abort the active run first.
 Before starting a run that may omit the section (this flag set, the global `intent.publish_intent` default `false`, or a global config that cannot be read), `axi run` probes the running daemon for the capability and refuses to start anything when that daemon is too old to honor it (an older daemon would silently drop the field, never read the global default, and publish); restart the daemon with the current binary. Only a run that cannot omit (flag unset, global default `true`) may reuse an older daemon. `rerun` always probes, because it inherits omission from the selected prior run and only the daemon knows that selection.
 Under the flag the PR-drafting turns receive no intent text at all and draft from the diff and commit messages only; every other step prompt keeps the full intent.
 The same omit-to-reattach rule applies to `--model`/`--effort` against an active run's [pinned Pi profile](/no-mistakes/reference/global-config/#per-run-pi-profiles); a different selection cannot change that pin.
+
+### Closing issues
+
+`--closes` declares an issue the PR fully resolves, so merging the PR closes it through GitHub's native closing keywords. Repeat it for each issue. A value is a same-repository issue number (`--closes 95`) or a cross-repository reference (`--closes owner/repo#95`); anything else, including `#95`, is rejected before a run starts. References are deduplicated case-insensitively and rendered in a deterministic order, one `Closes` line each, in the PR body's `## Issues` section (see the [PR step](/no-mistakes/reference/pipeline-steps/#pr)).
+
+`--closes` is the only way to request closure. Without it, no-mistakes never adds or infers a closing reference from the intent, commit messages, branch name, or linked issues: a PR may be partial work, so use ordinary references in your own text for that. Text the pipeline writes into the PR body never carries a live closing keyword: a reference such as `Fixes #12` in the intent or a drafted narrative is published as ``Fixes `#12` `` in an inline code span, which GitHub ignores. PR titles and commit messages are not rewritten, so a squash merge can still close an issue named after a closing keyword there.
+
+The references are persisted on the run and survive daemon restarts, fix rounds, rebases, and that run's PR-body refreshes; `no-mistakes rerun` inherits them, and its own `--closes` adds to them. They can also be passed on a plain gate push as repeated `-o no-mistakes.closes=<ref>` push options; a gate push without them starts a run with none, and its PR-body refresh drops the `## Issues` section. Reattaching with `--closes` adds references to the active run until its PR body has been composed; after that the request is refused with an explicit error rather than reported as applied. Before starting a run with `--closes`, `axi run` refuses a running daemon too old to honor it, and rejects `--closes` combined with `--skip pr` as a usage error; a run whose PR step is skipped any other way fails at that step instead (see the [PR step](/no-mistakes/reference/pipeline-steps/#pr)).
+
+`--closes` is supported on GitHub only; on another forge the PR step fails rather than publish a PR that silently closes nothing. GitHub closes the issue only when the PR merges into the repository's default branch and the issue is eligible for keyword closure; a PR merged into another branch does not close it.
 Ordinary reattachment accepts either the run's immutable submitted head or its current pipeline head, so pipeline-created fix commits do not detach an unchanged submitting worktree.
 When neither identity matches, `axi run` keeps the fresh-run path but refuses a gate push while `branch_sync` says the pipeline still owns the branch.
 That refusal returns the complete structured state and its `continue_active_run` or `recover_custody` next action instead of a raw Git non-fast-forward.
@@ -209,7 +243,7 @@ When the pipeline applied fixes, they include a `fixes` table and a `help` instr
 
 Supply `--launch-nonce` and `--validation-generation` together to bind a launch to an exact request instead of reattaching by branch and head alone.
 Both identifiers must be 1–128 ASCII characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `~`, and `-`; they are non-secret correlation values and must not contain credentials.
-This mode requires the same exact `--intent` bytes on retries.
+This mode requires the same exact intent bytes on retries, whether supplied as a string, file, or stdin.
 
 ```sh
 no-mistakes axi run --intent "the user's goal" \
@@ -284,10 +318,13 @@ no-mistakes axi answer --question q1 --answer "Keep it behind a flag" --by capta
 | `--question` | `string` | (none)             | Question ID, as carried by the review gate's `question-<id>` findings, or named by the gate's omission notice when more questions are open than the gate renders as rows; required |
 | `--answer`   | `string` | (none)             | The answer, ideally one of the question's stated options; required       |
 | `--by`       | `string` | (none)             | Who answered; recorded on the PR and in the branch's settled questions   |
+| `--wait`     | `duration` | `8m`             | Maximum time the answer that closes the last open question blocks following the run, as for `axi respond`; any other answer returns at once |
 
 The run is always the current branch's active run, and there is deliberately no `--run`: `axi`'s run resolution is branch-scoped, and this command mutates, so a second selection path could land an answer meant for one branch's reviewer on another's. Run it from a clone of the repository whose run it answers - the repository is resolved from the working directory, so a directory outside any initialized repository reports `repo not initialized` rather than answering.
 
 This is not a gate response, and `axi respond` does not accept an answer. The answer is appended to the run's review conversation immediately, so a reviewer that is still working reads it at its next checkpoint and can redirect the rest of its pass. The output reports `open_questions` and `reviewer_resumed`: once no question is open, the daemon resumes that same reviewer session with the answers so it can finish its pass, rather than the caller approving or fixing to get past the gate.
+
+The answer that closes the last open question sets the run moving again, so it then behaves exactly like `axi respond` after its response: it blocks until the next `gate:`, `checks-passed`, or final `outcome:`, bounded by `--wait`, and returns that document led by the answer's own fields. That holds whether the reviewer was already parked (`reviewer_resumed: true`) or still finishing its turn, in which case the gate resumes the reviewer itself as soon as it parks. A review gate that still carries questions right after the answer is given one [`gate_reconcile_timeout`](/no-mistakes/reference/global-config/) to leave, because a park registered just after the answer landed briefly still lists the question it closed until the daemon releases it; one still there after that asks something new and is returned. Two cases end that grace differently: a park restored by a daemon restart is not re-checked until one [`gate_reconcile_interval`](/no-mistakes/reference/global-config/) has passed, so the grace can expire before it is released and the park you just answered comes back; and a `--wait` at or below the grace elapses before the grace does, so even a genuine new question is reported as an elapsed wait rather than a `gate:`. If it returns another `gate:`, answer that gate. An answer that leaves questions open, or closes none, returns at once. An elapsed wait, and a park that came back already answered, both reattach with `axi run`, never by answering again.
 
 Every answered question is recorded per branch, so a later cold reviewer receives it as settled and does not re-raise it, and the question and answer appear in the PR body's review conversation.
 
@@ -323,7 +360,7 @@ Each row reports the whole step's elapsed time as `active_for`, the displayed ex
 `round_active_for` resets when a fix round starts; older active runs created before this timing was recorded show it as empty.
 If no activity arrives for longer than `step_quiet_warning`, `last_activity` is prefixed with `quiet`; this is only a liveness signal and does not cancel the step.
 For older active runs with no recorded activity timestamp, AXI falls back to the step log file modification time.
-Gate summaries and finding descriptions are bounded in this default status view; truncated values disclose their original length, and the gate help points to `no-mistakes axi logs --step <step> --full` for an implicitly resolved run or `no-mistakes axi logs --run <id> --step <step> --full` for an explicitly selected run.
+Finding descriptions are always rendered in full, so an `ask-user` finding can be relayed verbatim. Gate summaries are bounded in this default status view because a command gate's summary carries its command output; a truncated summary discloses its original length, and the gate help points to `no-mistakes axi logs --step <step> --full` for an implicitly resolved run or `no-mistakes axi logs --run <id> --step <step> --full` for an explicitly selected run.
 Relevant current-branch states also include a cached `branch_sync` object with full SHAs, the run's status, the persisted pipeline push binding, target kind and ref, relation, safety result, PR lifecycle, and a structured next action.
 Cached home and status rendering performs no network read and labels the remote observation `pipeline_push`; only explicit sync check or apply reports `live` freshness.
 A run holding no successful push binding - one that never published, or whose binding was released by `axi retire-custody` - has no observed remote head at all and reports `freshness: unknown` rather than claiming a push observation.
@@ -442,7 +479,7 @@ Retirement is therefore distinct from `--recover`: recovery of a pushed run keep
 
 ## no-mistakes axi logs
 
-Show the log output of one pipeline step.
+Show one pipeline step's recorded findings and log output.
 
 ```sh
 no-mistakes axi logs --step review
@@ -451,16 +488,18 @@ no-mistakes axi logs --step review --run <id>
 no-mistakes axi logs --step gate.test.mutation-budget
 ```
 
-| Flag     | Type     | Default            | Description                             |
-| -------- | -------- | ------------------ | --------------------------------------- |
-| `--step` | `string` | (none)             | Step name; required                     |
-| `--run`  | `string` | current-branch run | Run ID to inspect                       |
-| `--full` | `bool`   | `false`            | Show the entire log instead of the tail |
+| Flag     | Type     | Default            | Description                                                                          |
+| -------- | -------- | ------------------ | ------------------------------------------------------------------------------------ |
+| `--step` | `string` | (none)             | Step name; required                                                                  |
+| `--run`  | `string` | current-branch run | Run ID to inspect                                                                    |
+| `--full` | `bool`   | `false`            | Show the complete summary and the entire log instead of the bounded summary and tail |
 
 When `--run` is omitted, the run is resolved the same way as [`axi status`](#no-mistakes-axi-status): this branch's run, never another branch's.
 With `--run <id>`, logs are read from exactly that run regardless of branch.
 An unknown explicit run ID exits nonzero with `error: run "<id>" not found` instead of reporting that the current branch has no run.
-Without `--full`, long logs show the last 40 lines and a help hint for the full log; when `--run <id>` selected the log, that hint retains the same run ID.
+When the step recorded findings, the output leads with its `summary` and a `findings` table whose descriptions are always complete, including after the step's gate was resolved.
+If the recorded findings cannot be parsed, a `findings_error` field reports the parse error in their place and the step log still renders.
+Without `--full`, the summary is bounded like the gate's and long logs show the last 40 lines; when either is cut, a help hint names the `--full` command, retaining the run ID when `--run <id>` selected the log.
 Step logs include native subprocess agent lifecycle lines such as `codex started pid=4242`, `codex exited pid=4242 status=success`, and transient retry messages when the selected agent supports lifecycle events.
 They also include fix-loop markers such as `auto-fix round 1/3 starting after round 1` and `user-fix round starting after round 2`.
 `--step` accepts the nine core step names and valid repository gate names such as `gate.test.mutation-budget`. Use the exact gate name shown by `axi status`.
@@ -527,6 +566,7 @@ no-mistakes rerun
 no-mistakes rerun --intent "the revised user goal"
 no-mistakes rerun --model openai-codex/gpt-5.4 --effort high
 no-mistakes rerun --no-publish-intent
+no-mistakes rerun --closes 95
 ```
 
 `--model` and `--effort` opt this new run into a [pinned Pi profile](/no-mistakes/reference/global-config/#per-run-pi-profiles), with the same precedence and validation as `axi run`. Omitting both retains current global-config behavior; a prior run's model pin is not inherited.
@@ -563,6 +603,7 @@ use rerun to bypass a gate.
 | ---- | ---- | ------- | ----------- |
 | `--intent` | `string` | (none) | Explicit intent overriding inherited intent or fresh inference |
 | `--no-publish-intent` | `bool` | `false` | Keep the generated `## Intent` section out of the PR body for this rerun (adds to the inherited decision; tighten-only) |
+| `--closes` | `string`, repeatable | (none) | GitHub issue the PR fully resolves; adds to the [closing references](#closing-issues) inherited from the selected prior run |
 | `--model` | `string` | (none) | Pi provider/model ID for an immutable [per-run profile](/no-mistakes/reference/global-config/#per-run-pi-profiles) |
 | `--effort` | `string` | (none) | Pi reasoning effort for that profile; omitted fields inherit `agent_config.pi` |
 
@@ -702,6 +743,7 @@ Version discovery reads a `channels.json` manifest from the GitHub release-asset
 If the daemon is running from a different executable path, update still prompts before replacing it; pass `-y`/`--yes` to answer that prompt non-interactively.
 If the daemon executable path cannot be determined, the update aborts before replacement.
 If the daemon does not come back cleanly after a successful replacement, the command reports that failure.
+When the running binary resolves into `/nix/store`, update prints that self-update is unavailable for Nix installs and exits without a version check; upgrade through Nix instead (see [Installation](/no-mistakes/start-here/installation/#nix)).
 On macOS, removes the quarantine extended attribute.
 [Daemon & Worktrees](/no-mistakes/concepts/daemon/#starting-and-stopping)
 owns the active-run guard, the scope of `--force` and `--yes`, and recursive
@@ -709,7 +751,7 @@ validation-step containment.
 
 Because `update` installs the latest official release binary, the replacement binary includes the default self-hosted telemetry host and website ID. Disable telemetry with `NO_MISTAKES_TELEMETRY=0`, or override the host and website ID with `NO_MISTAKES_UMAMI_HOST` and `NO_MISTAKES_UMAMI_WEBSITE_ID`.
 
-Background update checks run automatically on each CLI invocation (except `update` itself and version queries `--version` / `-v`, which stay side-effect-free). If a newer version is available, a notification is printed to stderr. Suppressed for dev builds or when `NO_MISTAKES_NO_UPDATE_CHECK=1` is set.
+Background update checks run automatically on each CLI invocation (except `update` itself and version queries `--version` / `-v`, which stay side-effect-free). If a newer version is available, a notification is printed to stderr. Suppressed for dev builds, for Nix-store installs, or when `NO_MISTAKES_NO_UPDATE_CHECK=1` is set.
 
 ## no-mistakes daemon start
 

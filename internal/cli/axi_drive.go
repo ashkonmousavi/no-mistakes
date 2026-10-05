@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/agentcfg"
 	"github.com/kunchenguid/no-mistakes/internal/branchsync"
 	"github.com/kunchenguid/no-mistakes/internal/cimonitor"
+	"github.com/kunchenguid/no-mistakes/internal/closingissues"
 	"github.com/kunchenguid/no-mistakes/internal/daemon"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/gate"
@@ -66,10 +68,10 @@ func validateAxiWait(wait time.Duration) error {
 }
 
 func isAxiWaitElapsed(parent, drive context.Context, err error) bool {
-	if err == nil || parent.Err() != nil || drive.Err() != context.DeadlineExceeded {
+	if err == nil || parent.Err() != nil || !errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	return errors.Is(err, context.DeadlineExceeded)
+	return deadlinePassed(drive)
 }
 
 func emitAxiWaitElapsed(cmd *cobra.Command, wait time.Duration, reattach string) error {
@@ -118,13 +120,14 @@ func outcomeForRun(rv runView) string {
 func newAxiRunCmd() *cobra.Command {
 	var autoYes bool
 	var skipValue string
-	var intent string
+	var intent, intentFile string
 	var launchNonce string
 	var validationGeneration string
 	var baseBranch string
 	var noPublishIntent bool
 	var model, effort string
 	var wait time.Duration
+	var closesIssues []string
 
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -136,9 +139,15 @@ func newAxiRunCmd() *cobra.Command {
 			"accepting the result) until a decision point or outcome.\n" +
 			"Protected-path and Test unvalidated-work refusals require an explicit\n" +
 			"response, even with --yes.\n\n" +
-			"--intent is required when starting a new run: pass what the user set out\n" +
-			"to accomplish (the goal behind the change, not a description of the diff)\n" +
-			"so no-mistakes uses it directly instead of inferring it from transcripts.\n\n" +
+			"Starting a new run requires --intent TEXT, --intent-file PATH, or --intent -\n" +
+			"(read stdin to EOF). Pass what the user set out to accomplish, not a\n" +
+			"description of the diff. Inputs are mutually exclusive and must not be\n" +
+			"empty or whitespace-only; no transcript inference is used. File/stdin\n" +
+			"text reaches the run request unchanged; ordinary runs still trim outer\n" +
+			"whitespace when storing intent. Prefer file/stdin to interpolating prose\n" +
+			"into shell commands: the caller's shell can expand\n" +
+			"backticks and dollars in --intent TEXT before no-mistakes receives it.\n" +
+			"Ordinary reattachment needs no input and keeps the existing run's intent.\n\n" +
 			"--wait bounds this hold (default 8m) so an agent harness with a 10-minute\n" +
 			"tool cap gets a structured return instead of an unbounded hang. Elapsed wait\n" +
 			"is not a failed run: inspect with axi status and reattach. A slow live daemon\n" +
@@ -157,6 +166,14 @@ func newAxiRunCmd() *cobra.Command {
 			"draft from the diff and commit messages only. It is persisted on the run;\n" +
 			"the global intent.publish_intent: false default applies to runs started\n" +
 			"without it. The running daemon must honor it; an older daemon is refused.\n\n" +
+			"--closes <issue> adds a GitHub closing reference (Closes #42) to the PR\n" +
+			"body's Issues section. Repeat it for each issue the PR fully resolves; a\n" +
+			"value is an issue number or owner/repo#42. References are deduplicated,\n" +
+			"kept through that run's PR-body refreshes, inherited by rerun, and verified\n" +
+			"on the live PR; a later run started without --closes drops them. Without it\n" +
+			"no closing reference is added or inferred. GitHub closes the issue only when\n" +
+			"the PR merges into the default branch. Reattaching may add references until\n" +
+			"the PR body has been composed. It cannot be combined with --skip pr.\n\n" +
 			"--model and/or --effort opt into an immutable Pi profile for a new run.\n" +
 			"An omitted field comes from agent_config.pi; both must resolve. Requires\n" +
 			"Pi-only agents; raw native selection flags conflict. The pin outranks\n" +
@@ -171,13 +188,18 @@ func newAxiRunCmd() *cobra.Command {
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			resolvedIntent, err := resolveAxiRunIntent(cmd, intent, intentFile)
+			if err != nil {
+				return emitError(cmd, 2, err.Error())
+			}
 			return trackAxiSurface("axi-run", "/axi/run", telemetry.Fields{
 				"auto_yes":          autoYes,
-				"has_intent":        strings.TrimSpace(intent) != "",
+				"has_intent":        strings.TrimSpace(resolvedIntent) != "",
 				"has_skip":          strings.TrimSpace(skipValue) != "",
 				"has_base_branch":   strings.TrimSpace(baseBranch) != "",
 				"has_launch_nonce":  launchNonce != "",
 				"no_publish_intent": noPublishIntent,
+				"has_closes":        len(closesIssues) > 0,
 			}, func() error {
 				skipSteps, err := parseSkipSteps(skipValue)
 				if err != nil {
@@ -188,17 +210,19 @@ func newAxiRunCmd() *cobra.Command {
 				if err != nil {
 					return emitError(cmd, 2, err.Error())
 				}
-				return runAxiRunWithLaunchProof(cmd, autoYes, skipSteps, intent, baseBranch, noPublishIntent, launchNonce, validationGeneration, wait, profile)
+				return runAxiRunWithLaunchProof(cmd, autoYes, skipSteps, resolvedIntent, baseBranch, noPublishIntent, launchNonce, validationGeneration, wait, profile)
 			})
 		},
 	}
 	cmd.Flags().BoolVarP(&autoYes, "yes", "y", false, "auto-resolve eligible gates (fix findings, then accept) until a decision point or outcome; protected-path and Test unvalidated-work refusals require an explicit response")
 	cmd.Flags().StringVar(&skipValue, "skip", "", "comma-separated pipeline steps to skip")
-	cmd.Flags().StringVar(&intent, "intent", "", "what the user set out to accomplish (not a description of the diff); used instead of inferring from transcripts (required to start a run)")
+	cmd.Flags().StringVar(&intent, "intent", "", "what the user set out to accomplish; '-' reads stdin to EOF (exclusive with --intent-file)")
+	cmd.Flags().StringVar(&intentFile, "intent-file", "", "read intent from this file, relative to the current directory (exclusive with --intent)")
 	cmd.Flags().StringVar(&launchNonce, "launch-nonce", "", "opaque nonce for a daemon-bound pre-drive launch receipt")
 	cmd.Flags().StringVar(&validationGeneration, "validation-generation", "", "opaque generation bound to --launch-nonce proof mode")
 	cmd.Flags().StringVar(&baseBranch, "base-branch", "", "integration branch to open the PR against for this run only (overrides pr.base_branch)")
 	cmd.Flags().BoolVar(&noPublishIntent, "no-publish-intent", false, "keep the generated Intent section out of the PR body for this run (tighten-only; full intent still reaches every step prompt except PR drafting)")
+	cmd.Flags().StringArrayVar(&closesIssues, "closes", nil, "GitHub issue this PR closes when merged; repeat for multiple issues (42 or owner/repo#42)")
 	cmd.Flags().String("verification-plan", "", "capture a nonempty UTF-8 verification plan as separate run evidence (new runs only)")
 	bindAxiWaitFlag(cmd, &wait)
 	bindPiProfileFlags(cmd, &model, &effort)
@@ -225,6 +249,15 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 			return emitError(cmd, 2, "--verification-plan requires a file path")
 		}
 	}
+	// Validate --closes before any daemon or Git work so a malformed value
+	// never starts or touches a run.
+	closesIssues, err := closingIssueRefsFromFlags(cmd)
+	if err != nil {
+		return emitError(cmd, 2, err.Error(), "Use a positive issue number or owner/repository-qualified reference, e.g. --closes 42 --closes owner/repo#99.")
+	}
+	if len(closesIssues) > 0 && slices.Contains(skipSteps, types.StepPR) {
+		return emitError(cmd, 2, "--closes cannot be combined with --skip pr: skipping the PR step publishes no closing reference", "Drop pr from --skip, or drop --closes.")
+	}
 	ctx := cmd.Context()
 	driveCtx, cancel, err := boundAxiWait(ctx, wait)
 	if err != nil {
@@ -245,6 +278,11 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		globalCfg = nil
 	}
 	if err := requireDaemonHonorsOmitIntent(env.client, omitIntent, globalCfg); err != nil {
+		return emitError(cmd, 2, err.Error())
+	}
+	// Same reasoning: an older daemon would drop closing_issue_refs silently
+	// and open a PR that never closes the requested issues.
+	if err := requireDaemonHonorsClosingIssueRefs(env.client, closesIssues); err != nil {
 		return emitError(cmd, 2, err.Error())
 	}
 
@@ -331,8 +369,8 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		// the change's intent, so we take it directly instead of inferring it
 		// from transcripts. Reattaching to an in-flight run does not need it.
 		if strings.TrimSpace(intent) == "" {
-			return emitError(cmd, 2, "--intent is required to start a run",
-				`Pass what the user set out to accomplish: no-mistakes axi run --intent "the user's goal"`)
+			return emitError(cmd, 2, "--intent or --intent-file is required to start a run",
+				`Pass the user's goal with --intent TEXT, --intent-file PATH, or --intent - for stdin`)
 		}
 		if err := validateAxiRunBaseBranch(ctx, baseBranch); err != nil {
 			return emitError(cmd, 2, err.Error())
@@ -367,12 +405,12 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		}
 		var err error
 		if launchNonce != "" {
-			launchReceipt, err = triggerProofRun(ctx, env, branch, headSHA, skipSteps, intent, baseBranch, omitIntent, launchNonce, validationGeneration, planID, profile)
+			launchReceipt, err = triggerProofRun(ctx, env, branch, headSHA, skipSteps, intent, baseBranch, omitIntent, launchNonce, validationGeneration, planID, closesIssues, profile)
 			if err == nil {
 				runID = launchReceipt.RunID
 			}
 		} else {
-			runID, err = triggerRun(ctx, env, branch, skipSteps, intent, baseBranch, omitIntent, planID, profile)
+			runID, err = triggerRun(ctx, env, branch, skipSteps, intent, baseBranch, omitIntent, planID, closesIssues, profile)
 		}
 		if err == nil && planID != "" && runID != planID {
 			err = fmt.Errorf("launched run does not own the captured verification plan")
@@ -386,6 +424,17 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 	}
 	if launchReceipt != nil {
 		emitLaunchReceipt(cmd, *launchReceipt)
+	}
+	// Record --closes on the run whichever path selected it. A new run already
+	// carries them from its push options, so this is an idempotent check there;
+	// for a reattached or replayed run it is how they reach the PR step.
+	if err := forwardClosingIssueRefsToActiveRun(env.client, runID, closesIssues); err != nil {
+		if errors.Is(err, errClosingIssueRefsPRBodyComposed) {
+			return emitError(cmd, 1, err.Error(),
+				"The closing reference was NOT added. Add it to the PR description by hand, or pass --closes when starting a fresh run.")
+		}
+		return emitError(cmd, 1, err.Error(),
+			"Retry once the daemon is healthy; the PR will not include --closes unless this update succeeds.")
 	}
 
 	run, ciReady, err := driveRun(driveCtx, cmd.ErrOrStderr(), env.client, env.p.Socket(), runID, autoYes)
@@ -402,6 +451,79 @@ func digestLaunchIntent(intent string) string {
 	sum := sha256.Sum256([]byte(intent))
 	return fmt.Sprintf("%x", sum)
 }
+
+// closingIssueRefsFromFlags reads and canonicalizes --closes. A command
+// without the flag (tests driving runAxiRunWithLaunchProof directly) has none.
+func closingIssueRefsFromFlags(cmd *cobra.Command) ([]string, error) {
+	if cmd.Flags().Lookup("closes") == nil {
+		return nil, nil
+	}
+	values, err := cmd.Flags().GetStringArray("closes")
+	if err != nil {
+		return nil, err
+	}
+	return normalizeClosingIssueRefs(values)
+}
+
+// requireDaemonHonorsClosingIssueRefs refuses --closes before any push when
+// the running daemon predates it. Daemon requests decode JSON permissively, so
+// an older daemon would drop closing_issue_refs from the push and still open
+// the PR; it does refuse the unknown update method, which is the probe. An
+// empty update is a no-op for a daemon that knows the method.
+func requireDaemonHonorsClosingIssueRefs(client closingIssueRefsUpdateClient, refs []string) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	var result ipc.UpdateRunClosingIssueRefsResult
+	err := client.Call(ipc.MethodUpdateRunClosingIssueRefs, &ipc.UpdateRunClosingIssueRefsParams{}, &result)
+	if err == nil && !result.OK {
+		err = errors.New("daemon declined the closing-reference capability")
+	}
+	if err != nil {
+		return fmt.Errorf("the running daemon is too old to honor --closes (%v); restart it with `no-mistakes daemon restart` so the current binary serves it", err)
+	}
+	return nil
+}
+
+func normalizeClosingIssueRefs(values []string) ([]string, error) {
+	refs, err := closingissues.Normalize(values)
+	if err != nil {
+		return nil, fmt.Errorf("invalid --closes: %w", err)
+	}
+	return refs, nil
+}
+
+type closingIssueRefsUpdateClient interface {
+	Call(method string, params interface{}, result interface{}) error
+}
+
+func forwardClosingIssueRefsToActiveRun(client closingIssueRefsUpdateClient, runID string, refs []string) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	if client == nil {
+		return errors.New("forward closing issue references to active run: daemon client unavailable")
+	}
+	var result ipc.UpdateRunClosingIssueRefsResult
+	if err := client.Call(ipc.MethodUpdateRunClosingIssueRefs, &ipc.UpdateRunClosingIssueRefsParams{
+		RunID:            runID,
+		ClosingIssueRefs: refs,
+	}, &result); err != nil {
+		return fmt.Errorf("forward closing issue references to active run: %w", err)
+	}
+	if !result.OK {
+		if result.Reason == ipc.ClosingIssueRefsRejectedPRBodyComposed {
+			return errClosingIssueRefsPRBodyComposed
+		}
+		return errors.New("forward closing issue references to active run: daemon rejected update")
+	}
+	return nil
+}
+
+// errClosingIssueRefsPRBodyComposed reports that the run's PR body was already
+// composed, so --closes could not reach its Issues section. Retrying cannot help.
+var errClosingIssueRefsPRBodyComposed = errors.New(
+	"forward closing issue references to active run: the PR body was already composed, so --closes could not be applied")
 
 func configErrorForFreshAxiRun(env *axiEnv, runID string) error {
 	if runID != "" {
@@ -599,10 +721,11 @@ func freshRunBranchOwnershipState(ctx context.Context, env *axiEnv) *branchsync.
 // the gate to trigger a pipeline, and falls back to a rerun when the push was a
 // no-op (the gate already had this commit). Callers must check for an existing
 // active run first (see activeRunID) and apply pre-flight guards.
-func triggerRun(ctx context.Context, env *axiEnv, branch string, skipSteps []types.StepName, intent, baseBranch string, omitIntent bool, planID string, profiles ...*agentcfg.PiProfile) (string, error) {
+func triggerRun(ctx context.Context, env *axiEnv, branch string, skipSteps []types.StepName, intent, baseBranch string, omitIntent bool, planID string, closesIssues []string, profiles ...*agentcfg.PiProfile) (string, error) {
 	profile := agentcfg.OptionalPiProfile(profiles)
 	pushOptions := append(formatSkipPushOptions(skipSteps), formatPiProfilePushOptions(profile)...)
 	pushOptions = append(pushOptions, formatVerificationPlanPushOptions(planID)...)
+	pushOptions = append(pushOptions, formatClosingIssueRefsPushOptions(closesIssues)...)
 	if opt := formatIntentPushOption(intent); opt != "" {
 		pushOptions = append(pushOptions, opt)
 	}
@@ -694,6 +817,7 @@ func triggerRun(ctx context.Context, env *axiEnv, branch string, skipSteps []typ
 	params := rerunParams(env.repo.ID, branch, skipSteps, intent, baseBranch)
 	params.OmitIntent = omitIntent
 	params.PiProfile = profile
+	params.ClosingIssueRefs = closesIssues
 	params.VerificationPlanID = planID
 	params.CallerHeadSHA, err = rerunCallerHead(ctx)
 	if err != nil {
@@ -725,10 +849,11 @@ func claimLaunchReceipt(client *ipc.Client, repoID, branch, launchNonce, submitt
 // triggerProofRun captures the immutable submitted commit and waits only for
 // the matching nonce-bound receipt. Ordinary active-run heuristics never prove
 // strict launch identity.
-func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent, baseBranch string, omitIntent bool, launchNonce, validationGeneration, planID string, profiles ...*agentcfg.PiProfile) (*ipc.LaunchReceipt, error) {
+func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent, baseBranch string, omitIntent bool, launchNonce, validationGeneration, planID string, closesIssues []string, profiles ...*agentcfg.PiProfile) (*ipc.LaunchReceipt, error) {
 	profile := agentcfg.OptionalPiProfile(profiles)
 	pushOptions := append(formatSkipPushOptions(skipSteps), formatPiProfilePushOptions(profile)...)
 	pushOptions = append(pushOptions, formatVerificationPlanPushOptions(planID)...)
+	pushOptions = append(pushOptions, formatClosingIssueRefsPushOptions(closesIssues)...)
 	pushOptions = append(pushOptions,
 		formatIntentPushOption(intent),
 		formatLaunchNoncePushOption(launchNonce),
@@ -759,6 +884,7 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 	if err := env.client.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
 		RepoID: env.repo.ID, Branch: branch, HeadSHA: headSHA, SkipSteps: skipSteps,
 		Intent: intent, LaunchNonce: launchNonce, ValidationGeneration: validationGeneration, PRBaseBranch: baseBranch, OmitIntent: omitIntent, PiProfile: profile, VerificationPlanID: planID,
+		ClosingIssueRefs: closesIssues,
 	}, &result); err != nil {
 		return nil, fmt.Errorf("start fresh run: %w", err)
 	}
@@ -1044,11 +1170,27 @@ func gateResolution(gate stepView, alreadyFixed bool) (types.ApprovalAction, []s
 	return types.ActionFix, ids
 }
 
-// waitStepLeavesGate blocks until the named step's status changes away from the
-// gate status we just answered, or the run terminates. This prevents a
-// double-approve race: respond is asynchronous, so without waiting the next
-// event reconciliation could still observe the same gate and approve it twice.
-func waitStepLeavesGate(ctx context.Context, socketPath, runID, step, gateStatus string) error {
+// gateIdentity identifies the exact park a wait is leaving: the parked step's
+// status and the round it parked at. The status alone cannot tell a re-park
+// apart from the park just answered, since the next round can park at the same
+// status before any wait observes the intervening running state. Every
+// execution round is persisted before the step parks again (InsertStepRound),
+// so a re-park always carries a higher round count. A daemon that reports no
+// round count leaves both sides zero and degrades to the status-only check.
+type gateIdentity struct {
+	status string
+	round  int
+}
+
+func (s stepView) identity() gateIdentity {
+	return gateIdentity{status: s.Status, round: s.RoundCount}
+}
+
+// waitStepLeavesGate blocks until the named step leaves the gate we just
+// answered, or the run terminates. This prevents a double-approve race:
+// respond is asynchronous, so without waiting the next event reconciliation
+// could still observe the same gate and approve it twice.
+func waitStepLeavesGate(ctx context.Context, socketPath, runID, step string, gate gateIdentity) error {
 	reconciler := newRunReconciler(&ipcRunStateSource{socketPath: socketPath}, runID)
 	defer reconciler.Close()
 	for {
@@ -1061,7 +1203,7 @@ func waitStepLeavesGate(ctx context.Context, socketPath, runID, step, gateStatus
 		}
 		for _, s := range run.Steps {
 			if string(s.StepName) == step {
-				if string(s.Status) != gateStatus {
+				if string(s.Status) != gate.status || s.RoundCount != gate.round {
 					return nil
 				}
 				break
@@ -1101,10 +1243,12 @@ func sendRespond(client *ipc.Client, runID string, step types.StepName, action t
 // ready for a human to merge), or the terminal outcome (exit 0 when passed,
 // exit 1 when blocked, failed, or cancelled). Successful outcomes also carry
 // the fixes the pipeline applied and reporting instructions, so the agent
-// closes the loop with the user instead of stopping at "it passed".
-func renderDriveResult(cmd *cobra.Command, run *ipc.RunInfo, ciReady bool) error {
+// closes the loop with the user instead of stopping at "it passed". lead
+// fields, when given, open the document ahead of the run object, so a command
+// that did something before driving (axi answer) reports it in the same return.
+func renderDriveResult(cmd *cobra.Command, run *ipc.RunInfo, ciReady bool, lead ...toon.Field) error {
 	rv := runViewFromIPC(run)
-	fields := []toon.Field{runObjectField(rv)}
+	fields := append(append([]toon.Field{}, lead...), runObjectField(rv))
 	hasBranchSync := false
 	if syncField := cachedBranchSyncField(cmd, run.ID); syncField != nil {
 		fields = append(fields, *syncField)
@@ -1378,7 +1522,7 @@ func runAxiRespond(cmd *cobra.Command, ra respondArgs) error {
 
 	// Let the executor consume the response before we re-read state, so we
 	// don't immediately observe the same gate we just answered.
-	if err := waitStepLeavesGate(driveCtx, env.p.Socket(), runID, string(stepName), gateStatusFor(rv, string(stepName))); err != nil {
+	if err := waitStepLeavesGate(driveCtx, env.p.Socket(), runID, string(stepName), gateIdentityFor(rv, string(stepName))); err != nil {
 		if isAxiWaitElapsed(ctx, driveCtx, err) {
 			return emitAxiWaitElapsed(cmd, ra.wait, "no-mistakes axi run")
 		}
@@ -1395,16 +1539,16 @@ func runAxiRespond(cmd *cobra.Command, ra respondArgs) error {
 	return renderDriveResult(cmd, final, ciReady)
 }
 
-// gateStatusFor returns the current status of step in rv, defaulting to the
-// awaiting-approval status so the post-respond wait still functions if the step
-// was not found.
-func gateStatusFor(rv runView, step string) string {
+// gateIdentityFor returns the identity of step's current park in rv, defaulting
+// to the awaiting-approval status so the post-respond wait still functions if
+// the step was not found.
+func gateIdentityFor(rv runView, step string) gateIdentity {
 	for _, s := range rv.Steps {
 		if s.Name == step {
-			return s.Status
+			return s.identity()
 		}
 	}
-	return string(types.StepStatusAwaitingApproval)
+	return gateIdentity{status: string(types.StepStatusAwaitingApproval)}
 }
 
 func newAxiAbortCmd() *cobra.Command {

@@ -214,7 +214,7 @@ func TestTriggerRunReconcilesMirrorHeldByTheRunWhoseHeadIsSubmitted(t *testing.T
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 
-			runID, err := triggerRun(ctx, env, "feature", nil, "", "", false, "")
+			runID, err := triggerRun(ctx, env, "feature", nil, "", "", false, "", nil)
 			archive := "refs/tags/no-mistakes-abandoned/feature/" + mirrorHead
 			if outcome == "admitted" {
 				if err != nil || runID != admittedRunID {

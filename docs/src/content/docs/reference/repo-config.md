@@ -8,12 +8,12 @@ Per-repo configuration lives in `.no-mistakes.yaml` at the root of your reposito
 :::caution[Security: gate-control fields are read from the default branch]
 `commands.*` and `gates[].command` execute arbitrary shell on the daemon host via `sh -c` / `cmd.exe /c`, and `agent` selects which process launches there (including ordered fallback lists, ACP aliases such as `cursor` and `devin`, and `acp:` targets) with the maintainer's credentials.
 To prevent a supply-chain attack where a contributor lands a hostile value on a gated branch, the daemon always reads **`commands` and `agent` from your default branch** (e.g. `origin/main`), never from the pushed SHA, and reads them at the exact commit a fresh fetch resolved (so a stale `origin/<default>` ref cannot serve a value the live default branch removed).
-The daemon also reads `document.instructions`, `review.conversation`, `review.path_instructions`, `gates`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.revalidate_repairs`, `sync_strategy`, `rebase.strategy`, `test.prepare`, `test.instructions`, `test.allow_approve_over_failure`, `test.evidence.branch`, `pr.template`, `pr.publish_intent`, and `pr.appendix` only from that trusted copy.
+The daemon also reads `document.instructions`, `review.conversation`, `review.path_instructions`, `gates`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.revalidate_repairs`, `sync_strategy`, `rebase.strategy`, `test.prepare`, `test.base_attribution`, `test.instructions`, `test.allow_approve_over_failure`, `test.evidence.branch`, `pr.template`, `pr.publish_intent`, and `pr.appendix` only from that trusted copy.
 `pr.base_branch` is trusted-default-branch-only as well, but unlike those fields it follows the same `allow_repo_commands: true` opt-in exception as `commands`/`agent` (see [`pr.base_branch`](#prbase_branch) below).
 If the default branch cannot be fetched and resolved to a readable commit, or its present `.no-mistakes.yaml` cannot be read and parsed, the run aborts before launching an agent.
 A readable default-branch tree with no `.no-mistakes.yaml` is valid and uses defaults.
 Commit the gate-control settings you want to your default branch.
-Non-executing fields (`ignore_patterns`, `auto_fix`, `commit`, `intent`, `test`, `pr.title_format`, and `providers`) are still read from the pushed branch, except `test.prepare`, `test.instructions`, `test.allow_approve_over_failure`, and `test.evidence.branch`.
+Non-executing fields (`ignore_patterns`, `auto_fix`, `commit`, `intent`, `test`, `pr.title_format`, and `providers`) are still read from the pushed branch, except `test.prepare`, `test.base_attribution`, `test.instructions`, `test.allow_approve_over_failure`, and `test.evidence.branch`.
 
 If you genuinely want per-branch `commands` and `agent` (for example, a single-developer repo where you trust your own feature branches), opt in with [`allow_repo_commands: true`](#allow_repo_commands) in this same file on your default branch. This re-enables the previous behavior with eyes open. The switch is read only from the trusted default-branch copy, so a contributor cannot self-enable it from a pushed branch.
 :::
@@ -210,8 +210,8 @@ Select the branch that newly created pull requests target.
 | Trust | Trusted default branch, unless `allow_repo_commands: true` is explicitly enabled there |
 
 Use this when the repository's integration branch differs from its forge default branch, for example `develop` instead of `main`.
-The configured branch is used for PR creation, and as the integration base for the rebase step.
-When unset, no-mistakes preserves the existing behavior and targets `Repo.DefaultBranch`.
+The configured branch is used for PR creation and pipeline integration and change scoping; the [Pipeline Steps scope rules](/no-mistakes/reference/pipeline-steps/) describe which steps use it and how the recorded per-run override takes precedence.
+When unset and without a per-run override, no-mistakes targets the repository's forge default branch.
 
 PR lookup matches an existing PR by branch alone, never filtered by base, so a `pr.base_branch` change after a PR was opened updates that PR instead of opening a duplicate against the new base.
 A per-run `--base-branch` override is different: if the run's already-open PR targets another branch, the PR step retargets that PR (GitHub, GitLab, and Gitea) so title, body, and CI follow the requested integration branch. A discovered PR that is not the run's persisted identity, or a provider that cannot retarget, fails closed rather than moving another review object. See [PR](/no-mistakes/reference/pipeline-steps/#pr).
@@ -347,9 +347,14 @@ Optional dependency-preparation command for isolated run worktrees. Run via the 
 | Type | `string` |
 | Default | Empty (no preparation command) |
 
-When set, no-mistakes runs this command before the first configured `commands.test`, `commands.lint`, or `commands.format` command that the pipeline reaches. By default, it is a lazy command hook rather than an additional pipeline step: when no configured command needs it and [`test.prepare`](#testprepare) is false, `commands.prepare` alone does nothing. Trusted `test.prepare: true` instead triggers it eagerly before agent-only Test while leaving `commands.test` unset. A successful result is shared by all later configured commands in that isolated worktree, including after daemon recovery. The dependent step log records the preparation command, output, and elapsed preparation time. A non-zero exit or launch failure fails that step before its command runs.
+When set, no-mistakes runs this command before the first configured Test, Lint, or Format command that the pipeline reaches, including machine-local additional Test or Lint checks.
+By default, it is a lazy command hook rather than an additional pipeline step: when no configured command needs it and [`test.prepare`](#testprepare) is false, `commands.prepare` alone does nothing.
+Trusted `test.prepare: true` instead triggers it eagerly before agent-only Test while leaving `commands.test` unset.
+A successful result is shared by all later configured commands in that isolated worktree, including after daemon recovery.
+The dependent step log records the preparation command, output, and elapsed preparation time.
+A non-zero exit or launch failure fails that step before its command runs.
 
-Use this for deterministic dependency materialization such as `npm ci --prefer-offline`. The run worktree starts with tracked files only, so ignored dependency directories such as `node_modules` are otherwise absent. no-mistakes keeps ignored files produced by preparation, while removing its tracked, ordinary untracked, and nested-repository mutations before continuing. Earlier pending tracked and ordinary untracked pipeline changes are restored exactly, so preparation can run before a later configured command without admitting setup artifacts into a fix commit.
+Use this for deterministic dependency materialization such as `npm ci --prefer-offline`. The run worktree starts with tracked files only, so ignored dependency directories such as `node_modules` are otherwise absent. no-mistakes keeps ignored files produced by preparation, and keeps any submodule it checks out at the commit the superproject records, while removing its tracked, ordinary untracked, and nested-repository mutations before continuing; a submodule commit the command moved to is reset to the recorded commit. Earlier pending tracked and ordinary untracked pipeline changes are restored exactly, so preparation can run before a later configured command without admitting setup artifacts into a fix commit.
 
 Like every `commands.*` value, `commands.prepare` comes from the trusted default-branch configuration unless that trusted copy explicitly enables `allow_repo_commands: true`. no-mistakes never auto-detects an install command from the pushed branch.
 
@@ -367,6 +372,7 @@ Broad regression belongs in remote CI and remains mandatory before a PR is ready
 no-mistakes does not guess whether an arbitrary shell string is "too broad" - the contract is documented and dogfooded, not enforced with language- or filename-specific heuristics.
 
 When set, the test step runs this exact command first as the baseline and checks the exit code.
+Machine-local [`repository_overrides.commands`](/no-mistakes/reference/global-config/#machine-local-commands) can add checks and lower its scheduling priority without replacing this command.
 Whether the baseline passes, fails, or is absent, the agent then derives targeted end-user scenarios and drives the product itself under the same targeted-validation contract.
 A non-zero exit parks the Test step. Approving that gate records an explicit override on the step and on the PR attestation; the [`require-no-mistakes`](/no-mistakes/reference/pipeline-steps/#pipeline-step-attestation) check treats that as non-compliant unless [`test.allow_approve_over_failure`](#testallow_approve_over_failure) is set.
 
@@ -868,6 +874,27 @@ Opts agent-only Test into running `commands.prepare` before its first agent turn
 This is **eager**, not on-demand: opted-in repositories pay setup cost even when the evidence agent subsequently reports `no-surface`. Leave it off to retain lazy command-only preparation. Preparation does not replace fresh Test evidence or change verdict/approval policy. Failures stop Test before the agent launches and never record successful preparation.
 
 The trigger always comes from the trusted default branch; pushed-branch text cannot enable it. The executable `commands.prepare` value separately follows the existing `allow_repo_commands` policy.
+
+### test.base_attribution
+
+**Type:** boolean. **Default:** `false`. Repository-only, trusted-default-branch-only, even with `allow_repo_commands: true`.
+
+```yaml
+commands:
+  test: "go test ./internal/... -count=1"
+test:
+  base_attribution: true
+```
+
+When a configured [`commands.test`](#commandstest) exits non-zero, re-runs the same command on the run's base commit (the merge base with the effective PR base branch) and diffs the two results, so failures that already exist on the base are not blamed on the change. The base run uses a disposable clone of that commit outside the run worktree, runs [`commands.prepare`](#commandsprepare) there first when one is configured (its output is logged as `Prepare (base)`, and its tracked and ordinary untracked changes are reset before the base suite runs, exactly as on the head, so only ignored materialization survives), and logs its output to the Test step log as `Test (base)`. Base preparation and the base command share one deadline, the Test budget [`test_agent_timeout`](/no-mistakes/reference/global-config/#test_agent_timeout) (default 30 minutes); a base run that outlives it is stopped and reported as unavailable while the head's failure still parks. Both base commands keep the machine-local [`nice`](/no-mistakes/reference/global-config/#machine-local-commands) settings for `prepare` and `test`. Only the repository command's own output is attributed: machine-local `additional` test checks are never re-run on the base, and a failure in one of them alone triggers no base run.
+
+The attribution leads the Test findings summary (the failure output the PR and repair turns see) and is passed to the evidence agent:
+
+- the command passes on the base: every failure is introduced by the change;
+- the command also fails on the base: recognized per-test failure lines are split into *introduced by this change* and *pre-existing on the base commit*. Per-test lines are recognized for common runners (`go test`, pytest, jest/vitest, TAP, cargo); package- or file-level summary lines are ignored, except that a `go test` failure is keyed by the package its block reports, and a pytest failure is keyed by its `path::test` id without the failure reason. Only those two carry a package or file identity; any other line that also fails on the base (jest/vitest, TAP, cargo, or `go test` output without a package line) may be a different test sharing the name, so it is listed as *ambiguous, could not attribute* instead of pre-existing. A `go test` package that fails with no per-test line (a build failure, or a `TestMain` or `init` panic) and did not fail that way on the base is listed under *failures without a per-test line (could not be attributed)*. When no per-test lines are recognized in the base output, or none are left to list from the change's output, the summary says the two could not be separated;
+- the base checkout, preparation, or run cannot complete (including a base command that exits 126 or 127, meaning it could not be executed or found, such as an ignored dependency the fresh clone lacks, or a base run past its deadline): the summary says attribution is unavailable and every failure stays attributed to the change.
+
+Attribution informs; it never changes the gate. The failing command still parks the Test step with the same `error` finding, an approval over it is still recorded as a configured-command override (see [`test.allow_approve_over_failure`](#testallow_approve_over_failure)), and a passing command never triggers a base run. Each failing Test execution, including after an auto-fix round, pays one extra run of the command, which is why this is off by default.
 
 ### test.instructions
 

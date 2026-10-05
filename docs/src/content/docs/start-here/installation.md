@@ -33,6 +33,38 @@ go install github.com/kunchenguid/no-mistakes/cmd/no-mistakes@latest
 
 `go install` builds the CLI without an embedded telemetry website ID, so telemetry stays off by default unless you later set `NO_MISTAKES_UMAMI_WEBSITE_ID` at runtime.
 
+## Nix
+
+```sh
+nix run github:kunchenguid/no-mistakes -- --version
+nix profile install github:kunchenguid/no-mistakes
+no-mistakes daemon restart
+```
+
+The flake builds for `x86_64-linux`, `aarch64-linux`, and `aarch64-darwin`.
+Intel macOS is not covered because nixpkgs dropped `x86_64-darwin`; use the install script or `go install` there.
+
+To add it to a [devenv](https://devenv.sh) shell, declare the flake as an input in `devenv.yaml` and add its package:
+
+```yaml
+inputs:
+  no-mistakes:
+    url: github:kunchenguid/no-mistakes
+```
+
+```nix
+{ pkgs, inputs, ... }:
+{
+  packages = [ inputs.no-mistakes.packages.${pkgs.stdenv.system}.default ];
+}
+```
+
+Without flakes, `default.nix` exposes the same packages through flake-compat, for example `nix-build -A packages.x86_64-linux.default`.
+
+The flake embeds the same default telemetry host and website ID as official release binaries. Disable telemetry with `NO_MISTAKES_TELEMETRY=0`, or override the host and website ID with `NO_MISTAKES_UMAMI_HOST` and `NO_MISTAKES_UMAMI_WEBSITE_ID`.
+
+`no-mistakes update` refuses to run on a binary in the Nix store, and the background update notice stays off. Upgrade through Nix (for example `nix profile upgrade no-mistakes` or a flake input update), then run `no-mistakes daemon restart`. The restart points the managed service at the new store path; until then the daemon keeps running the old one, which garbage collection can delete.
+
 ## From source
 
 ```sh
@@ -83,6 +115,7 @@ If the daemon executable path cannot be determined, the update aborts before rep
 If the daemon does not come back cleanly after a successful replacement, the new binary stays installed but the command reports the daemon reset failure.
 
 Background update checks run automatically on each CLI invocation (except `update` itself and version queries `--version` / `-v`, which stay side-effect-free). Suppress with `NO_MISTAKES_NO_UPDATE_CHECK=1`.
+A [Nix install](#nix) upgrades through Nix instead.
 
 ## Remove from a repo
 
