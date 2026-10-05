@@ -115,6 +115,10 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 		sctx.Log(fmt.Sprintf("warning: CI fix failed: %v", err))
 		return nil, nil
 	}
+	if repair.NoCodeChangeNeeded {
+		sctx.Log(fmt.Sprintf("CI fixer concluded no code change is needed: %s", repair.Summary))
+		return ciRepairParkOutcome(targets.Findings, sctx.DeferredFindings, repair.Summary), nil
+	}
 	if repair.HeadAdvanced || sctx.Run.HeadSHA != previousHeadSHA {
 		s.lastFixedChecks = fixKey
 		s.lastFixedCompletedAt = fixCompletedAt
@@ -142,10 +146,6 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 			}
 		}
 		return nil, nil
-	}
-	if repair.NoCodeChangeNeeded {
-		sctx.Log(fmt.Sprintf("CI fixer concluded no code change is needed: %s", repair.Summary))
-		return ciRepairParkOutcome(targets.Findings, sctx.DeferredFindings, repair.Summary), nil
 	}
 	sctx.Log("CI fix produced no changes, resuming monitoring...")
 	return nil, nil
