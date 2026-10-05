@@ -809,7 +809,7 @@ func ciRepairPolicyDescription(sctx *pipeline.StepContext) string {
 func (s *CIStep) recordRepair(sctx *pipeline.StepContext, headSHA string) (ciRepairResult, error) {
 	if sctx.CurrentFixUnit != nil {
 		parent := sctx.Run.HeadSHA
-		if err := updateNonSharedBranchRef(sctx, headSHA); err != nil {
+		if err := updateLocalRepairBranchRef(sctx, headSHA); err != nil {
 			return ciRepairResult{}, err
 		}
 		if err := sctx.RecordFixUnitHead(headSHA); err != nil {

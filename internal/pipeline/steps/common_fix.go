@@ -240,7 +240,7 @@ func commitAgentFixesWithResult(sctx *pipeline.StepContext, stepName types.StepN
 	}
 	if sctx.CurrentFixUnit != nil {
 		parent := sctx.Run.HeadSHA
-		if err := updateNonSharedBranchRef(sctx, headSHA); err != nil {
+		if err := updateLocalRepairBranchRef(sctx, headSHA); err != nil {
 			return false, err
 		}
 		if err := sctx.RecordFixUnitHead(headSHA); err != nil {
@@ -459,35 +459,11 @@ func executeFixTurn(sctx *pipeline.StepContext, stepName types.StepName, opts fi
 	return fixResultSummary(committed), nil
 }
 
-func updateNonSharedBranchRef(sctx *pipeline.StepContext, headSHA string) error {
-	shared, err := worktreeSharesGateRefs(sctx)
-	if err != nil || shared {
-		return err
-	}
+// The current fork's managed-head and rerun paths read the gate branch.
+// Keep its existing local-ref contract; remote publication remains a later gate.
+func updateLocalRepairBranchRef(sctx *pipeline.StepContext, headSHA string) error {
 	if _, err := stepGitRun(sctx, "update-ref", normalizedBranchRef(sctx.Run.Branch), headSHA); err != nil {
 		return fmt.Errorf("update local branch ref: %w", err)
 	}
 	return nil
-}
-
-func worktreeSharesGateRefs(sctx *pipeline.StepContext) (bool, error) {
-	if strings.TrimSpace(sctx.GateDir) == "" {
-		return false, nil
-	}
-	gateInfo, err := os.Stat(sctx.GateDir)
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("inspect gate ref storage: %w", err)
-	}
-	commonDir, err := stepGitRun(sctx, "rev-parse", "--path-format=absolute", "--git-common-dir")
-	if err != nil {
-		return false, fmt.Errorf("resolve worktree ref storage: %w", err)
-	}
-	commonInfo, err := os.Stat(commonDir)
-	if err != nil {
-		return false, fmt.Errorf("inspect worktree ref storage: %w", err)
-	}
-	return os.SameFile(gateInfo, commonInfo), nil
 }
