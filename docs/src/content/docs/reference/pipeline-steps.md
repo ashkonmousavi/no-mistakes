@@ -382,6 +382,15 @@ Monitors PR health after creation and auto-fixes CI failures. Mergeability polli
 
 ## Step statuses
 
+Stopped agent invocations preserve unfinished work separately from ordinary correction commits.
+For representable Git state, local rescue refs below `refs/no-mistakes/rescue/<run>/<step>/<stop>` store the working tree and staged content without moving HEAD or the live index.
+The first parent is the pre-invocation head; the second parent holds staged content.
+A rescue is unfinished evidence, never a publishable or review-approved head.
+Publication refuses while unfinished rescue state remains outstanding.
+Unsupported Git operations, ignored content, uncertain writer shutdown, and storage failures retain the original checkout and report the reason.
+Immediate, startup, and retention cleanup must preserve dirty bytes durably or refuse deletion.
+For the saved and retained fields, see [`axi status`](/no-mistakes/reference/cli/#no-mistakes-axi-status).
+
 Each step progresses through these statuses:
 
 | Status | Meaning |
