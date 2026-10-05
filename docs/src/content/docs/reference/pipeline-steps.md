@@ -401,6 +401,20 @@ CI intermediate checkpoints stay local; the existing final publish or revalidati
 An external CI no-code conclusion still parks for a decision rather than counting as an applied repair.
 All these calls belong to the executor's one existing fix round and do not change automatic round limits.
 
+An explicit Fix response continues the original selected scope using exact applied receipts, excluding completed editing turns while retaining independent validation.
+A cut in final verification resumes validation without repeating repairs.
+Test carries the regression paths recorded before earlier commits, including into a matching terminal rerun.
+CI restores the selected batch's original check execution freshness before inspecting unpublished intermediate heads.
+
+A matching terminal rerun verifies source refs, branch, intent, custody, and the exact saved parent before restoring working and staged bytes into its clean checkout, before preparation or agent launch.
+The inherited source's unfinished causes finish through their owning step, and the new run still executes its required independent validation.
+A new review's re-reported defect remains outstanding regardless of older applied receipts or positional IDs.
+Inherited submitted commits do not count as published: later reruns follow the verified source chain to the actual publication baseline, preserving progress after repeated cuts.
+Restore never cherry-picks a rescue into HEAD and never executes checkout filters.
+A second restore accepts only the complete matching working/index state; an incomplete or conflicting restore refuses and preserves the evidence.
+Changed instructions or intent, returned custody, divergent author work, uncertain writers, unsupported Git state, and mismatched or symbolic refs refuse automatic continuation.
+Consumed refs remain local and reachable; consumption is not approval or permission to publish.
+
 Each step progresses through these statuses:
 
 | Status | Meaning |

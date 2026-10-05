@@ -340,6 +340,12 @@ Saved work does not imply a successful repair or successful validation.
 Keep these refs and retained paths until their unfinished work has been reconciled; do not push a rescue snapshot or remove retained work to clear a failure.
 An optional `fix_progress` object reports `applied`, `total`, the current unfinished finding, `saved_head`, and `validation_pending` for the latest repair selection.
 Its counters report stored edit turns, not verified resolutions or approval.
+A linked rerun can report `partial_work.state: consumed`, with `consumed_by` naming the new run and `consumption_completed` distinguishing restored context from completed repair storage.
+The source run keeps its original failed outcome; the new run still needs its own validation and publication gates.
+Use the existing Fix or `rerun` operations for matching continuation; no new recovery flag is required.
+The existing clean-caller rule still requires the selected saved head; changed clean author heads are refused.
+The existing dirty-caller mode omits that clean-head evidence and keeps caller bytes untouched while restoration uses a separate clean pipeline checkout.
+A refusal names the saved evidence to inspect instead of silently restarting from an older submitted head.
 Legacy runs without progress records omit these objects.
 
 When `--run` is omitted, show this branch's run: its active run, else its most recent one.
