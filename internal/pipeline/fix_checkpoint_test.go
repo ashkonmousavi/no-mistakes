@@ -2,12 +2,34 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
+
+func TestFixSizingLegacyPendingUnitUsesCurrentFindingSize(t *testing.T) {
+	d, _, run, _ := setupTest(t)
+	finding := types.Finding{ID: "A", Description: "original cause"}
+	raw, _ := json.Marshal(finding)
+	selection := `{"findings":[{"id":"A","description":"original cause"}]}`
+	c := &db.FixCheckpoint{RunID: run.ID, Step: "review", Selection: "saved-selection", Ordinal: 1, Total: 1,
+		FindingID: finding.ID, FindingDigest: fmt.Sprintf("%x", sha256.Sum256(raw)), ParentHead: run.HeadSHA, SelectionJSON: selection}
+	if err := d.BeginFixCheckpoint(c); err != nil {
+		t.Fatal(err)
+	}
+	sctx := &StepContext{DB: d, Run: run, FixSelectionID: "saved-selection", FixSelectionFindings: selection}
+	if err := sctx.BeginFixUnit(types.StepReview, finding, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if sctx.CurrentFixUnit.FixSize != 1 {
+		t.Fatalf("legacy pending unit has no usable size: %+v", sctx.CurrentFixUnit)
+	}
+}
 
 func TestFixProgressAuthorityCheckpointRefMustStillMatch(t *testing.T) {
 	for _, fault := range []string{"moved", "symbolic", "ref without receipt"} {

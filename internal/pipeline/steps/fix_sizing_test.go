@@ -116,3 +116,112 @@ func TestFixSizingSmallFindingLaunchesOnceAndRecordsMeasurement(t *testing.T) {
 		t.Fatalf("one finding did not create one commit: %s", got)
 	}
 }
+
+func TestFixSizingCIParksWithoutLaunchOrPublish(t *testing.T) {
+	f := newCIRepairFixture(t, false, func(string) { t.Fatal("oversized CI fixer launched") })
+	bindStepResult(t, f.sctx, types.StepCI)
+	seedFixTiming(t, f.sctx, types.StepCI, 29*time.Minute)
+	outcome, err := f.run(t)
+	if err != nil || outcome == nil || !outcome.NeedsApproval || !strings.Contains(outcome.Findings, "fix-estimate-exceeds-deadline") {
+		t.Fatalf("CI sizing did not park: %+v %v", outcome, err)
+	}
+	if got := gitCmd(t, f.dir, "ls-remote", "origin", "refs/heads/feature"); !strings.Contains(got, f.headSHA) {
+		t.Fatalf("oversized CI repair published: %s", got)
+	}
+}
+
+func TestFixSizingHonorsWorkingCapAndInheritedDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		working    time.Duration
+		parent     time.Duration
+		wantLaunch bool
+	}{
+		{"silent_absolute_bound", 0, 0, false},
+		{"larger_working_cap", 30 * time.Minute, 0, true},
+		{"working_cap_cannot_extend_parent", 30 * time.Minute, 5 * time.Minute, false},
+		{"parent_owns_bound", 0, 40 * time.Minute, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, base, head := setupGitRepo(t)
+			calls := 0
+			ag := &mockAgent{name: "test", runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+				calls++
+				return nil, context.Canceled
+			}}
+			sctx := newTestContextWithDBRecords(t, ag, dir, base, head, config.Commands{})
+			bindStepResult(t, sctx, types.StepReview)
+			sctx.Fixing = true
+			sctx.Config.ReviewAgentTimeout = 10 * time.Minute
+			sctx.Config.ReviewAgentWorkingTimeout = tc.working
+			sctx.PreviousFindings = `{"findings":[{"id":"A","description":"one cause"}]}`
+			seedFixTiming(t, sctx, types.StepReview, 20*time.Minute)
+			if tc.parent > 0 {
+				ctx, cancel := context.WithTimeout(sctx.Ctx, tc.parent)
+				defer cancel()
+				sctx.Ctx = ctx
+			}
+			outcome, err := (&ReviewStep{}).Execute(sctx)
+			if tc.wantLaunch {
+				if calls != 1 || err == nil {
+					t.Fatalf("fitting repair was not launched: calls=%d outcome=%+v error=%v", calls, outcome, err)
+				}
+			} else if calls != 0 || err != nil || outcome == nil || !outcome.NeedsApproval {
+				t.Fatalf("effective bound was ignored: calls=%d outcome=%+v error=%v", calls, outcome, err)
+			}
+		})
+	}
+}
+
+func TestFixSizingColdOversizedFindingUsesHonestSizeEstimate(t *testing.T) {
+	dir, base, head := setupGitRepo(t)
+	ag := &mockAgent{name: "test", runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+		t.Fatal("oversized cold repair launched")
+		return nil, nil
+	}}
+	sctx := newTestContextWithDBRecords(t, ag, dir, base, head, config.Commands{})
+	bindStepResult(t, sctx, types.StepReview)
+	sctx.Fixing = true
+	sctx.PreviousFindings = `{"findings":[{"id":"large","description":"` + strings.Repeat("x", 8192) + `"}]}`
+	outcome, err := (&ReviewStep{}).Execute(sctx)
+	if err != nil || outcome == nil || !outcome.NeedsApproval || !strings.Contains(outcome.Findings, "unmeasured size estimate") {
+		t.Fatalf("cold sizing did not park honestly: %+v %v", outcome, err)
+	}
+}
+
+func TestFixSizingResumeKeepsCompletedCommitAndRechecksUnfinishedCause(t *testing.T) {
+	dir, base, head := setupGitRepo(t)
+	calls := map[string]int{}
+	ag := &mockAgent{name: "test", runFn: func(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+		if opts.Purpose == "review-fix" {
+			id := "A"
+			if strings.Contains(opts.Prompt, "Current repair finding ID: B") {
+				id = "B"
+			}
+			calls[id]++
+			if err := os.WriteFile(filepath.Join(dir, id+".txt"), []byte("fixed"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			return &agent.Result{Output: []byte(`{"summary":"repair cause"}`)}, nil
+		}
+		if opts.Purpose == "review-fix-verification" {
+			return &agent.Result{Output: []byte(`{"summary":"focused checks passed"}`)}, nil
+		}
+		return &agent.Result{Output: []byte(`{"findings":[],"summary":"reviewed","risk_level":"low","risk_rationale":"fixture","risk_scope":"source-or-external","reviewed_paths":["feature.txt","A.txt","B.txt"]}`)}, nil
+	}}
+	sctx := newTestContextWithDBRecords(t, ag, dir, base, head, config.Commands{})
+	bindStepResult(t, sctx, types.StepReview)
+	sctx.Fixing = true
+	sctx.PreviousFindings = `{"findings":[{"id":"A","description":"small cause"},{"id":"B","description":"` + strings.Repeat("x", 5120) + `"}]}`
+	seedFixTiming(t, sctx, types.StepReview, 8*time.Minute)
+	outcome, err := (&ReviewStep{}).Execute(sctx)
+	if err != nil || outcome == nil || !outcome.NeedsApproval || calls["A"] != 1 || calls["B"] != 0 || gitCmd(t, dir, "rev-list", "--count", head+"..HEAD") != "1" {
+		t.Fatalf("park lost completed work: calls=%v outcome=%+v error=%v", calls, outcome, err)
+	}
+	sctx.PreviousFindings = outcome.Findings // includes the scheduling warning, not another repair cause
+	sctx.Config.ReviewAgentWorkingTimeout = time.Hour
+	outcome, err = (&ReviewStep{}).Execute(sctx)
+	if err != nil || outcome.NeedsApproval || calls["A"] != 1 || calls["B"] != 1 || gitCmd(t, dir, "rev-list", "--count", head+"..HEAD") != "2" {
+		t.Fatalf("retry replayed repairs or failed to validate: calls=%v outcome=%+v error=%v", calls, outcome, err)
+	}
+}
