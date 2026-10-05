@@ -69,6 +69,7 @@ type StepContext struct {
 	CompletedFixSelectionID string
 	FixStartingHead         string
 	CIFixSnapshotJSON       string
+	InheritedRepairContext  string
 	// EvidenceDir is where this run's test-evidence artifacts belong, always
 	// outside the worktree. The executor resolves it once from the app root
 	// (honoring test.evidence.local_root) so every consumer - the test step's

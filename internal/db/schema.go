@@ -16,6 +16,9 @@ CREATE TABLE IF NOT EXISTS run_work_rescues (
     payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS run_work_rescues_run ON run_work_rescues(run_id, stop_id);
+CREATE UNIQUE INDEX IF NOT EXISTS run_work_rescues_consumer
+ ON run_work_rescues(json_extract(payload,'$.consumed_by'))
+ WHERE json_extract(payload,'$.consumed_by') IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS repos (
     id             TEXT PRIMARY KEY,

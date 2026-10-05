@@ -506,6 +506,8 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 			toon.Field{Key: "sha", Value: p.SHA},
 			toon.Field{Key: "parent_head", Value: p.ParentHead},
 			toon.Field{Key: "source_run", Value: p.RunID},
+			toon.Field{Key: "consumed_by", Value: p.ConsumedBy},
+			toon.Field{Key: "consumption_completed", Value: p.ConsumptionCompleted},
 			toon.Field{Key: "path", Value: p.Path},
 			toon.Field{Key: "reason", Value: p.Reason},
 		)})

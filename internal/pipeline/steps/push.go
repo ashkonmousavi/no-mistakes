@@ -130,6 +130,18 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 		if unfinished {
 			return fmt.Errorf("refusing to publish unfinished repair selection")
 		}
+		inherited, err := sctx.DB.InheritedWorkRescue(sctx.Run.ID)
+		if err != nil {
+			return err
+		}
+		if inherited != nil {
+			if err = pipeline.ValidateInheritedWork(sctx.Ctx, sctx.DB, sctx.Run, sctx.WorkDir, inherited); err != nil {
+				return err
+			}
+			if !inherited.ConsumptionCompleted {
+				return fmt.Errorf("refusing to publish unfinished inherited rescue %s", inherited.Ref)
+			}
+		}
 		p, err := sctx.DB.LatestWorkRescue(sctx.Run.ID)
 		if err != nil {
 			return fmt.Errorf("check unfinished work before publication: %w", err)

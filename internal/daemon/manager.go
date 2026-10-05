@@ -1123,7 +1123,7 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 	if latestForBranch == nil {
 		return "", fmt.Errorf("no previous run for branch %s", branch)
 	}
-	headSHA, err := resolveRerunHead(ctx, gateDir, branch, latestForBranch)
+	headSHA, err := m.resolveContinuationHead(ctx, gateDir, branch, latestForBranch)
 	if err != nil {
 		return "", err
 	}
@@ -1157,6 +1157,17 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 			intent = *selectedRun.Intent
 			intentSource = db.RunIntentSourceRerun
 		}
+	}
+
+	saved, err := m.matchingRerunRescue(ctx, latestForBranch, headSHA, intent)
+	if err != nil {
+		return "", err
+	}
+	if saved != nil {
+		if selectedRun.ID != latestForBranch.ID {
+			return "", fmt.Errorf("refusing cross-run continuation of %s", saved.Ref)
+		}
+		ctx = context.WithValue(ctx, rerunRescueKey{}, saved)
 	}
 
 	storedPRBaseBranch := strings.TrimSpace(prBaseBranch)
@@ -1405,6 +1416,23 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		}
 	}
 
+	if requested, ok := ctx.Value(rerunRescueKey{}).(*types.PartialWork); ok {
+		sourceRun, e := m.db.GetRun(requested.RunID)
+		if e != nil {
+			return "", e
+		}
+		if sourceRun == nil {
+			return "", fmt.Errorf("source run unavailable for %s", requested.Ref)
+		}
+		current, e := m.matchingRerunRescue(ctx, sourceRun, headSHA, intent)
+		if e != nil {
+			return "", e
+		}
+		if current == nil || current.StopID != requested.StopID {
+			return "", fmt.Errorf("saved continuation changed at %s", requested.Ref)
+		}
+	}
+
 	// Cancel any active run for this repo+branch.
 	m.cancelActiveRuns(repo.ID, branch)
 
@@ -1503,6 +1531,19 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 			m.removeRunWorktree(repo.ID, run.ID, gateDir, wtDir, "run_setup_failed")
 		}
 	}()
+
+	if saved, ok := ctx.Value(rerunRescueKey{}).(*types.PartialWork); ok {
+		if err := custody.RestorePartialWork(ctx, wtDir, saved); err != nil {
+			m.db.UpdateRunError(run.ID, err.Error())
+			return "", err
+		}
+		saved.State = "consumed"
+		saved.ConsumedBy = run.ID
+		if err := m.db.SaveWorkRescue(saved); err != nil {
+			m.db.UpdateRunError(run.ID, err.Error())
+			return "", err
+		}
+	}
 
 	if err := git.CopyLocalUserIdentity(ctx, repo.WorkingPath, wtDir); err != nil {
 		m.db.UpdateRunError(run.ID, fmt.Sprintf("configure worktree git identity: %s", err))

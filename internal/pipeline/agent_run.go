@@ -97,6 +97,9 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 	if sctx != nil {
 		ag = sctx.Agent
 	}
+	if sctx != nil && sctx.InheritedRepairContext != "" {
+		opts.Prompt += sctx.InheritedRepairContext
+	}
 	activity := observeAgentActivity(&opts)
 	rescue, err := sctx.beginAgentRescue(opts)
 	if err != nil {
