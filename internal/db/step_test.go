@@ -183,6 +183,9 @@ func TestStartStepFixRoundResetsRoundClockAndUpdatesLimit(t *testing.T) {
 	if _, err := d.sql.Exec(`UPDATE step_results SET started_at = ?, round_started_at = ?, auto_fix_limit = ? WHERE id = ?`, stepStarted, stepStarted, priorAutoFixLimit, step.ID); err != nil {
 		t.Fatal(err)
 	}
+	if err := d.SetStepOverrideReason(step.ID, "approved over failure"); err != nil {
+		t.Fatal(err)
+	}
 	if err := d.StartStepFixRound(step.ID, 2); err != nil {
 		t.Fatalf("start fix round: %v", err)
 	}
@@ -201,6 +204,9 @@ func TestStartStepFixRoundResetsRoundClockAndUpdatesLimit(t *testing.T) {
 	}
 	if got.AutoFixLimit == nil || *got.AutoFixLimit != 2 {
 		t.Errorf("auto-fix limit = %v, want newly configured 2 instead of prior %d", got.AutoFixLimit, priorAutoFixLimit)
+	}
+	if got.OverrideReason != nil {
+		t.Errorf("override reason = %q, want nil", *got.OverrideReason)
 	}
 }
 
@@ -278,6 +284,9 @@ func TestCompleteStepWithStatus(t *testing.T) {
 	run, _ := d.InsertRun(repo.ID, "feature", "abc", "def")
 	step, _ := d.InsertStepResult(run.ID, types.StepReview)
 
+	if err := d.SetStepOverrideReason(step.ID, "approved over failure"); err != nil {
+		t.Fatal(err)
+	}
 	if err := d.CompleteStepWithStatus(step.ID, types.StepStatusSkipped, 0, 1500, "/logs/run-1/review.log"); err != nil {
 		t.Fatalf("complete step with status: %v", err)
 	}
@@ -296,6 +305,9 @@ func TestCompleteStepWithStatus(t *testing.T) {
 	}
 	if got.CompletedAt == nil {
 		t.Error("expected non-nil completed_at")
+	}
+	if got.OverrideReason != nil {
+		t.Errorf("override reason = %q, want nil", *got.OverrideReason)
 	}
 }
 
@@ -320,6 +332,9 @@ func TestResetStepsFromPreservesSkippedSteps(t *testing.T) {
 	if err := d.CompleteStepWithStatus(review.ID, types.StepStatusCompleted, 0, 10, ""); err != nil {
 		t.Fatal(err)
 	}
+	if err := d.SetStepOverrideReason(review.ID, "approved over failure"); err != nil {
+		t.Fatal(err)
+	}
 	if err := d.CompleteStepWithStatus(push.ID, types.StepStatusSkipped, 0, 0, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -335,46 +350,15 @@ func TestResetStepsFromPreservesSkippedSteps(t *testing.T) {
 	if gotReview.Status != types.StepStatusPending {
 		t.Fatalf("review status = %s, want %s", gotReview.Status, types.StepStatusPending)
 	}
+	if gotReview.OverrideReason != nil {
+		t.Fatalf("review override reason = %q, want nil", *gotReview.OverrideReason)
+	}
 	gotPush, err := d.GetStepResult(push.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if gotPush.Status != types.StepStatusSkipped {
 		t.Fatalf("push status = %s, want %s", gotPush.Status, types.StepStatusSkipped)
-	}
-}
-
-func TestResetStepsFromClearsApprovalOverrideForRevalidation(t *testing.T) {
-	d := openTestDB(t)
-	repo, err := d.InsertRepo("/tmp/gate", "https://example.com/repo.git", "main")
-	if err != nil {
-		t.Fatal(err)
-	}
-	run, err := d.InsertRun(repo.ID, "feature", "abc123", "def456")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ci, err := d.InsertStepResult(run.ID, types.StepCI)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := d.CompleteStep(ci.ID, 0, 10, ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := d.SetStepOverrideReason(ci.ID, "required check still failing"); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := d.ResetStepsFrom(run.ID, types.StepReview.Order()); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := d.GetStepResult(ci.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Status != types.StepStatusPending || got.OverrideReason != nil {
-		t.Fatalf("reset CI step = %+v, want pending with no stale override", got)
 	}
 }
 
@@ -413,7 +397,7 @@ func TestParkStepForApproval_FindingsFailureRollsBackGate(t *testing.T) {
 	}
 	findings := `{"items":[{"id":"review-1"}]}`
 
-	if err := d.ParkStepForApproval(run.ID, step.ID, types.StepStatusAwaitingApproval, 100, &findings); err == nil {
+	if err := d.ParkStepForApproval(run.ID, step.ID, types.StepStatusAwaitingApproval, 7, 100, &findings); err == nil {
 		t.Fatal("expected findings persistence failure")
 	}
 	gotStep, err := d.GetStepResult(step.ID)
@@ -532,5 +516,97 @@ func TestUpdateStepStatus(t *testing.T) {
 	got, _ := d.GetStepResult(step.ID)
 	if got.Status != types.StepStatusAwaitingApproval {
 		t.Errorf("status = %q, want %q", got.Status, types.StepStatusAwaitingApproval)
+	}
+}
+
+// A custom gate shares its anchor's step_order, so a run holds duplicate sort
+// keys for the first time. Executor.recoveredGate matches these rows to the
+// executor's step list POSITIONALLY, and SQLite does not define the order of
+// rows with equal keys, so without a tie-break every parked run in a
+// gates-configured repository could become unrecoverable. Step ids are
+// monotonic ULIDs, so id order is insertion - that is, execution - order.
+func TestGetStepsByRun_OrdersEqualStepOrderRowsDeterministically(t *testing.T) {
+	d := openTestDB(t)
+	repo, err := d.InsertRepo("/tmp/repo", "git@github.com:test/repo.git", "main")
+	if err != nil {
+		t.Fatalf("insert repo: %v", err)
+	}
+	run, err := d.InsertRun(repo.ID, "feature", "abc123", "def456")
+	if err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+
+	gate := types.CustomGateStepName(types.StepReview, "arch-fitness")
+	if gate.Order() != types.StepReview.Order() {
+		t.Fatalf("gate order = %d, want the anchor's %d", gate.Order(), types.StepReview.Order())
+	}
+	// Insert the gate row FIRST, with the LATER id. Physical (rowid) order and
+	// id order therefore disagree, so a query relying on SQLite's undefined tie
+	// order returns the gate ahead of the anchor it actually ran after.
+	for _, row := range []struct {
+		id   string
+		name types.StepName
+	}{
+		{"01000000000000000000000002", gate},
+		{"01000000000000000000000001", types.StepReview},
+	} {
+		if _, err := d.sql.Exec(
+			`INSERT INTO step_results (id, run_id, step_name, step_order, status) VALUES (?, ?, ?, ?, ?)`,
+			row.id, run.ID, row.name, row.name.Order(), types.StepStatusPending,
+		); err != nil {
+			t.Fatalf("insert step result %s: %v", row.name, err)
+		}
+	}
+
+	steps, err := d.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatalf("get steps by run: %v", err)
+	}
+	got := make([]types.StepName, 0, len(steps))
+	for _, s := range steps {
+		got = append(got, s.StepName)
+	}
+	want := []types.StepName{types.StepReview, gate}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("step order = %v, want %v", got, want)
+	}
+}
+
+// The production insertion path must produce the same answer: a gate comes
+// back immediately after the anchor it runs after.
+func TestGetStepsByRun_PlacesAGateAfterItsAnchor(t *testing.T) {
+	d := openTestDB(t)
+	repo, err := d.InsertRepo("/tmp/repo", "git@github.com:test/repo.git", "main")
+	if err != nil {
+		t.Fatalf("insert repo: %v", err)
+	}
+	run, err := d.InsertRun(repo.ID, "feature", "abc123", "def456")
+	if err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+
+	sequence := []types.StepName{
+		types.StepReview,
+		types.CustomGateStepName(types.StepReview, "arch-fitness"),
+		types.CustomGateStepName(types.StepReview, "budget"),
+		types.StepTest,
+	}
+	for _, name := range sequence {
+		if _, err := d.InsertStepResult(run.ID, name); err != nil {
+			t.Fatalf("insert step result %s: %v", name, err)
+		}
+	}
+
+	steps, err := d.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatalf("get steps by run: %v", err)
+	}
+	if len(steps) != len(sequence) {
+		t.Fatalf("step count = %d, want %d", len(steps), len(sequence))
+	}
+	for i, want := range sequence {
+		if steps[i].StepName != want {
+			t.Fatalf("step %d = %q, want %q", i, steps[i].StepName, want)
+		}
 	}
 }

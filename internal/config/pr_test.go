@@ -1,0 +1,212 @@
+package config
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
+
+func TestPRPublicationPolicyTrustedEvenWithCommandsOptIn(t *testing.T) {
+	t.Parallel()
+	no, yes := false, true
+	pushed := &RepoConfig{PR: PRRaw{BaseBranch: "feature-base", Template: "evil.md", PublishIntent: &yes, Appendix: PRAppendixMinimal}}
+	trusted := &RepoConfig{PR: PRRaw{BaseBranch: "trusted-base", Template: ".github/pull_request_template.md", PublishIntent: &no, Appendix: PRAppendixCollapsed}}
+	for _, allow := range []bool{false, true} {
+		got := EffectiveRepoConfig(pushed, trusted, allow)
+		cfg := Merge(DefaultGlobalConfig(), got)
+		if cfg.PR.Template != trusted.PR.Template || cfg.PR.PublishesIntent() || cfg.PR.AppendixMode() != PRAppendixCollapsed {
+			t.Fatalf("allow=%v: pushed publication policy won: %+v", allow, cfg.PR)
+		}
+		wantBase := "trusted-base"
+		if allow {
+			wantBase = "feature-base"
+		}
+		if cfg.PR.BaseBranch != wantBase {
+			t.Fatalf("base-branch opt-in semantics changed: %+v", cfg.PR)
+		}
+		for _, absent := range []*RepoConfig{nil, {}} {
+			got = EffectiveRepoConfig(pushed, absent, allow)
+			if got.PR.Template != "" || got.PR.PublishIntent != nil || got.PR.Appendix != "" {
+				t.Fatalf("allow=%v: absent trusted policy inherited pushed values: %+v", allow, got.PR)
+			}
+		}
+		got = EffectiveRepoConfig(nil, trusted, allow)
+		if got.PR.Template != trusted.PR.Template || got.PR.PublishIntent == nil || *got.PR.PublishIntent || got.PR.Appendix != PRAppendixCollapsed {
+			t.Fatalf("allow=%v: trusted policy lost when pushed copy absent", allow)
+		}
+	}
+	if pushed.PR.Template != "evil.md" || !*pushed.PR.PublishIntent || pushed.PR.Appendix != PRAppendixMinimal {
+		t.Fatal("trust merge mutated caller input")
+	}
+}
+
+func TestLoadRepo_PRAppendix(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"", PRAppendixFull, PRAppendixCollapsed, PRAppendixMinimal} {
+		raw := "pr: {}\n"
+		if mode != "" {
+			raw = "pr:\n  appendix: " + mode + "\n"
+		}
+		repo, err := LoadRepoFromBytes([]byte(raw))
+		if err != nil {
+			t.Fatalf("mode %q: %v", mode, err)
+		}
+		got := Merge(DefaultGlobalConfig(), repo).PR.AppendixMode()
+		want := mode
+		if want == "" {
+			want = PRAppendixFull
+		}
+		if got != want {
+			t.Fatalf("mode %q resolved to %q", mode, got)
+		}
+	}
+	for _, mode := range []string{"hidden", "FULL", "none", "off"} {
+		if _, err := LoadRepoFromBytes([]byte("pr:\n  appendix: " + mode + "\n")); err == nil {
+			t.Fatalf("pr.appendix %q accepted", mode)
+		}
+	}
+}
+
+func TestPRTemplateLiteralPaths(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"", ".github/pull_request_template.md", "docs/PR template.md", "templates/[team].md"} {
+		if err := ValidatePRTemplatePath(name); err != nil {
+			t.Errorf("valid %q: %v", name, err)
+		}
+		repo, err := LoadRepoFromBytes([]byte(fmt.Sprintf("pr:\n  template: %q\n", name)))
+		if err != nil || Merge(DefaultGlobalConfig(), repo).PR.Template != name {
+			t.Errorf("path parse/merge %q: %v", name, err)
+		}
+	}
+	for _, name := range []string{".", "..", "../outside", "a/../../outside", "/etc/passwd", `C:\Users\who\x`, `a\b`, "https://example.test/a", "main:x", "./a", "a//b", "a/", ".git/config", "a/.git/x", " x", "x\n", "a\x00b", "-template"} {
+		if err := ValidatePRTemplatePath(name); err == nil {
+			t.Errorf("unsafe %q accepted", name)
+		}
+	}
+}
+
+func TestPRRenderTitle_DefaultLeavesTitleUnchanged(t *testing.T) {
+	t.Parallel()
+
+	got, err := (PR{}).RenderTitle("PROJ-123", "fix: repair widget")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "fix: repair widget"; got != want {
+		t.Fatalf("RenderTitle() = %q, want %q", got, want)
+	}
+}
+
+func TestPRRenderTitle_CustomFormat(t *testing.T) {
+	t.Parallel()
+
+	pr := PR{TitleFormat: "{{.Branch}}: {{.Title}}"}
+	got, err := pr.RenderTitle("PROJ-123", "add widget")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "PROJ-123: add widget"; got != want {
+		t.Fatalf("RenderTitle() = %q, want %q", got, want)
+	}
+}
+
+func TestPRRenderTitle_UsesReplacedBranchIdentifier(t *testing.T) {
+	t.Parallel()
+
+	commit := Commit{
+		BranchPattern:     `^PROJ/([0-9]+)$`,
+		BranchReplacement: "PROJ-${1}",
+	}
+	branch, err := commit.BranchValue("PROJ/123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := (PR{TitleFormat: "{{.Branch}}: {{.Title}}"}).RenderTitle(branch, "preserve legacy drafts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "PROJ-123: preserve legacy drafts"; got != want {
+		t.Fatalf("RenderTitle() = %q, want %q", got, want)
+	}
+}
+
+func TestPRRenderTitle_DoesNotApplyProviderLimit(t *testing.T) {
+	t.Parallel()
+
+	title := strings.Repeat("x", 256)
+	got, err := (PR{TitleFormat: "{{.Title}}"}).RenderTitle("", title)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != title {
+		t.Fatalf("RenderTitle() length = %d, want %d", len(got), len(title))
+	}
+}
+
+func TestPRRenderTitle_NoIdentifierFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	pr := PR{TitleFormat: "{{.Branch}}: {{.Title}}"}
+	if got, err := pr.RenderTitle("", "add widget"); err == nil {
+		t.Fatalf("RenderTitle() = %q, want no-identifier error", got)
+	}
+}
+
+func TestLoadRepo_PRTitleFormat(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := LoadRepoFromBytes([]byte("pr:\n  title_format: '{{.Branch}}: {{.Title}}'\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PR.TitleFormat == nil || *cfg.PR.TitleFormat != "{{.Branch}}: {{.Title}}" {
+		t.Fatalf("pr.title_format = %v, want configured format", cfg.PR.TitleFormat)
+	}
+}
+
+func TestLoadRepo_RejectsInvalidPRTitleFormat(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]string{
+		"empty":               "pr:\n  title_format: ''\n",
+		"unknown placeholder": "pr:\n  title_format: '{{.Summary}}'\n",
+		"function":            "pr:\n  title_format: '{{printf \"%s\" .Title}}'\n",
+		"malformed":           "pr:\n  title_format: '{{'\n",
+		"control":             "pr:\n  title_format: \"PROJ-123:\\u0007 {{.Title}}\"\n",
+	}
+	for name, data := range tests {
+		name, data := name, data
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := LoadRepoFromBytes([]byte(data)); err == nil {
+				t.Fatal("LoadRepoFromBytes() accepted invalid pr.title_format")
+			}
+		})
+	}
+}
+
+func TestEffectiveRepoConfig_TitleFormatIsPushedReadable(t *testing.T) {
+	t.Parallel()
+
+	pushedFormat := "{{.Branch}}: {{.Title}}"
+	trustedFormat := "trusted {{.Title}}"
+	pushed := &RepoConfig{PR: PRRaw{TitleFormat: &pushedFormat}}
+	trusted := &RepoConfig{PR: PRRaw{TitleFormat: &trustedFormat, BaseBranch: "develop"}}
+
+	got := EffectiveRepoConfig(pushed, trusted, false)
+	if got.PR.TitleFormat == nil || *got.PR.TitleFormat != pushedFormat {
+		t.Fatalf("effective title_format = %v, want pushed format", got.PR.TitleFormat)
+	}
+	if got.PR.BaseBranch != "develop" {
+		t.Fatalf("effective base_branch = %q, want trusted branch", got.PR.BaseBranch)
+	}
+}
+
+func TestMerge_DefaultPRTitleFormatIsEmpty(t *testing.T) {
+	t.Parallel()
+
+	cfg := Merge(DefaultGlobalConfig(), &RepoConfig{})
+	if cfg.PR.TitleFormat != "" {
+		t.Fatalf("PR.TitleFormat = %q, want empty default", cfg.PR.TitleFormat)
+	}
+}

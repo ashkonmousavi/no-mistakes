@@ -17,8 +17,10 @@ import (
 
 // TestTestStep_PromptDerivesScenariosAndMarksLive pins the live-validation
 // prompt contract: the step asks for named scenarios driven against the real
-// product, an explicit live marking that a unit test cannot claim, an honest
-// untested result with a reason instead of a guessed pass, and a verdict. The
+// product, agent-owned workarounds (disposable, isolated setups it builds
+// itself) to get each scenario live, an explicit live marking that a unit test
+// cannot claim, untested reserved for scenarios that are truly impossible to
+// drive live with a reason saying what was tried, and a verdict. The
 // pre-contract framing that let a green unit-test run stand in for driving the
 // product must be gone.
 func TestTestStep_PromptDerivesScenariosAndMarksLive(t *testing.T) {
@@ -46,12 +48,28 @@ func TestTestStep_PromptDerivesScenariosAndMarksLive(t *testing.T) {
 		"add an adversarial scenario that actively tries to break it",
 		// Live is a claim about what actually ran.
 		"drive each scenario end-to-end against that running product",
+		"give the pty a non-zero window size (TIOCSWINSZ)",
+		"drain the master",
+		"terminal reported a zero-sized grid",
+		"a live UI check silently becomes a fake",
 		`Mark a scenario "live": true ONLY when you drove it against the real product in this run`,
 		"A unit test, a stub, a mock, a recorded fixture, or reading the code is NOT live",
-		// Untested is honest and cheap; a guessed pass is not.
-		`return it with result "untested" and a reason naming the specific tool, credential, permission, or authority`,
+		// The agent owns workarounds to get each scenario live, and whatever
+		// it builds for that stays disposable and isolated.
+		"Getting every scenario live is your responsibility",
+		"build a disposable one yourself",
+		"point the real product at it through whatever isolation the product supports",
+		"A missing environment is a problem to solve, not a reason to skip the scenario",
+		"a fixture that stands in for the product itself is not",
+		"Everything you build must stay disposable and isolated",
+		"never read or write the operator's real data, real configuration, or shared services",
+		// Untested is reserved for the truly impossible and says what was tried.
+		`Return a scenario with result "untested" only when live validation is truly impossible here`,
+		"state what you tried in order to drive it live and why each attempt cannot work",
+		"naming the specific tool, credential, permission, or authority that is out of reach and how to provide it",
+		`"No environment was provided" is not such a reason while you could have built a disposable one`,
 		"Never guess a pass",
-		"an honest \"untested\" costs nothing and a guessed \"pass\" costs everything",
+		"an honest \"untested\" after exhausting your workarounds costs nothing and a guessed \"pass\" costs everything",
 		"reported as an untested scenario with its reason, NOT as a finding",
 		// The verdict and what it does.
 		`Return a "verdict"`,
@@ -72,9 +90,37 @@ func TestTestStep_PromptDerivesScenariosAndMarksLive(t *testing.T) {
 	for _, forbidden := range []string{
 		"run the smallest relevant tests yourself",
 		"Look for existing tests that would generate sufficient evidence",
+		// The old contract let any missing capability justify untested.
+		"When a scenario cannot be driven live here",
 	} {
 		if strings.Contains(prompt, forbidden) {
 			t.Errorf("evidence prompt still carries pre-contract framing %q", forbidden)
+		}
+	}
+
+	var schema struct {
+		Properties struct {
+			Scenarios struct {
+				Items struct {
+					Properties struct {
+						Reason struct {
+							Description string `json:"description"`
+						} `json:"reason"`
+					} `json:"properties"`
+				} `json:"items"`
+			} `json:"scenarios"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(ag.calls[0].JSONSchema, &schema); err != nil {
+		t.Fatalf("decode delivered evidence schema: %v", err)
+	}
+	reason := schema.Properties.Scenarios.Items.Properties.Reason.Description
+	for _, want := range []string{
+		"what was tried to drive this scenario live and why live validation is impossible",
+		"why there is no live-validatable surface",
+	} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("delivered schema's untested reason description = %q, want it to contain %q", reason, want)
 		}
 	}
 }
@@ -146,8 +192,11 @@ func TestTestStep_FailingBaselineStillRunsEvidenceTurn(t *testing.T) {
 	if len(findings.Tested) < 2 || findings.Tested[0] != testCmd {
 		t.Fatalf("tested = %+v, want baseline followed by evidence checks", findings.Tested)
 	}
-	if len(findings.Items) == 0 || findings.Items[0].Action != types.ActionAutoFix || !strings.Contains(findings.Items[0].Description, "tests failed with exit code 7") {
-		t.Fatalf("auto-fixable baseline finding missing from %+v", findings.Items)
+	if len(findings.Items) == 0 || !strings.Contains(findings.Items[0].Description, "configured test command failed with exit code 7") {
+		t.Fatalf("baseline finding missing from %+v", findings.Items)
+	}
+	if findings.Items[0].Category != types.FindingCategoryTestCommand {
+		t.Fatalf("finding category = %q, want %s", findings.Items[0].Category, types.FindingCategoryTestCommand)
 	}
 }
 
@@ -526,7 +575,7 @@ func TestTestStep_InvalidAnalyzerPayloadTriggersCorrectionRound(t *testing.T) {
 		{
 			name:       "untested without a reason",
 			invalid:    untestedWithoutReasonFindingsJSON,
-			wantPrompt: `scenario 1: result "untested" without a reason - name the specific tool, credential, permission, or authority that stopped you, and how to provide it`,
+			wantPrompt: `scenario 1: result "untested" without a reason - state what was tried to drive it live and why live validation is impossible, naming the specific tool, credential, permission, or authority out of reach and how to provide it`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -717,133 +766,6 @@ func TestTestStep_ValidMixedPayloadDoesNotRetry(t *testing.T) {
 	}
 	if findings.Verdict != types.TestVerdictGo || len(findings.Scenarios) != 2 {
 		t.Fatalf("valid mixed payload was not retained: %+v", findings)
-	}
-}
-
-// TestTestStep_EmptyPlaceholderScenarioMapRefused reproduces the
-// test-analyzer-empty-scenario-map heal finding verbatim: a single scenario
-// literally named "test" (the step's own name), reported untested with a
-// verdict of inconclusive. Before the scenario-map-shape check this payload
-// satisfied every per-field contract check and reached verdictFindings as a
-// legitimate "inconclusive" ask-user finding. It must instead be refused as
-// degenerate output and, since the analyzer keeps returning the same
-// placeholder, fail the step after the bounded correction attempts rather
-// than parking as inconclusive.
-func TestTestStep_EmptyPlaceholderScenarioMapRefused(t *testing.T) {
-	t.Parallel()
-	dir, baseSHA, headSHA := setupGitRepo(t)
-	const degenerateSingleScenarioJSON = `{
-	  "findings": [],
-	  "summary": "",
-	  "tested": ["test"],
-	  "testing_summary": "test",
-	  "artifacts": [],
-	  "scenarios": [{"name":"test","result":"untested","live":false,"evidence":"","reason":"could not derive scenarios"}],
-	  "verdict": "inconclusive"
-	}`
-	ag := &mockAgent{
-		name: "test",
-		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
-			return &agent.Result{Output: json.RawMessage(degenerateSingleScenarioJSON)}, nil
-		},
-	}
-	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
-	sctx.UserIntent = "Show users a success screen after checkout"
-
-	outcome, err := (&TestStep{}).Execute(sctx)
-	if err == nil {
-		t.Fatalf("a placeholder-only scenario map must be refused, not ruled inconclusive; outcome: %+v", outcome)
-	}
-	if outcome != nil {
-		t.Fatalf("Execute() outcome = %+v, want no outcome once refusal exhausts the correction bound", outcome)
-	}
-	got := err.Error()
-	for _, want := range []string{
-		fmt.Sprintf("after %d attempts", testAnalyzerMaxAttempts),
-		"parsed scenario map shape: 1 scenario(s) total, 1 placeholder name(s) (test)",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("error = %q, want it to name the parsed shape including %q", got, want)
-		}
-	}
-	if len(ag.calls) != testAnalyzerMaxAttempts {
-		t.Fatalf("agent calls = %d, want %d: the analyzer must be asked to re-derive the map before the step fails", len(ag.calls), testAnalyzerMaxAttempts)
-	}
-}
-
-// TestTestStep_PlaceholderScenarioNameRefused proves the placeholder check is
-// a general mechanism, not a hardcoded match on the literal word "test": any
-// generic label that carries no scenario content is refused the same way,
-// even when mixed alongside a well-formed scenario.
-func TestTestStep_PlaceholderScenarioNameRefused(t *testing.T) {
-	t.Parallel()
-	dir, baseSHA, headSHA := setupGitRepo(t)
-	const placeholderAmongRealJSON = `{
-	  "findings": [],
-	  "summary": "",
-	  "tested": ["npm run e2e -- checkout"],
-	  "testing_summary": "drove checkout end to end",
-	  "artifacts": [],
-	  "scenarios": [
-	    {"name":"user reaches the success screen","result":"pass","live":true,"evidence":"checkout.png","reason":""},
-	    {"name":"scenario","result":"untested","live":false,"evidence":"","reason":"placeholder"}
-	  ],
-	  "verdict": "inconclusive"
-	}`
-	ag := &mockAgent{
-		name: "test",
-		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
-			return &agent.Result{Output: json.RawMessage(placeholderAmongRealJSON)}, nil
-		},
-	}
-	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
-	sctx.UserIntent = "Show users a success screen after checkout"
-
-	outcome, err := (&TestStep{}).Execute(sctx)
-	if err == nil {
-		t.Fatalf("a scenario map containing a placeholder name must be refused; outcome: %+v", outcome)
-	}
-	if outcome != nil {
-		t.Fatalf("Execute() outcome = %+v, want no outcome once refusal exhausts the correction bound", outcome)
-	}
-	got := err.Error()
-	if !strings.Contains(got, "parsed scenario map shape: 2 scenario(s) total, 1 placeholder name(s) (scenario)") {
-		t.Fatalf("error = %q, want it to name the parsed shape naming the placeholder scenario", got)
-	}
-}
-
-// TestTestStep_WellFormedScenarioMapStillRulesNormally proves the new
-// placeholder check does not disturb a legitimate, intent-derived scenario
-// map: it must still reach a normal verdict without hitting the scenario-map
-// refusal, exactly as it did before the check existed.
-func TestTestStep_WellFormedScenarioMapStillRulesNormally(t *testing.T) {
-	t.Parallel()
-	dir, baseSHA, headSHA := setupGitRepo(t)
-	ag := &mockAgent{
-		name: "test",
-		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
-			return &agent.Result{Output: json.RawMessage(mixedLivePassAndUntestedFindingsJSON)}, nil
-		},
-	}
-	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
-	sctx.UserIntent = "Show users a success screen after checkout"
-
-	outcome, err := (&TestStep{}).Execute(sctx)
-	if err != nil {
-		t.Fatalf("a well-formed scenario map must not be refused: %v", err)
-	}
-	if len(ag.calls) != 1 {
-		t.Fatalf("agent calls = %d, want 1: a well-formed map must not trigger a correction round", len(ag.calls))
-	}
-	if outcome.NeedsApproval {
-		t.Fatalf("a well-formed passing map must not park, findings: %s", outcome.Findings)
-	}
-	findings, err := types.ParseFindingsJSON(outcome.Findings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if findings.Verdict != types.TestVerdictGo || len(findings.Scenarios) != 2 {
-		t.Fatalf("well-formed map was not retained: %+v", findings)
 	}
 }
 

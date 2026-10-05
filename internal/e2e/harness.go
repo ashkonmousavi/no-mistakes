@@ -79,12 +79,6 @@ type SetupOpts struct {
 
 const e2eDaemonStartTimeout = "45s"
 
-// e2eNoMistakesBinEnv lets a post-install consumer run the E2E suite against
-// the exact installed binary rather than silently compiling the checkout. The
-// harness still builds fakeagent from this checkout, because it is test
-// infrastructure rather than the consumer artifact under proof.
-const e2eNoMistakesBinEnv = "NM_E2E_NO_MISTAKES_BIN"
-
 // NewHarness builds the no-mistakes + fakeagent binaries (once per test
 // process), creates a temp git repo with origin, writes the no-mistakes
 // global config to point at the chosen fake agent, and registers cleanup
@@ -134,7 +128,7 @@ func NewHarness(t *testing.T, opts SetupOpts) *Harness {
 	// system CLI. antigravity gets a second link under its probed binary
 	// name "agy" (internal/cli/doctor.go searches that name, not the agent
 	// name).
-	for _, name := range []string{"claude", "codex", "grok", "opencode", "antigravity", "agy", "gh", "tea"} {
+	for _, name := range []string{"claude", "codex", "grok", "opencode", "pi", "antigravity", "agy", "gh", "tea"} {
 		linkPath := filepath.Join(h.BinDir, executableName(name))
 		if err := os.Symlink(fakeBin, linkPath); err != nil {
 			t.Fatalf("symlink %s: %v", linkPath, err)
@@ -472,26 +466,15 @@ func (h *Harness) WorktreeRefSHA(ref string) string {
 // RunInfo so the test can assert on per-step outcomes.
 func (h *Harness) WaitForRun(branch string, timeout time.Duration) *ipc.RunInfo {
 	h.t.Helper()
-	return h.waitForRunStatus(branch, "", timeout, func(status types.RunStatus) bool {
+	return h.waitForRunStatus(branch, timeout, func(status types.RunStatus) bool {
 		return status.Terminal()
 	}, "finish")
-}
-
-// WaitForRunAfter waits for a terminal run created after the named prior run.
-// A trigger can return before the replacement row is visible; excluding the
-// prior terminal row prevents that race from being mistaken for completion of
-// the new launch.
-func (h *Harness) WaitForRunAfter(branch, priorRunID string, timeout time.Duration) *ipc.RunInfo {
-	h.t.Helper()
-	return h.waitForRunStatus(branch, priorRunID, timeout, func(status types.RunStatus) bool {
-		return status.Terminal()
-	}, "finish after prior run "+priorRunID)
 }
 
 // WaitForRunRunning polls until the newest run for branch reaches running.
 func (h *Harness) WaitForRunRunning(branch string, timeout time.Duration) *ipc.RunInfo {
 	h.t.Helper()
-	return h.waitForRunStatus(branch, "", timeout, func(status types.RunStatus) bool {
+	return h.waitForRunStatus(branch, timeout, func(status types.RunStatus) bool {
 		return status == types.RunRunning
 	}, "start running")
 }
@@ -548,6 +531,10 @@ func (h *Harness) Respond(runID string, step types.StepName, action types.Approv
 	}
 }
 
+// RespondWithFindings answers an approval gate while explicitly selecting the
+// findings that the fix round must carry forward. An empty selection means no
+// findings, not all findings, so tests exercising review fixes should name the
+// finding IDs they intend to repair.
 func (h *Harness) RespondWithFindings(runID string, step types.StepName, action types.ApprovalAction, findingIDs []string) {
 	h.t.Helper()
 	if err := h.respondError(runID, step, action, findingIDs); err != nil {
@@ -594,7 +581,7 @@ func (h *Harness) CancelRun(runID string) {
 	}
 }
 
-func (h *Harness) waitForRunStatus(branch, excludedRunID string, timeout time.Duration, match func(types.RunStatus) bool, action string) *ipc.RunInfo {
+func (h *Harness) waitForRunStatus(branch string, timeout time.Duration, match func(types.RunStatus) bool, action string) *ipc.RunInfo {
 	h.t.Helper()
 	deadline := time.Now().Add(timeout)
 
@@ -621,7 +608,7 @@ func (h *Harness) waitForRunStatus(branch, excludedRunID string, timeout time.Du
 		}
 		for i := range result.Runs {
 			r := &result.Runs[i]
-			if r.Branch != branch || r.ID == excludedRunID {
+			if r.Branch != branch {
 				continue
 			}
 			lastRun = r
@@ -781,9 +768,9 @@ var (
 	buildErr  error
 )
 
-// buildBinaries compiles fakeagent and, unless NM_E2E_NO_MISTAKES_BIN names a
-// verified absolute no-mistakes executable, compiles no-mistakes too. Both are
-// cached once per `go test` invocation; subsequent harnesses reuse them.
+// buildBinaries compiles the no-mistakes binary and the fakeagent binary
+// once per `go test` invocation. Both are placed in a per-process build
+// dir; subsequent harnesses reuse them.
 func buildBinaries(t *testing.T) (nmBin, fakeBin string) {
 	t.Helper()
 	buildOnce.Do(func() {
@@ -792,6 +779,7 @@ func buildBinaries(t *testing.T) (nmBin, fakeBin string) {
 			buildErr = err
 			return
 		}
+		nm := filepath.Join(dir, executableName("no-mistakes"))
 		fake := filepath.Join(dir, executableName("fakeagent"))
 
 		repoRoot, err := findRepoRoot()
@@ -799,22 +787,19 @@ func buildBinaries(t *testing.T) (nmBin, fakeBin string) {
 			buildErr = err
 			return
 		}
-
-		nm, err := suppliedNoMistakesBinary()
-		if err != nil {
-			buildErr = err
-			return
-		}
-		if nm == "" {
-			nm = filepath.Join(dir, executableName("no-mistakes"))
-			buildTarget(repoRoot, nm, "./cmd/no-mistakes")
-			if buildErr != nil {
+		for _, target := range []struct {
+			out, pkg string
+		}{
+			{nm, "./cmd/no-mistakes"},
+			{fake, "./cmd/fakeagent"},
+		} {
+			cmd := exec.Command("go", "build", "-o", target.out, target.pkg)
+			cmd.Dir = repoRoot
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				buildErr = fmt.Errorf("build %s: %v\n%s", target.pkg, err, out)
 				return
 			}
-		}
-		buildTarget(repoRoot, fake, "./cmd/fakeagent")
-		if buildErr != nil {
-			return
 		}
 		builtNM = nm
 		builtFake = fake
@@ -823,48 +808,6 @@ func buildBinaries(t *testing.T) (nmBin, fakeBin string) {
 		t.Fatalf("build binaries: %v", buildErr)
 	}
 	return builtNM, builtFake
-}
-
-func buildTarget(repoRoot, output, pkg string) {
-	cmd := exec.Command("go", "build", "-o", output, pkg)
-	cmd.Dir = repoRoot
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		buildErr = fmt.Errorf("build %s: %v\n%s", pkg, err, out)
-	}
-}
-
-// suppliedNoMistakesBinary validates the opt-in consumer binary before any
-// E2E daemon can execute it. An empty setting preserves the normal source-tree
-// build; a relative path, non-regular file, file without required host execute
-// permissions, or executable that is not no-mistakes fails closed.
-func suppliedNoMistakesBinary() (string, error) {
-	path := strings.TrimSpace(os.Getenv(e2eNoMistakesBinEnv))
-	if path == "" {
-		return "", nil
-	}
-	if !filepath.IsAbs(path) {
-		return "", fmt.Errorf("%s must be an absolute path, got %q", e2eNoMistakesBinEnv, path)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", fmt.Errorf("verify %s %q: %w", e2eNoMistakesBinEnv, path, err)
-	}
-	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("verify %s %q: not a regular file", e2eNoMistakesBinEnv, path)
-	}
-	if runtime.GOOS != "windows" && info.Mode().Perm()&0o111 == 0 {
-		return "", fmt.Errorf("verify %s %q: not executable", e2eNoMistakesBinEnv, path)
-	}
-	cmd := exec.Command(path, "--version")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("verify %s %q with --version: %w\n%s", e2eNoMistakesBinEnv, path, err, out)
-	}
-	if !strings.HasPrefix(string(out), "no-mistakes version ") {
-		return "", fmt.Errorf("verify %s %q: --version did not identify no-mistakes: %q", e2eNoMistakesBinEnv, path, strings.TrimSpace(string(out)))
-	}
-	return path, nil
 }
 
 func executableName(base string) string {

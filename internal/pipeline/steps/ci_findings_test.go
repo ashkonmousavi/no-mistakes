@@ -172,17 +172,6 @@ func TestCIObservationFindings_PreservesSameNamedCheckIdentityAndClassification(
 	}
 }
 
-func TestCIObservationFindings_IgnoresNamesAbsentFromObservation(t *testing.T) {
-	t.Parallel()
-	findings := ciObservationFindings(ciIssues{
-		checks:  []scm.Check{{Name: "build", ProviderID: "github-check-run:41", Bucket: scm.CheckBucketFail}},
-		failing: []string{"missing"},
-	})
-	if len(findings.Items) != 0 || findings.Summary != "" {
-		t.Fatalf("findings = %+v, want no synthetic finding for an absent check", findings)
-	}
-}
-
 // A red review-bot check with no unresolved comment still needs a decision; a
 // bot that left more comments than one gate can carry is summarized.
 func TestReviewBotFindings_BoundsAndEmptyCase(t *testing.T) {
@@ -306,46 +295,6 @@ func TestCIRepairParkOutcome_RelabelsEveryFindingAskUser(t *testing.T) {
 	}
 	if types.HasAskUserFindings(parsed) != true || len(types.AutoFixableFindings(parsed).Items) != 0 {
 		t.Fatal("parked findings must be ask-user only")
-	}
-}
-
-// TestCITerminalMonitorOutcomePreservesDeferredFindingsAfterPublishedRepair
-// proves a terminal provider/read/target exit cannot erase the ask-user half
-// of the mixed observation whose auto-fix half was just published.
-func TestCITerminalMonitorOutcomePreservesDeferredFindingsAfterPublishedRepair(t *testing.T) {
-	t.Parallel()
-	outcome := ciTerminalMonitorOutcome(
-		ciFailureOutcome([]scm.CheckTarget{{Name: "unsafe", ProviderID: "github-check-run:42"}}, false, "provider target moved"),
-		`{"findings":[{"id":"deferred-review","severity":"warning","description":"review decision still required","action":"ask-user","category":"ci-review-bot","check":"review"}]}`,
-	)
-	findings, err := types.ParseFindingsJSON(outcome.Findings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !outcome.NeedsApproval || outcome.AutoFixable || len(findings.Items) != 2 {
-		t.Fatalf("outcome = %+v findings = %+v, want the terminal issue plus deferred decision parked", outcome, findings.Items)
-	}
-	if findings.Items[0].CheckID != "github-check-run:42" || findings.Items[1].ID != "deferred-review" {
-		t.Fatalf("findings = %+v, want exact terminal check and deferred decision", findings.Items)
-	}
-}
-
-func TestCITerminalMonitorOutcomeAssignsUniqueIDsAfterDeferredMerge(t *testing.T) {
-	t.Parallel()
-	outcome := ciTerminalMonitorOutcome(
-		ciFailureOutcome([]scm.CheckTarget{{Name: "provider", ProviderID: "github-check-run:42"}}, false, "provider unavailable"),
-		`{"findings":[{"id":"ci-1","severity":"warning","description":"review decision still required","action":"ask-user","category":"ci-review-bot","check":"review"}]}`,
-	)
-	findings, err := types.ParseFindingsJSON(outcome.Findings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(findings.Items) != 2 || findings.Items[0].ID != "ci-2" || findings.Items[1].ID != "ci-1" {
-		t.Fatalf("finding IDs = %+v, want a new collision-free ID and the stable deferred ID", findings.Items)
-	}
-	selected := types.FilterFindings(findings, []string{"ci-1"})
-	if len(selected.Items) != 1 || selected.Items[0].Description != "review decision still required" {
-		t.Fatalf("ci-1 selected %+v, want only the deferred finding", selected.Items)
 	}
 }
 

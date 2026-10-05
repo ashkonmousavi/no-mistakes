@@ -2195,196 +2195,253 @@ func (f *recoverFixture) localAnchorRef() string {
 	return "refs/no-mistakes/recover-local/" + f.run.ID
 }
 
-// newRebasedRecoverFixtureGateBehind reproduces the exact shape in G3
-// evidence-supplement C7.8 (row C7.8, executions/c7-execution.log): a
-// pipeline rebase moves the preserved head, and terminalization anchors it in
-// the gate under the run-specific recovery ref rather than by pushing -
-// refs/heads/feature/recover in the gate never advances past the submitted
-// head, because no push step ever ran before the run went terminal. This
-// differs from newRebasedRecoverFixture, whose pipeline clone force-pushes
-// the rebased head straight onto the gate branch and so never exhibits the
-// gap.
-func newRebasedRecoverFixtureGateBehind(t *testing.T, status types.RunStatus) *recoverFixture {
+func newTerminalEqualTreeRewriteFixture(t *testing.T) (*recoverFixture, string) {
 	t.Helper()
-	ctx := context.Background()
-	root := t.TempDir()
-	remote := filepath.Join(root, "upstream.git")
-	mustRun(t, root, "init", "--bare", remote)
+	f := newRebasedRecoverFixture(t, types.RunFailed)
+	pipeline := filepath.Join(filepath.Dir(f.local), "terminal-rewrite")
+	mustRun(t, filepath.Dir(f.local), "-c", "core.autocrlf=false", "clone", f.gate, pipeline)
+	configureIdentity(t, pipeline)
+	mustRun(t, pipeline, "checkout", "--detach", f.submitted)
+	mustWrite(t, filepath.Join(pipeline, "feature.txt"), "pipeline reviewed replacement\n")
+	mustRun(t, pipeline, "commit", "-am", "reviewed pipeline result")
+	recorded := mustRun(t, pipeline, "rev-parse", "HEAD")
+	tree := mustRun(t, pipeline, "rev-parse", recorded+"^{tree}")
+	live := mustRun(t, pipeline, "commit-tree", tree, "-p", "origin/main", "-m", "terminal equal-tree rewrite")
+	mustRun(t, pipeline, "push", "origin", recorded+":refs/no-mistakes/test-recorded")
+	mustRun(t, pipeline, "push", "--force", "origin", live+":refs/heads/feature/recover")
+	mustRun(t, f.gate, "update-ref", "-d", "refs/no-mistakes/test-recorded")
+	if err := f.db.UpdateRunHeadSHA(f.run.ID, recorded); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.UpdateRunReviewApprovedHeadSHA(f.run.ID, recorded); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.UpdateRunErrorStatus(f.run.ID, "terminal worker lost", types.RunFailed); err != nil {
+		t.Fatal(err)
+	}
+	f.preserved = live
+	f.run, _ = f.db.GetRun(f.run.ID)
+	return f, recorded
+}
 
-	local := filepath.Join(root, "operator")
-	mustRun(t, root, "init", "-b", "main", local)
-	configureIdentity(t, local)
-	mustWrite(t, filepath.Join(local, "file.txt"), "base\n")
-	mustRun(t, local, "add", "file.txt")
-	mustRun(t, local, "commit", "-m", "base")
-	base := mustRun(t, local, "rev-parse", "HEAD")
+func TestRecoverTerminalUnverifiedEqualTreeRewriteAdoptsLiveGateHead(t *testing.T) {
+	t.Parallel()
 
-	mustRun(t, local, "checkout", "-b", "feature/recover")
-	mustWrite(t, filepath.Join(local, "feature.txt"), "feature one\n")
-	mustRun(t, local, "add", "feature.txt")
-	mustRun(t, local, "commit", "-m", "feature one")
-	mustWrite(t, filepath.Join(local, "feature.txt"), "feature one\nfeature two\n")
-	mustRun(t, local, "commit", "-am", "feature two")
-	submitted := mustRun(t, local, "rev-parse", "HEAD")
+	f, recorded := newTerminalEqualTreeRewriteFixture(t)
+	if f.run.TerminalHeadVerifiedAt != nil {
+		t.Fatal("fixture terminal head is already verified")
+	}
+	if isAncestor(f.ctx, f.gate, recorded, f.preserved) || isAncestor(f.ctx, f.gate, f.preserved, recorded) {
+		t.Fatal("fixture heads are not non-ancestral")
+	}
+	if got, want := mustRun(t, f.gate, "rev-parse", recorded+"^{tree}"), mustRun(t, f.gate, "rev-parse", f.preserved+"^{tree}"); got != want {
+		t.Fatalf("fixture trees differ: %s != %s", got, want)
+	}
+	if !isAncestor(f.ctx, f.gate, f.submitted, recorded) {
+		t.Fatal("recorded reviewed head does not descend from submitted local head")
+	}
+	if preservedContainsLocalWork(f.ctx, f.gate, f.submitted, f.preserved) {
+		t.Fatal("fixture does not reproduce the direct live-head containment conflict")
+	}
+	if f.run.ReviewApprovedHeadSHA == nil || *f.run.ReviewApprovedHeadSHA != recorded {
+		t.Fatalf("review authority = %#v, want %s", f.run.ReviewApprovedHeadSHA, recorded)
+	}
+	runsBefore := len(mustRuns(t, f.db, f.repo.ID))
+	remoteBefore := mustRun(t, f.remote, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads")
 
-	// The default branch advances after submission; that is what makes the
-	// pipeline rebase produce new SHAs for the same logical commits.
-	mustRun(t, local, "checkout", "main")
-	mustWrite(t, filepath.Join(local, "upstream.txt"), "upstream advance\n")
-	mustRun(t, local, "add", "upstream.txt")
-	mustRun(t, local, "commit", "-m", "upstream advance")
-	mustRun(t, local, "checkout", "feature/recover")
+	state := f.service.Recover(f.ctx, false)
+	if !state.Recovered || !state.Changed || state.State != StateCustodyReturned {
+		t.Fatalf("equal-tree terminal recovery = %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("HEAD = %s, want live gate head %s", got, f.preserved)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", f.anchorRef()); got != f.preserved {
+		t.Fatalf("gate recovery anchor = %s, want %s", got, f.preserved)
+	}
+	if got := mustRun(t, f.local, "rev-parse", f.anchorRef()); got != f.preserved {
+		t.Fatalf("local recovery anchor = %s, want %s", got, f.preserved)
+	}
+	if got := mustRun(t, f.local, "rev-parse", f.localAnchorRef()); got != f.submitted {
+		t.Fatalf("local pre-recovery anchor = %s, want %s", got, f.submitted)
+	}
+	run, err := f.db.GetRun(f.run.ID)
+	if err != nil || run.HeadSHA != f.preserved || run.TerminalHeadVerifiedAt == nil || run.CustodyReturnedAt == nil || run.UpdatedAt < f.run.UpdatedAt {
+		t.Fatalf("recovered run = %#v, err %v", run, err)
+	}
+	if clean, reason := worktreeClean(f.ctx, f.local); !clean {
+		t.Fatalf("worktree not clean after recovery: %s", reason)
+	}
+	if second := f.service.Recover(f.ctx, false); !second.Recovered || second.Changed {
+		t.Fatalf("repeated recovery = %#v", second)
+	}
+	if got := len(mustRuns(t, f.db, f.repo.ID)); got != runsBefore {
+		t.Fatalf("recovery changed run count from %d to %d", runsBefore, got)
+	}
+	if got := mustRun(t, f.remote, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"); got != remoteBefore {
+		t.Fatalf("recovery pushed upstream refs: %q != %q", got, remoteBefore)
+	}
+}
 
-	gate := filepath.Join(root, "gate.git")
-	mustRun(t, root, "init", "--bare", gate)
-	mustRun(t, local, "push", gate, "refs/heads/main:refs/heads/main", "refs/heads/feature/recover:refs/heads/feature/recover")
+func mustRuns(t *testing.T, database *db.DB, repoID string) []*db.Run {
+	t.Helper()
+	runs, err := database.GetRunsByRepo(repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runs
+}
 
-	pipeline := filepath.Join(root, "pipeline")
-	mustRun(t, root, "-c", "core.autocrlf=false", "clone", gate, pipeline)
+func pushTerminalRewrite(t *testing.T, f *recoverFixture, mutate func(string)) string {
+	t.Helper()
+	pipeline := filepath.Join(t.TempDir(), "rewrite")
+	mustRun(t, filepath.Dir(pipeline), "-c", "core.autocrlf=false", "clone", f.gate, pipeline)
 	configureIdentity(t, pipeline)
 	mustRun(t, pipeline, "checkout", "feature/recover")
-	mustRun(t, pipeline, "rebase", "origin/main")
-	preserved := mustRun(t, pipeline, "rev-parse", "HEAD")
-
-	database, err := db.Open(filepath.Join(root, "state.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { database.Close() })
-	repo, err := database.InsertRepo(local, remote, "main")
-	if err != nil {
-		t.Fatal(err)
-	}
-	run, err := database.InsertRun(repo.ID, "feature/recover", submitted, base)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Terminalization anchors the rebased head under the run-specific
-	// recovery ref; unlike newRebasedRecoverFixture, the gate's own branch
-	// ref is never force-pushed and so stays exactly at the submitted head.
-	mustRun(t, pipeline, "push", "origin", preserved+":"+custody.RecoveryRef(run.ID))
-	if err := database.UpdateRunHeadSHA(run.ID, preserved); err != nil {
-		t.Fatal(err)
-	}
-	if err := database.UpdateRunStatusWithVerifiedHead(run.ID, status, preserved); err != nil {
-		t.Fatal(err)
-	}
-	run, _ = database.GetRun(run.ID)
-	return &recoverFixture{
-		t: t, ctx: ctx, db: database, repo: repo, run: run,
-		service: &Service{DB: database, Repo: repo, WorkDir: local, GateDir: gate},
-		local:   local, gate: gate, remote: remote,
-		base: base, submitted: submitted, preserved: preserved,
-	}
+	mutate(pipeline)
+	mustRun(t, pipeline, "add", "-A")
+	mustRun(t, pipeline, "commit", "-m", "terminal changed-tree rewrite")
+	live := mustRun(t, pipeline, "rev-parse", "HEAD")
+	mustRun(t, pipeline, "push", "--force", "origin", "HEAD:refs/heads/feature/recover")
+	f.preserved = live
+	return live
 }
 
-// TestRecoverRebasedPreservedHeadSettlesGateBranchForFreshRun is the
-// regression for G3 evidence-supplement C7.8: after a pipeline-moved head,
-// plain `axi sync --recover` (no --keep-local) must settle the gate's own
-// branch ref to the adopted preserved head, atomically, so the very next
-// follow-up commit's fresh run can push without a raw Git non-fast-forward.
-// It independently proves recovery no longer leaves the gate ref behind the
-// branch it just recovered.
-func TestRecoverRebasedPreservedHeadSettlesGateBranchForFreshRun(t *testing.T) {
-	t.Parallel()
-
-	f := newRebasedRecoverFixtureGateBehind(t, types.RunCancelled)
-	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.submitted {
-		t.Fatalf("fixture gate branch = %s, want submitted %s before recovery", got, f.submitted)
+func assertUnverifiedRecoveryRefusalNoMutation(t *testing.T, f *recoverFixture) State {
+	t.Helper()
+	localRefs := mustRun(t, f.local, "for-each-ref", "--format=%(refname) %(objectname)", "refs/no-mistakes")
+	gateRefs := mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname)", "refs/no-mistakes")
+	runBefore, err := f.db.GetRun(f.run.ID)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	state := f.service.Recover(f.ctx, false)
-	if !state.Recovered || !state.Changed {
-		t.Fatalf("recovery did not adopt the preserved head: %#v", state)
-	}
-	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
-		t.Fatalf("HEAD = %s, want preserved %s", got, f.preserved)
-	}
-	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
-		t.Fatalf("gate branch = %s, want it settled to the adopted head %s", got, f.preserved)
-	}
-	if !f.custodyReturned() {
-		t.Fatal("custody not stamped")
-	}
-
-	// The exact downstream failure the evidence names: a follow-up commit's
-	// fresh run must push cleanly to the gate, not hit a raw non-fast-forward.
-	mustWrite(t, filepath.Join(f.local, "followup.txt"), "follow-up\n")
-	mustRun(t, f.local, "add", "followup.txt")
-	mustRun(t, f.local, "commit", "-m", "follow-up commit")
-	if _, err := gitpkg.Run(f.ctx, f.local, "push", f.gate, "refs/heads/feature/recover:refs/heads/feature/recover"); err != nil {
-		t.Fatalf("fresh push after recovery was rejected: %v", err)
-	}
-}
-
-// TestRecoverRebasedPreservedHeadRefusesConcurrentGateBranchMove is the
-// concurrency counterpart the correction explicitly asked for: if the gate
-// branch moves away from its observed pre-settle value between observation
-// and the settling compare-and-swap, recovery must refuse with a structured,
-// re-run-able next action instead of clobbering whatever now sits there. The
-// local branch and worktree, already moved to the preserved head, are left
-// exactly as they are; only the gate settlement and the custody stamp are
-// withheld.
-func TestRecoverRebasedPreservedHeadRefusesConcurrentGateBranchMove(t *testing.T) {
-	t.Parallel()
-
-	f := newRebasedRecoverFixtureGateBehind(t, types.RunCancelled)
-	tree := mustRun(t, f.gate, "rev-parse", f.submitted+"^{tree}")
-	racingHead := mustRun(t, f.gate, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", "-m", "concurrent gate push", "-p", f.submitted, tree)
-	f.service.beforeGateReset = func() {
-		mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", racingHead, f.submitted)
-	}
-
 	state := f.service.Recover(f.ctx, false)
 	if state.Recovered || state.Changed {
-		t.Fatalf("recovery raced a concurrent gate branch move: %#v", state)
+		t.Fatalf("unsafe recovery succeeded: %#v", state)
 	}
-	if state.Safety != "blocked_recover_gate_race" {
-		t.Fatalf("concurrent-gate-move refusal = %s", state.Safety)
+	if got := mustRun(t, f.local, "for-each-ref", "--format=%(refname) %(objectname)", "refs/no-mistakes"); got != localRefs {
+		t.Fatalf("refusal changed local recovery refs: %q != %q", got, localRefs)
 	}
-	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
-		t.Fatalf("HEAD = %s, want the already-adopted preserved head %s left in place", got, f.preserved)
+	if got := mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname)", "refs/no-mistakes"); got != gateRefs {
+		t.Fatalf("refusal changed gate recovery refs: %q != %q", got, gateRefs)
 	}
-	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != racingHead {
-		t.Fatalf("gate branch = %s, want the concurrent push %s left untouched", got, racingHead)
+	runAfter, err := f.db.GetRun(f.run.ID)
+	if err != nil || runAfter.HeadSHA != runBefore.HeadSHA || ptr(runAfter.ReviewApprovedHeadSHA) != ptr(runBefore.ReviewApprovedHeadSHA) || runAfter.TerminalHeadVerifiedAt != nil || runAfter.CustodyReturnedAt != nil || runAfter.UpdatedAt != runBefore.UpdatedAt {
+		t.Fatalf("refusal changed run: before %#v after %#v err %v", runBefore, runAfter, err)
 	}
-	if f.custodyReturned() {
-		t.Fatal("raced settlement stamped custody")
-	}
+	return state
 }
 
-// TestRecoverRebasedPreservedHeadRefusesDivergedGateBranch proves recovery
-// never overwrites a gate branch that moved onto its own independent commit
-// before recovery ran at all (not a mid-call race, and not the submitted
-// head the run itself left behind): another run or an operator could have
-// pushed there after this run went terminal, and settleGateBranchToAdoptedHead
-// must not silently detach that commit from the branch ref.
-func TestRecoverRebasedPreservedHeadRefusesDivergedGateBranch(t *testing.T) {
+func TestRecoverTerminalUnverifiedRewriteNegativeControls(t *testing.T) {
 	t.Parallel()
 
-	f := newRebasedRecoverFixtureGateBehind(t, types.RunCancelled)
-	tree := mustRun(t, f.gate, "rev-parse", f.submitted+"^{tree}")
-	divergedHead := mustRun(t, f.gate, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", "-m", "independent gate push", "-p", f.submitted, tree)
-	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", divergedHead, f.submitted)
-
-	state := f.service.Recover(f.ctx, false)
-	if state.Recovered || state.Changed {
-		t.Fatalf("recovery overwrote a diverged gate branch: %#v", state)
-	}
-	if state.Safety != "blocked_recover_gate_diverged" {
-		t.Fatalf("diverged-gate-branch refusal = %s", state.Safety)
-	}
-	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
-		t.Fatalf("HEAD = %s, want the already-adopted preserved head %s left in place", got, f.preserved)
-	}
-	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != divergedHead {
-		t.Fatalf("gate branch = %s, want the independent push %s left untouched", got, divergedHead)
-	}
-	if f.custodyReturned() {
-		t.Fatal("diverged gate branch overwrite stamped custody")
-	}
+	t.Run("different tree", func(t *testing.T) {
+		f, _ := newTerminalEqualTreeRewriteFixture(t)
+		pushTerminalRewrite(t, f, func(dir string) { mustWrite(t, filepath.Join(dir, "pipeline.txt"), "different tree\n") })
+		if state := assertUnverifiedRecoveryRefusalNoMutation(t, f); state.Safety != "blocked_recover_unverified_head" {
+			t.Fatalf("different-tree refusal = %s", state.Safety)
+		}
+		if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+			t.Fatalf("different-tree refusal moved HEAD to %s", got)
+		}
+	})
+	t.Run("drops local hunk", func(t *testing.T) {
+		f, _ := newTerminalEqualTreeRewriteFixture(t)
+		mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", mustRun(t, f.gate, "rev-parse", "refs/heads/main"))
+		if state := assertUnverifiedRecoveryRefusalNoMutation(t, f); state.Safety != "blocked_recover_unverified_head" {
+			t.Fatalf("dropped-work refusal = %s", state.Safety)
+		}
+	})
+	t.Run("rewrites operator line", func(t *testing.T) {
+		f, _ := newTerminalEqualTreeRewriteFixture(t)
+		pushTerminalRewrite(t, f, func(dir string) { mustWrite(t, filepath.Join(dir, "feature.txt"), "pipeline replacement\n") })
+		if state := assertUnverifiedRecoveryRefusalNoMutation(t, f); state.Safety != "blocked_recover_unverified_head" {
+			t.Fatalf("rewritten-line refusal = %s", state.Safety)
+		}
+	})
+	t.Run("conflicting create-only anchor", func(t *testing.T) {
+		f, recorded := newTerminalEqualTreeRewriteFixture(t)
+		mustRun(t, f.gate, "update-ref", f.anchorRef(), recorded)
+		if state := assertUnverifiedRecoveryRefusalNoMutation(t, f); state.Safety != "blocked_recover_anchor_mismatch" {
+			t.Fatalf("anchor-conflict refusal = %s", state.Safety)
+		}
+	})
+	t.Run("untrusted recorded head", func(t *testing.T) {
+		f, _ := newTerminalEqualTreeRewriteFixture(t)
+		if err := f.db.UpdateRunReviewApprovedHeadSHA(f.run.ID, f.submitted); err != nil {
+			t.Fatal(err)
+		}
+		if state := assertUnverifiedRecoveryRefusalNoMutation(t, f); state.Safety != "blocked_recover_unverified_head" {
+			t.Fatalf("untrusted-head refusal = %s", state.Safety)
+		}
+	})
+	t.Run("recorded head does not preserve local", func(t *testing.T) {
+		f, _ := newTerminalEqualTreeRewriteFixture(t)
+		pipeline := filepath.Join(t.TempDir(), "uncontained-recorded")
+		mustRun(t, filepath.Dir(pipeline), "-c", "core.autocrlf=false", "clone", f.gate, pipeline)
+		configureIdentity(t, pipeline)
+		mustRun(t, pipeline, "checkout", "--detach", "origin/main")
+		mustWrite(t, filepath.Join(pipeline, "feature.txt"), "recorded without local work\n")
+		mustRun(t, pipeline, "add", "feature.txt")
+		mustRun(t, pipeline, "commit", "-m", "uncontained recorded result")
+		recorded := mustRun(t, pipeline, "rev-parse", "HEAD")
+		tree := mustRun(t, pipeline, "rev-parse", "HEAD^{tree}")
+		live := mustRun(t, pipeline, "commit-tree", tree, "-p", "origin/main", "-m", "uncontained live rewrite")
+		mustRun(t, pipeline, "push", "origin", recorded+":refs/no-mistakes/test-recorded")
+		mustRun(t, pipeline, "push", "--force", "origin", live+":refs/heads/feature/recover")
+		mustRun(t, f.gate, "update-ref", "-d", "refs/no-mistakes/test-recorded")
+		if err := f.db.UpdateRunHeadSHA(f.run.ID, recorded); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.db.UpdateRunReviewApprovedHeadSHA(f.run.ID, recorded); err != nil {
+			t.Fatal(err)
+		}
+		if state := assertUnverifiedRecoveryRefusalNoMutation(t, f); state.Safety != "blocked_recover_unverified_head" {
+			t.Fatalf("uncontained-recorded refusal = %s", state.Safety)
+		}
+	})
+	t.Run("symbolic live branch", func(t *testing.T) {
+		f, _ := newTerminalEqualTreeRewriteFixture(t)
+		mustRun(t, f.gate, "update-ref", "refs/no-mistakes/symbolic-live", f.preserved)
+		mustRun(t, f.gate, "symbolic-ref", "refs/heads/feature/recover", "refs/no-mistakes/symbolic-live")
+		if state := assertUnverifiedRecoveryRefusalNoMutation(t, f); state.Safety != "blocked_recover_unverified_head" {
+			t.Fatalf("symbolic-live refusal = %s", state.Safety)
+		}
+	})
+	t.Run("active run", func(t *testing.T) {
+		f, _ := newTerminalEqualTreeRewriteFixture(t)
+		if err := f.db.UpdateRunStatus(f.run.ID, types.RunRunning); err != nil {
+			t.Fatal(err)
+		}
+		if state := assertUnverifiedRecoveryRefusalNoMutation(t, f); state.Safety != "blocked_recover_run_active" {
+			t.Fatalf("active-run refusal = %s", state.Safety)
+		}
+	})
+	t.Run("dirty worktree", func(t *testing.T) {
+		f, _ := newTerminalEqualTreeRewriteFixture(t)
+		mustWrite(t, filepath.Join(f.local, "feature.txt"), "dirty local edit\n")
+		if state := assertUnverifiedRecoveryRefusalNoMutation(t, f); state.Safety != "blocked_recover_unverified_head" {
+			t.Fatalf("dirty-worktree refusal = %s", state.Safety)
+		}
+		if got := readOptional(t, filepath.Join(f.local, "feature.txt")); got != "dirty local edit\n" {
+			t.Fatalf("dirty worktree changed: %q", got)
+		}
+	})
+	t.Run("racing local branch", func(t *testing.T) {
+		f, _ := newTerminalEqualTreeRewriteFixture(t)
+		f.service.beforeRecoverTerminalHeadPreserve = func() {
+			mustRun(t, f.local, "checkout", "-b", "racing-branch", f.submitted)
+		}
+		if state := assertUnverifiedRecoveryRefusalNoMutation(t, f); state.Safety != "blocked_recover_assumptions_changed" {
+			t.Fatalf("branch-race refusal = %s", state.Safety)
+		}
+		if got := mustRun(t, f.local, "branch", "--show-current"); got != "racing-branch" {
+			t.Fatalf("racing branch was changed to %s", got)
+		}
+	})
 }
 
+// TestRecoverRebasedPreservedHeadAdoptsWithoutEscalating is the regression for
 // the over-escalating custody return: a cancelled validation whose preserved
 // pipeline head is the operator's own work rebased onto a newer base loses
 // nothing by adopting it, so recovery must succeed instead of refusing as
@@ -2781,4 +2838,152 @@ func TestRecoverSquashedPreservedHeadStillEscalatesForDroppedLocalWork(t *testin
 	if f.custodyReturned() {
 		t.Fatal("dropped-work escalation stamped custody")
 	}
+}
+
+// publishedRebaseAfterCustody recreates the lane-staleness shape AdoptPublished
+// recovers: custody is returned, the branch is published, rebased onto a newer
+// main with a follow-up commit, then force-with-lease pushed to the registered
+// target while the gate lane still names the pre-rebase head.
+func publishedRebaseAfterCustody(t *testing.T, f *recoverFixture) string {
+	t.Helper()
+	if state := f.service.Recover(f.ctx, false); !state.Recovered {
+		t.Fatalf("return custody: %#v", state)
+	}
+	mustRun(t, f.local, "remote", "add", "origin", f.remote)
+	mustRun(t, f.local, "push", "origin", "main:refs/heads/main")
+	mustRun(t, f.local, "push", "origin", "HEAD:refs/heads/feature/recover")
+
+	mustRun(t, f.local, "checkout", "main")
+	mustWrite(t, filepath.Join(f.local, "upstream.txt"), "newer main\n")
+	mustRun(t, f.local, "add", "upstream.txt")
+	mustRun(t, f.local, "commit", "-m", "advance main")
+	mustRun(t, f.local, "push", "origin", "main:refs/heads/main")
+
+	mustRun(t, f.local, "checkout", "feature/recover")
+	mustRun(t, f.local, "rebase", "main")
+	mustWrite(t, filepath.Join(f.local, "follow-up.txt"), "post-rebase follow-up\n")
+	mustRun(t, f.local, "add", "follow-up.txt")
+	mustRun(t, f.local, "commit", "-m", "post-rebase follow-up")
+	rebased := mustRun(t, f.local, "rev-parse", "HEAD")
+	mustRun(t, f.local, "push", "--force-with-lease=refs/heads/feature/recover:"+f.preserved, "origin", "HEAD:refs/heads/feature/recover")
+	return rebased
+}
+
+// TestAdoptPublishedFetchHonorsTheRemoteTimeout proves the import of the
+// verified published object is bounded by branch_sync_remote_timeout like every
+// other network call in AdoptPublished. The ls-remote checks are stubbed to
+// answer instantly and ignore their own budget, so the only operation the tiny
+// timeout can reach is the fetch; had that fetch kept the caller's unbounded
+// context it would have succeeded against this local remote and the lane would
+// have been adopted instead of refusing.
+func TestAdoptPublishedFetchHonorsTheRemoteTimeout(t *testing.T) {
+	f := newRecoverFixture(t, types.RunCancelled)
+	rebased := publishedRebaseAfterCustody(t, f)
+
+	f.service.RemoteTimeout = time.Nanosecond
+	f.service.lsRemote = func(ctx context.Context, dir, remote, ref string) (string, error) {
+		return rebased, nil
+	}
+
+	state := f.service.AdoptPublished(f.ctx)
+	if state.Changed || state.Safety != "blocked_adopt_published_fetch_failed" {
+		t.Fatalf("stalled fetch did not return the documented closed refusal: %#v", state)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+		t.Fatalf("gate lane = %s, want the untouched pre-rebase head %s", got, f.preserved)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != rebased {
+		t.Fatalf("refusal moved the worktree to %s, want %s", got, rebased)
+	}
+}
+
+// TestAdoptPublishedFetchSucceedsWithinItsOwnBudget guards the other side: the
+// bound must be a real per-operation budget, not a cap that makes an ordinary
+// adoption fail. Both ls-remote calls burn most of a generous timeout, and the
+// fetch still gets its own fresh budget and completes.
+//
+// The budget has to clear the cost of the one real network operation left in
+// the path: FetchRemoteRef spawns `git fetch` and then `git rev-parse`. That
+// pair costs ~50ms on Linux and macOS but roughly 10x that on the Windows leg,
+// which is process-spawn bound rather than compute bound (see
+// .agents/skills/testing-conventions/SKILL.md). A
+// sub-second budget sits on top of the Windows cost with no margin and fails
+// there as soon as anything perturbs spawn latency, so the budget is kept a
+// whole multiple of the slowest platform's cost.
+//
+// The stub honors its own context rather than sleeping through it, which is
+// what gives this test teeth on every platform. A stub that always succeeds can
+// only report a shared deadline by way of the fetch being starved, and how much
+// of the budget is left for that fetch has to be read against a per-platform
+// spawn cost - so such a stub silently stops detecting the regression wherever
+// the fetch happens to be quick enough to squeeze in. Honoring the context
+// instead makes the SECOND ls-remote the witness: on one shared deadline the
+// first call consumes most of it and the second is left with far less than it
+// needs, failing the adoption regardless of how fast git is on the platform.
+func TestAdoptPublishedFetchSucceedsWithinItsOwnBudget(t *testing.T) {
+	f := newRecoverFixture(t, types.RunCancelled)
+	rebased := publishedRebaseAfterCustody(t, f)
+
+	f.service.RemoteTimeout = 3 * time.Second
+	f.service.lsRemote = func(ctx context.Context, dir, remote, ref string) (string, error) {
+		select {
+		case <-time.After(2500 * time.Millisecond):
+			return rebased, nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+
+	state := f.service.AdoptPublished(f.ctx)
+	if !state.Changed || state.Safety != "gate_ready" {
+		t.Fatalf("adoption did not complete on its own fetch budget: %#v", state)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != rebased {
+		t.Fatalf("gate lane = %s, want the published rebased head %s", got, rebased)
+	}
+}
+
+func TestAdoptPublishedRefusesReplacedPushTarget(t *testing.T) {
+	t.Run("before adoption", func(t *testing.T) {
+		f := newRecoverFixture(t, types.RunCancelled)
+		publishedRebaseAfterCustody(t, f)
+		replacement := filepath.Join(t.TempDir(), "replacement.git")
+		mustRun(t, filepath.Dir(replacement), "init", "--bare", replacement)
+		if _, err := f.db.ReplaceRepoURLs(f.repo.ID, replacement, ""); err != nil {
+			t.Fatal(err)
+		}
+
+		state := f.service.AdoptPublished(f.ctx)
+		if state.Changed || state.Safety != "blocked_published_head_mismatch" {
+			t.Fatalf("adoption did not refuse the replacement target: %#v", state)
+		}
+		if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+			t.Fatalf("gate lane = %s, want the untouched pre-rebase head %s", got, f.preserved)
+		}
+	})
+
+	t.Run("during verification", func(t *testing.T) {
+		f := newRecoverFixture(t, types.RunCancelled)
+		rebased := publishedRebaseAfterCustody(t, f)
+		replacement := filepath.Join(t.TempDir(), "replacement.git")
+		mustRun(t, filepath.Dir(replacement), "init", "--bare", replacement)
+		checks := 0
+		f.service.lsRemote = func(ctx context.Context, dir, remote, ref string) (string, error) {
+			checks++
+			if checks == 2 {
+				if _, err := f.db.ReplaceRepoURLs(f.repo.ID, replacement, ""); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return rebased, nil
+		}
+
+		state := f.service.AdoptPublished(f.ctx)
+		if state.Changed || state.Safety != "blocked_adopt_published_target_changed" {
+			t.Fatalf("adoption did not refuse the concurrently replaced target: %#v", state)
+		}
+		if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+			t.Fatalf("gate lane = %s, want the untouched pre-rebase head %s", got, f.preserved)
+		}
+	})
 }

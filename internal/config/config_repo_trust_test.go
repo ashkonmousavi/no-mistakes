@@ -633,127 +633,64 @@ func TestMerge_CarriesDisableProjectSettings(t *testing.T) {
 	}
 }
 
-// TestEffectiveRepoConfig_DocumentCorrectionPathsTrustedOnly proves the
-// documentation-and-records path class is honored only from the trusted
-// default-branch copy. That class decides both what a pipeline correction may
-// edit and which head advance may skip Review, so a pushed branch that could
-// widen it would be able to name its own source directory as "documentation"
-// and publish unreviewed code through the cheaper path.
-func TestEffectiveRepoConfig_DocumentCorrectionPathsTrustedOnly(t *testing.T) {
-	pushed := &RepoConfig{Document: DocumentRaw{CorrectionPaths: []string{"internal/**"}}}
-	trusted := &RepoConfig{Document: DocumentRaw{CorrectionPaths: []string{"contracts/**"}}}
+// TestEffectiveRepoConfig_ReviewConversationTrustedOnly proves the opt-in is
+// the maintainer's in both directions. An open question PARKS the review gate
+// for a human, so a pushed branch must not be able to make its own review wait
+// on an answer; and once a maintainer has asked for the conversation, a pushed
+// branch must not be able to decline it and get a monologue review instead.
+// allow_repo_commands is scoped to the code-executing selection fields and
+// changes neither direction.
+func TestEffectiveRepoConfig_ReviewConversationTrustedOnly(t *testing.T) {
+	on := &RepoConfig{Review: ReviewRaw{Conversation: true}}
+	off := &RepoConfig{}
 
-	for _, allowRepoCommands := range []bool{false, true} {
-		effective := EffectiveRepoConfig(pushed, trusted, allowRepoCommands)
-		if len(effective.Document.CorrectionPaths) != 1 || effective.Document.CorrectionPaths[0] != "contracts/**" {
-			t.Fatalf("allow_repo_commands=%v: CorrectionPaths = %v, want the trusted copy's class", allowRepoCommands, effective.Document.CorrectionPaths)
-		}
-	}
-
-	// Without a trusted copy the pushed class is discarded entirely, so the
-	// built-in default class stays active.
-	if effective := EffectiveRepoConfig(pushed, nil, false); len(effective.Document.CorrectionPaths) != 0 {
-		t.Fatalf("CorrectionPaths = %v, want empty (built-in class) without a trusted copy", effective.Document.CorrectionPaths)
-	}
-}
-
-// TestLoadRepoFromBytes_DocumentCorrectionPathsRejectsInvalidGlob proves an
-// uncompilable or empty pattern fails the config rather than silently matching
-// nothing, which would quietly shrink the class a correction may edit.
-func TestLoadRepoFromBytes_DocumentCorrectionPathsRejectsInvalidGlob(t *testing.T) {
-	for name, yaml := range map[string]string{
-		"unclosed character class": "document:\n  correction_paths:\n    - 'docs/[a-.md'\n",
-		"empty entry":              "document:\n  correction_paths:\n    - ''\n",
+	for _, tc := range []struct {
+		name              string
+		pushed, trusted   *RepoConfig
+		allowRepoCommands bool
+		want              bool
+	}{
+		{name: "pushed-only on is ignored", pushed: on, trusted: off, want: false},
+		{name: "pushed-only on with no trusted copy is ignored", pushed: on, trusted: nil, want: false},
+		{name: "the commands opt-in does not let a pushed on through", pushed: on, trusted: off, allowRepoCommands: true, want: false},
+		{name: "a trusted on survives a pushed branch with no review block", pushed: off, trusted: on, want: true},
+		{name: "a trusted on survives the commands opt-in", pushed: off, trusted: on, allowRepoCommands: true, want: true},
+		{name: "a pushed branch cannot decline a trusted on", pushed: off, trusted: on, want: true},
 	} {
-		t.Run(name, func(t *testing.T) {
-			if _, err := LoadRepoFromBytes([]byte(yaml)); err == nil {
-				t.Fatalf("expected %s to be rejected", name)
+		t.Run(tc.name, func(t *testing.T) {
+			got := EffectiveRepoConfig(tc.pushed, tc.trusted, tc.allowRepoCommands)
+			if got.Review.Conversation != tc.want {
+				t.Fatalf("review.conversation = %v, want %v", got.Review.Conversation, tc.want)
 			}
 		})
 	}
-	cfg, err := LoadRepoFromBytes([]byte("document:\n  correction_paths:\n    - '  contracts/**  '\n    - '*.md'\n"))
+}
+
+// TestMerge_ReviewConversationDefaultsOffAndComesFromTheRepo pins the default
+// and the resolution path. Global config carries no review block - the
+// conversation is a repository's policy about its own reviews, like
+// document.instructions - so the resolved value is the (already trusted) repo
+// value and nothing else, and an absent key is off.
+func TestMerge_ReviewConversationDefaultsOffAndComesFromTheRepo(t *testing.T) {
+	if got := Merge(&GlobalConfig{}, &RepoConfig{}).Review.Conversation; got {
+		t.Fatal("review.conversation defaults on; every repository that never asked would get the conversation")
+	}
+	if got := Merge(&GlobalConfig{}, &RepoConfig{Review: ReviewRaw{Conversation: true}}).Review.Conversation; !got {
+		t.Fatal("a trusted review.conversation: true did not reach the resolved config")
+	}
+}
+
+// An unparseable review.conversation fails the config closed rather than
+// silently reading as off, the same way an unrecognized rebase.strategy does.
+func TestLoadRepoConfig_ReviewConversationRejectsANonBoolean(t *testing.T) {
+	if cfg, err := LoadRepoFromBytes([]byte("review:\n  conversation: sometimes\n")); err == nil {
+		t.Fatalf("a non-boolean review.conversation parsed as %v; it must fail the config closed", cfg.Review.Conversation)
+	}
+	cfg, err := LoadRepoFromBytes([]byte("review:\n  conversation: true\n"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("review.conversation: true must parse: %v", err)
 	}
-	if len(cfg.Document.CorrectionPaths) != 2 || cfg.Document.CorrectionPaths[0] != "contracts/**" {
-		t.Fatalf("CorrectionPaths = %#v, want trimmed patterns", cfg.Document.CorrectionPaths)
-	}
-}
-
-// TestLoadRepoConfig_SyncStrategy proves sync_strategy parses both recognized
-// values and that an empty value stays empty (EffectiveSyncStrategy is where
-// the "rebase" default is applied).
-func TestLoadRepoConfig_SyncStrategy(t *testing.T) {
-	cases := map[string]string{
-		"":       "",
-		"merge":  "merge",
-		"rebase": "rebase",
-	}
-	for value, want := range cases {
-		cfg, err := LoadRepoFromBytes([]byte("sync_strategy: \"" + value + "\"\n"))
-		if err != nil {
-			t.Fatalf("sync_strategy %q: %v", value, err)
-		}
-		if cfg.SyncStrategy != want {
-			t.Fatalf("sync_strategy %q: SyncStrategy = %q, want %q", value, cfg.SyncStrategy, want)
-		}
-	}
-}
-
-// TestLoadRepoConfig_SyncStrategyRejectsInvalidValue proves the config fails
-// closed on a sync_strategy value that is neither "merge" nor "rebase",
-// naming the field in the error.
-func TestLoadRepoConfig_SyncStrategyRejectsInvalidValue(t *testing.T) {
-	_, err := LoadRepoFromBytes([]byte("sync_strategy: squash\n"))
-	if err == nil {
-		t.Fatal("expected error for invalid sync_strategy, got nil")
-	}
-	if !strings.Contains(err.Error(), "sync_strategy") {
-		t.Fatalf("error = %v, want it to name sync_strategy", err)
-	}
-}
-
-// TestEffectiveRepoConfig_SyncStrategyTrustedOnly proves sync_strategy is
-// honored only from the trusted default-branch copy, regardless of
-// allow_repo_commands, matching no_ci and disable_project_settings: a pushed
-// branch must not be able to switch itself back to a history-rewriting
-// rebase after a maintainer has forbidden one, nor force merge on a
-// repository that expects the default.
-func TestEffectiveRepoConfig_SyncStrategyTrustedOnly(t *testing.T) {
-	// Contributor pushes rebase; trusted default-branch forbids it.
-	got := EffectiveRepoConfig(&RepoConfig{SyncStrategy: "rebase"}, &RepoConfig{SyncStrategy: "merge"}, false)
-	if got.SyncStrategy != "merge" {
-		t.Errorf("SyncStrategy = %q, want trusted merge (pushed cannot re-enable rebase)", got.SyncStrategy)
-	}
-	// Contributor pushes merge; trusted default-branch has no opinion (rebase default).
-	got = EffectiveRepoConfig(&RepoConfig{SyncStrategy: "merge"}, &RepoConfig{SyncStrategy: ""}, false)
-	if got.SyncStrategy != "" {
-		t.Errorf("SyncStrategy = %q, want empty trusted fallback (pushed cannot force merge)", got.SyncStrategy)
-	}
-	// allow_repo_commands must NOT leak the pushed value through.
-	got = EffectiveRepoConfig(&RepoConfig{SyncStrategy: "rebase"}, &RepoConfig{SyncStrategy: "merge"}, true)
-	if got.SyncStrategy != "merge" {
-		t.Errorf("SyncStrategy = %q, want trusted merge even with allow_repo_commands", got.SyncStrategy)
-	}
-	// No trusted copy -> empty (rebase default), regardless of the pushed value.
-	got = EffectiveRepoConfig(&RepoConfig{SyncStrategy: "merge"}, nil, false)
-	if got.SyncStrategy != "" {
-		t.Errorf("SyncStrategy = %q, want empty without a trusted copy", got.SyncStrategy)
-	}
-}
-
-// TestConfig_EffectiveSyncStrategy proves the resolved Config defaults an
-// unset sync strategy to SyncStrategyRebase, preserving the pipeline's
-// original rebase behavior for repositories that never set the key.
-func TestConfig_EffectiveSyncStrategy(t *testing.T) {
-	if got := (&Config{}).EffectiveSyncStrategy(); got != SyncStrategyRebase {
-		t.Errorf("EffectiveSyncStrategy() = %q, want %q for an unset config", got, SyncStrategyRebase)
-	}
-	if got := (&Config{SyncStrategy: "merge"}).EffectiveSyncStrategy(); got != SyncStrategyMerge {
-		t.Errorf("EffectiveSyncStrategy() = %q, want %q", got, SyncStrategyMerge)
-	}
-	var nilCfg *Config
-	if got := nilCfg.EffectiveSyncStrategy(); got != SyncStrategyRebase {
-		t.Errorf("EffectiveSyncStrategy() on nil config = %q, want %q", got, SyncStrategyRebase)
+	if !cfg.Review.Conversation {
+		t.Fatal("review.conversation: true did not parse as on")
 	}
 }

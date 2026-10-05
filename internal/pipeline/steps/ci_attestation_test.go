@@ -14,6 +14,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
+	"github.com/kunchenguid/no-mistakes/internal/testgit"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -168,7 +169,7 @@ func TestRebindPipelineAttestationWithSteps_UsesCurrentLiveValidation(t *testing
 		FindingsJSON: &currentFindings,
 	}}
 
-	rebound, ok := rebindPipelineAttestationWithSteps(original, newHead, currentSteps)
+	rebound, ok := rebindPipelineAttestationWithSteps(original, newHead, currentSteps, pipelineAttestationPolicy{})
 	if !ok {
 		t.Fatal("expected attestation to rebind")
 	}
@@ -190,6 +191,14 @@ type attestationTestHost struct {
 	updates            int
 	reads              int
 	failUpdates        int
+	provider           scm.Provider
+}
+
+func (h *attestationTestHost) Provider() scm.Provider {
+	if h.provider == "" {
+		return scm.ProviderGitHub
+	}
+	return h.provider
 }
 
 func (h *attestationTestHost) GetPRContent(context.Context, *scm.PR) (scm.PRContent, error) {
@@ -477,13 +486,9 @@ func TestCIStep_PublishRepairFailsWhenAttestationCannotSettle(t *testing.T) {
 	}
 }
 
-// TestCIStep_PublishRepairSkipsAttestationForNonGitHubProvider pins
-// attestHeadBeforePush's earliest short-circuit: a non-GitHub provider
-// returns nil before ever building a host or touching PR content, since only
-// GitHub emits the HTML attestation comment and implements PRContentReader.
-// A repair still publishes cleanly with no PR interaction at all - unlike the
-// old post-push restamp, which needed a host-capability check (and a
-// "cannot read PR content" log) to reach the same no-op.
+// This fixture has no available GitLab host, so publication skips attestation
+// interaction. GitLab with an available host supports raw reads and restamping;
+// provider identity alone no longer causes the skip.
 func TestCIStep_PublishRepairSkipsAttestationForNonGitHubProvider(t *testing.T) {
 	f := newCIRepairFixture(t, false, writeCIFix)
 	gitlabPR := "https://gitlab.com/test/repo/-/merge_requests/42"
@@ -774,7 +779,7 @@ func TestPushStep_PushFailureAfterAttestationLeavesBodyAhead(t *testing.T) {
 	gitCmd(t, dir, "commit", "-m", "new work")
 	newHead := gitCmd(t, dir, "rev-parse", "HEAD")
 
-	realGit, err := exec.LookPath("git")
+	realGit, err := testgit.RealGit()
 	if err != nil {
 		t.Fatal(err)
 	}

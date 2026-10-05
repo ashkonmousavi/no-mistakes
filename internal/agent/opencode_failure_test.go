@@ -92,9 +92,6 @@ func TestOpencodeAgent_FailedTurnSurfacesProviderErrorInsteadOfEmptyOutput(t *te
 	if err == nil {
 		t.Fatalf("expected error, got result %+v", result)
 	}
-	if result != nil {
-		t.Fatalf("expected nil result on error, got %+v", result)
-	}
 	msg := err.Error()
 	if strings.Contains(msg, "no text output") {
 		t.Errorf("failed turn must not be reported as empty output, got %q", msg)
@@ -516,7 +513,9 @@ func TestOpencodeTurnFailure_GatesTheSharedClassifier(t *testing.T) {
 	}
 
 	// The thinking-conflict trigger reaches the retry loop by the same route,
-	// and the prompt-only fallback reads the same markers.
+	// and the prompt-only fallback reads the same markers. The blanket
+	// only-auto trigger shares the fallback and its gate, under its own
+	// sentinel so it never reports a thinking conflict.
 	for _, evidence := range []opencodeToolEvidence{opencodeToolsRan, opencodeToolsUnknown} {
 		conflict := thinkingConflict(evidence, fmt.Errorf("connection reset by peer"))
 		if _, retry := classifyOpencodeTransient(conflict); retry {
@@ -525,9 +524,25 @@ func TestOpencodeTurnFailure_GatesTheSharedClassifier(t *testing.T) {
 		if !opencodeReplayUnsafe(conflict) {
 			t.Errorf("a thinking conflict with evidence %v must block the fresh-session fallback", evidence)
 		}
+		if !opencodeFallbackTrigger(conflict) {
+			t.Errorf("a thinking conflict with evidence %v must trigger the prompt-only fallback", evidence)
+		}
+		rejection := forcedToolChoiceConflict(evidence, fmt.Errorf("connection reset by peer"))
+		if _, retry := classifyOpencodeTransient(rejection); retry {
+			t.Errorf("an only-auto rejection with evidence %v must not be retried", evidence)
+		}
+		if !opencodeReplayUnsafe(rejection) {
+			t.Errorf("an only-auto rejection with evidence %v must block the fresh-session fallback", evidence)
+		}
+		if !opencodeFallbackTrigger(rejection) {
+			t.Errorf("an only-auto rejection with evidence %v must trigger the prompt-only fallback", evidence)
+		}
 	}
 	if opencodeReplayUnsafe(thinkingConflict(opencodeToolsNone, nil)) {
 		t.Error("a conflict proven to be before any tool ran must still reach the fallback")
+	}
+	if opencodeReplayUnsafe(forcedToolChoiceConflict(opencodeToolsNone, nil)) {
+		t.Error("a rejection proven to be before any tool ran must still reach the fallback")
 	}
 }
 

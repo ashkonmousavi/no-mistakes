@@ -59,9 +59,8 @@ type ciIssues struct {
 //   - a merge conflict is an auto-fix error whose repair always revalidates;
 //   - a failing check published by a registered review bot (scm.ReviewBots)
 //     is the bot's opinion about the change, not a verdict on it, so it
-//     becomes one ask-user warning per available unresolved bot comment,
-//     anchored to the file and line the comment is about; when no comment can
-//     be attached, the red check remains as one check-level ask-user finding;
+//     becomes one ask-user warning per unresolved bot comment, anchored to
+//     the file and line the comment is about;
 //   - a provider-attributed outcome no rerun will replace is an ask-user
 //     warning, exactly as before findings existed: nothing a fix agent does
 //     can clear it.
@@ -135,82 +134,6 @@ func ciObservationOutcome(findings Findings) *pipeline.StepOutcome {
 	}
 }
 
-// appendUnsafeInfrastructureFindings adds the exact provider observations
-// whose retry scope is unsafe to the normal settled observation. The caller
-// has already classified ordinary failures, cancellations, merge conflicts,
-// and review-bot comments, so no issue family disappears behind this refusal.
-func appendUnsafeInfrastructureFindings(findings Findings, unsafe []scm.Check) Findings {
-	if len(unsafe) == 0 {
-		return findings
-	}
-	for _, check := range unsafe {
-		findings.Items = append(findings.Items, Finding{
-			Severity:    types.FindingSeverityWarning,
-			Action:      types.ActionAskUser,
-			Category:    types.FindingCategoryCITransient,
-			Check:       check.Name,
-			CheckID:     check.ProviderID,
-			Description: ciCheckDescription(check) + " - provider retry scope includes work outside the proven failed-job population",
-		})
-	}
-	failureNoun := "failure"
-	if len(unsafe) != 1 {
-		failureNoun = "failures"
-	}
-	unsafeSummary := fmt.Sprintf("%d infrastructure %s cannot be rerun with exact scope", len(unsafe), failureNoun)
-	if findings.Summary != "" {
-		findings.Summary += "; "
-	}
-	findings.Summary += unsafeSummary
-	return findings
-}
-
-// ciSettledObservationFindings is the complete issue-family join for a poll.
-// Unsafe infrastructure checks are removed only from ordinary failure
-// classification, then added back as exact ask-user findings after cancelled
-// checks and review-bot comments have been represented.
-func ciSettledObservationFindings(checks, unsafe []scm.Check, failing, unresolvedCancelled []string, mergeConflict bool, reruns func(string) int, botComments []scm.ReviewComment) Findings {
-	ordinary := checksWithoutObservations(checks, unsafe)
-	findings := ciObservationFindings(ciIssues{
-		checks:              ordinary,
-		failing:             failing,
-		unresolvedCancelled: unresolvedCancelled,
-		mergeConflict:       mergeConflict,
-		reruns:              reruns,
-		botComments:         botComments,
-	})
-	return appendUnsafeInfrastructureFindings(findings, unsafe)
-}
-
-func checksWithoutObservations(checks, excluded []scm.Check) []scm.Check {
-	excludedKeys := make(map[string]bool, len(excluded))
-	for _, check := range excluded {
-		excludedKeys[checkObservationKey(check)] = true
-	}
-	kept := make([]scm.Check, 0, len(checks)-len(excluded))
-	for _, check := range checks {
-		if !excludedKeys[checkObservationKey(check)] {
-			kept = append(kept, check)
-		}
-	}
-	return kept
-}
-
-func checkTargets(checks []scm.Check) []scm.CheckTarget {
-	targets := make([]scm.CheckTarget, 0, len(checks))
-	for _, check := range checks {
-		targets = append(targets, scm.CheckTarget{Name: check.Name, ProviderID: check.ProviderID})
-	}
-	return targets
-}
-
-func checkObservationKey(check scm.Check) string {
-	if strings.TrimSpace(check.ProviderID) != "" {
-		return "id:" + check.ProviderID
-	}
-	return "observation:" + check.Name + "\x00" + check.Link
-}
-
 func hasAutoFixFindings(items []Finding) bool {
 	for _, item := range items {
 		if item.ActionOrDefault() == types.ActionAutoFix {
@@ -224,13 +147,18 @@ func selectedFailingChecks(checks []scm.Check, names []string) []scm.Check {
 	used := make([]bool, len(checks))
 	selected := make([]scm.Check, 0, len(names))
 	for _, name := range names {
+		matched := false
 		for i, check := range checks {
 			if used[i] || !check.Failing() || check.Name != name {
 				continue
 			}
 			selected = append(selected, check)
 			used[i] = true
+			matched = true
 			break
+		}
+		if !matched {
+			selected = append(selected, scm.Check{Name: name, Bucket: scm.CheckBucketFail})
 		}
 	}
 	return selected
@@ -515,17 +443,9 @@ func ciTerminalRepairOutcome(outcome *pipeline.StepOutcome, selected Findings, d
 			appendFinding(item)
 		}
 	}
-	parked = types.NormalizeFindings(parked, string(types.StepCI))
 	encoded, _ := json.Marshal(parked)
 	outcome.NeedsApproval = true
 	outcome.AutoFixable = false
 	outcome.Findings = string(encoded)
 	return outcome
-}
-
-// ciTerminalMonitorOutcome is the single exit for monitor failures after a CI
-// repair may already have been published. Until a fresh settled observation or
-// proven-clean result supersedes them, deferred findings must remain visible.
-func ciTerminalMonitorOutcome(outcome *pipeline.StepOutcome, deferredRaw string) *pipeline.StepOutcome {
-	return ciTerminalRepairOutcome(outcome, Findings{}, deferredRaw)
 }

@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
+	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -187,6 +189,50 @@ func TestExecutor_RestartsValidationFromRequestedStep(t *testing.T) {
 		if rounds[0].Round != 1 || rounds[1].Round != 2 {
 			t.Errorf("%s rounds = %v, want [1 2]", result.StepName, roundNumbers(rounds))
 		}
+	}
+}
+
+func TestExecutor_RevalidationClearsReviewCarry(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	reviewCalls := 0
+	review := &adaptiveCallStep{name: types.StepReview, fn: func(*StepContext) (*StepOutcome, error) {
+		reviewCalls++
+		if reviewCalls == 1 {
+			return &StepOutcome{
+				NeedsApproval: true,
+				Findings:      `{"findings":[{"id":"review-1","severity":"warning","description":"review needed","action":"ask-user"}],"summary":"review needed"}`,
+			}, nil
+		}
+		return &StepOutcome{}, nil
+	}}
+	ciCalls := 0
+	ci := &adaptiveCallStep{name: types.StepCI, fn: func(*StepContext) (*StepOutcome, error) {
+		ciCalls++
+		if ciCalls == 1 {
+			return &StepOutcome{RestartFrom: types.StepReview}, nil
+		}
+		return &StepOutcome{}, nil
+	}}
+
+	exec := NewExecutor(database, p, nil, nil, []Step{review, ci}, nil)
+	done, _ := startExecutor(t, exec, run, repo, workDir)
+	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
+	if err := exec.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+		t.Fatalf("approve initial review: %v", err)
+	}
+	waitExecutorDone(t, done)
+
+	if reviewCalls != 2 || ciCalls != 2 {
+		t.Fatalf("calls = review %d, ci %d; want two each", reviewCalls, ciCalls)
+	}
+	completed, err := database.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Status != types.RunCompleted {
+		t.Fatalf("run status = %s, want %s", completed.Status, types.RunCompleted)
 	}
 }
 
@@ -413,6 +459,32 @@ func TestExecutor_StepError_FailsRun(t *testing.T) {
 	}
 }
 
+func TestExecutor_OutOfMemoryFailureReasonKeepsRestorationDetail(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	const snapshot = "/tmp/nm-recovery-snapshot"
+	stepErr := errors.Join(
+		fmt.Errorf("run prepare command: %w", shellenv.ErrOutOfMemory),
+		fmt.Errorf("restore pre-preparation changes; recovery snapshot retained at %s: %w", snapshot, errors.New("git stash apply failed")),
+	)
+
+	exec := NewExecutor(database, p, nil, nil, []Step{newFailStep(types.StepTest, stepErr)}, nil)
+	err := exec.Execute(context.Background(), run, repo, t.TempDir())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	dbSteps, _ := database.GetStepsByRun(run.ID)
+	if dbSteps[0].Error == nil {
+		t.Fatal("failed step has no recorded reason")
+	}
+	reason := *dbSteps[0].Error
+	for _, want := range []string{"git stash apply failed", snapshot, shellenv.ErrOutOfMemory.Error()} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("step failure reason %q is missing %q", reason, want)
+		}
+	}
+}
+
 func TestExecutor_FailedStepEmitsTelemetry(t *testing.T) {
 	database, p, run, repo := setupTest(t)
 	workDir := t.TempDir()
@@ -609,5 +681,82 @@ func TestExecutor_ConfiguredSkippedStepDoesNotExecuteAndContinues(t *testing.T) 
 		if step.StepName == types.StepReview && step.Status != types.StepStatusSkipped {
 			t.Fatalf("review status = %s, want %s", step.Status, types.StepStatusSkipped)
 		}
+	}
+}
+
+func TestExecutor_SkippedPRStepWithClosingIssueRefsFails(t *testing.T) {
+	for _, refs := range [][]string{nil, {"95"}} {
+		t.Run(fmt.Sprintf("closes=%v", refs), func(t *testing.T) {
+			database, p, run, repo := setupTest(t)
+			if refs != nil {
+				if err := database.UpdateRunClosingIssueRefs(run.ID, refs); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pr := newPassStep(types.StepPR)
+			exec := NewExecutor(database, p, nil, nil, []Step{pr}, nil)
+			exec.SetSkippedSteps([]types.StepName{types.StepPR})
+
+			err := exec.Execute(context.Background(), run, repo, t.TempDir())
+			if got := pr.callCount(); got != 0 {
+				t.Fatalf("skipped PR step executed %d times, want 0", got)
+			}
+			steps, stepsErr := database.GetStepsByRun(run.ID)
+			if stepsErr != nil || len(steps) != 1 {
+				t.Fatalf("steps = %+v, err = %v", steps, stepsErr)
+			}
+			if refs == nil {
+				if err != nil || steps[0].Status != types.StepStatusSkipped {
+					t.Fatalf("err = %v, status = %s; want skipped", err, steps[0].Status)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "--closes requires publishing a pull request") {
+				t.Fatalf("err = %v; want --closes refusal", err)
+			}
+			if steps[0].Status != types.StepStatusFailed {
+				t.Fatalf("status = %s, want %s", steps[0].Status, types.StepStatusFailed)
+			}
+			if err := database.UpdateRunClosingIssueRefs(run.ID, []string{"95", "96"}); err == nil {
+				t.Fatal("reattach after the skipped PR step must be refused")
+			}
+		})
+	}
+}
+
+func TestExecutor_SkipRemainingPastPRStepWithClosingIssueRefsFails(t *testing.T) {
+	for _, refs := range [][]string{nil, {"95"}} {
+		t.Run(fmt.Sprintf("closes=%v", refs), func(t *testing.T) {
+			database, p, run, repo := setupTest(t)
+			if refs != nil {
+				if err := database.UpdateRunClosingIssueRefs(run.ID, refs); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rebase := &mockStep{name: types.StepRebase, outcome: &StepOutcome{ExitCode: 0, SkipRemaining: true}}
+			pr := newPassStep(types.StepPR)
+			exec := NewExecutor(database, p, nil, nil, []Step{rebase, pr}, nil)
+
+			err := exec.Execute(context.Background(), run, repo, t.TempDir())
+			if got := pr.callCount(); got != 0 {
+				t.Fatalf("PR step executed %d times, want 0", got)
+			}
+			steps, stepsErr := database.GetStepsByRun(run.ID)
+			if stepsErr != nil || len(steps) != 2 {
+				t.Fatalf("steps = %+v, err = %v", steps, stepsErr)
+			}
+			if refs == nil {
+				if err != nil || steps[1].Status != types.StepStatusSkipped {
+					t.Fatalf("err = %v, status = %s; want skipped", err, steps[1].Status)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "--closes requires publishing a pull request") {
+				t.Fatalf("err = %v; want --closes refusal", err)
+			}
+			if steps[1].Status != types.StepStatusFailed {
+				t.Fatalf("status = %s, want %s", steps[1].Status, types.StepStatusFailed)
+			}
+		})
 	}
 }

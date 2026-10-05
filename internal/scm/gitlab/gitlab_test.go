@@ -508,8 +508,12 @@ func TestFetchFailedCheckTargetLogsReturnsPartialLogsWithRetrievalError(t *testi
 	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
 		"glab mr view 123 --output json":                                {stdout: `{"head_pipeline":{"id":77}}` + "\n"},
 		"glab ci get --pipeline-id 77 --output json --with-job-details": {stdout: `{"jobs":[{"id":55,"name":"build","status":"failed"},{"id":56,"name":"lint","status":"failed"}]}` + "\n"},
-		"glab ci trace 55":                                              {stdout: "build failed\n"},
-		"glab ci trace 56":                                              {stderr: "expired", code: 1},
+
+		// Keep this blank line: gofmt versions disagree on whether these short
+		// keys join the alignment group above, so an explicit group break is the
+		// only layout every toolchain formats identically.
+		"glab ci trace 55": {stdout: "build failed\n"},
+		"glab ci trace 56": {stderr: "expired", code: 1},
 	}), nil, "", "")
 
 	logs, err := host.FetchFailedCheckTargetLogs(context.Background(), &scm.PR{Number: "123"}, "", "", []scm.CheckTarget{{ProviderID: "gitlab-job:55"}, {ProviderID: "gitlab-job:56"}})
@@ -654,6 +658,48 @@ func TestCreatePROmitsDraftFlagByDefault(t *testing.T) {
 	}
 	if pr == nil || pr.Number != "3" {
 		t.Fatalf("CreatePR() PR = %+v, want !3", pr)
+	}
+}
+
+func TestCreatePRTitleLimitCountsCharacters(t *testing.T) {
+	t.Parallel()
+	title := strings.Repeat("😀", 255)
+	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+		"glab mr create --source-branch feature/x --target-branch main --title " + title + " --description body --yes": {},
+	}), nil, "", "")
+	if _, err := host.CreatePR(context.Background(), "feature/x", "main", scm.PRContent{Title: title, Body: "body"}); err != nil {
+		t.Fatalf("255-character title rejected: %v", err)
+	}
+
+	host = New(gitlabTestCmdFactory(nil), nil, "", "")
+	_, err := host.CreatePR(context.Background(), "feature/x", "main", scm.PRContent{Title: strings.Repeat("😀", 256), Body: "body"})
+	if err == nil || !strings.Contains(err.Error(), "255 characters") {
+		t.Fatalf("256-character title error = %v", err)
+	}
+}
+
+func TestUpdatePRTitleLimitIncludesDraftMarker(t *testing.T) {
+	t.Parallel()
+	allowed := strings.Repeat("x", 248)
+	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+		"glab mr view 9 --output json": {
+			stdout: `{"iid":9,"title":"Draft: old","web_url":"https://gitlab.example.com/group/project/-/merge_requests/9"}` + "\n",
+		},
+		"glab mr update 9 --title Draft: " + allowed + " --description body": {},
+	}), nil, "", "")
+	pr := &scm.PR{Number: "9", URL: "https://gitlab.example.com/group/project/-/merge_requests/9"}
+	if _, err := host.UpdatePR(context.Background(), pr, scm.PRContent{Title: allowed, Body: "body"}); err != nil {
+		t.Fatalf("255-character draft title rejected: %v", err)
+	}
+
+	host = New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+		"glab mr view 9 --output json": {
+			stdout: `{"iid":9,"title":"Draft: old","web_url":"https://gitlab.example.com/group/project/-/merge_requests/9"}` + "\n",
+		},
+	}), nil, "", "")
+	_, err := host.UpdatePR(context.Background(), pr, scm.PRContent{Title: strings.Repeat("x", 249), Body: "body"})
+	if err == nil || !strings.Contains(err.Error(), "255 characters") {
+		t.Fatalf("256-character draft title error = %v", err)
 	}
 }
 

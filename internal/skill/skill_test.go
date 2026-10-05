@@ -54,13 +54,14 @@ func TestBodyIncludesGeneratedGateStepGuard(t *testing.T) {
 }
 
 func TestBodyDocumentsTaskFirstFlow(t *testing.T) {
+	// Check the generated, installed skill's guidance contract.
 	md := Markdown()
 	for _, want := range []string{
 		"## Two ways to invoke",
 		"feature branch",
 		"Inspect `git status` before you change or commit anything",
 		"commit only the changes that belong to the user's task",
-		"passing the user's task as your `--intent`",
+		"passing the user's task as explicit intent",
 	} {
 		if !strings.Contains(md, want) {
 			t.Errorf("body should document the task-first flow: missing %q", want)
@@ -88,35 +89,6 @@ func TestBodyDocumentsAxiGateGuidance(t *testing.T) {
 	}
 	if strings.Contains(md, "drive it to an outcome with `axi respond`") {
 		t.Errorf("body should not tell agents to resume non-parked runs with axi respond")
-	}
-}
-
-// TestBodyDelegatesUnambiguousAskUserDecisionsWithinAcceptedIntent proves the
-// installed skill does not turn every ask-user classification into a mandatory
-// human interruption. Existing explicit delegation may settle unambiguous work
-// inside accepted intent; only ambiguity, expansion, or destructive authority
-// must go back to the human, and records-only no-surface work remains distinct
-// from missing required product proof.
-func TestBodyDelegatesUnambiguousAskUserDecisionsWithinAcceptedIntent(t *testing.T) {
-	md := Markdown()
-	for _, want := range []string{
-		"`ask-user` is not an automatic human interruption",
-		"unambiguous work inside the accepted intent",
-		"genuinely ambiguous, expands the accepted scope, or authorizes a destructive action",
-		"A true `no-surface` verdict for a records-only",
-		"must not excuse an untested required product journey",
-	} {
-		if !strings.Contains(md, want) {
-			t.Errorf("installed skill delegation contract missing %q", want)
-		}
-	}
-	for _, forbidden := range []string{
-		"This is a call only the user can make",
-		"`ask-user` is a decision that belongs to the user, not you",
-	} {
-		if strings.Contains(md, forbidden) {
-			t.Errorf("installed skill retains unconditional escalation wording %q", forbidden)
-		}
 	}
 }
 

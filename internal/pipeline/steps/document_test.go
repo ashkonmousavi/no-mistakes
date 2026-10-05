@@ -16,10 +16,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
-// TestDocumentStep_ReadOnly_ReportsFindingsWithoutTouchingWorktree proves the
-// happy path: the agent only reports findings and never mutates the worktree,
-// and the outcome carries those findings unchanged.
-func TestDocumentStep_ReadOnly_ReportsFindingsWithoutTouchingWorktree(t *testing.T) {
+func TestDocumentStep_AgentManaged_FixesAndCommitsWithoutApproval(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	gitCmd(t, dir, "checkout", "--detach", headSHA)
@@ -29,7 +26,8 @@ func TestDocumentStep_ReadOnly_ReportsFindingsWithoutTouchingWorktree(t *testing
 		name: "test",
 		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
 			callCount++
-			return &agent.Result{Output: json.RawMessage(`{"findings":[{"severity":"warning","file":"README.md","line":3,"description":"stale install instructions","action":"ask-user","class":"substantive"}],"summary":"README stale"}`)}, nil
+			os.WriteFile(filepath.Join(dir, "README.md"), []byte("# Updated\n"), 0o644)
+			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"update README"}`)}, nil
 		},
 	}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
@@ -40,30 +38,29 @@ func TestDocumentStep_ReadOnly_ReportsFindingsWithoutTouchingWorktree(t *testing
 		t.Fatal(err)
 	}
 	if callCount != 1 {
-		t.Fatalf("expected 1 agent call, got %d", callCount)
+		t.Fatalf("expected 1 agent call (discover+fix+verify in one pass), got %d", callCount)
 	}
-	if !outcome.NeedsApproval {
-		t.Error("expected approval for a reported documentation finding")
+	if outcome.NeedsApproval {
+		t.Error("expected no approval when agent resolved all documentation gaps")
 	}
 	if outcome.AutoFixable {
-		t.Error("expected no auto-fix loop for the read-only document step")
+		t.Error("expected no auto-fix loop in agent-managed document mode")
 	}
-	if outcome.FixSummary != noChangesAppliedSummary {
-		t.Fatalf("fix summary = %q, want %q for a report-only step", outcome.FixSummary, noChangesAppliedSummary)
+	if outcome.FixSummary != changesAppliedSummary {
+		t.Fatalf("fix summary = %q, want %q", outcome.FixSummary, changesAppliedSummary)
 	}
 	if status := gitStatusPorcelain(t, dir); status != "" {
-		t.Fatalf("expected clean worktree, got %q", status)
+		t.Fatalf("expected clean worktree after doc commit, got %q", status)
 	}
-	if sctx.Run.HeadSHA != headSHA {
-		t.Error("expected HeadSHA to stay unchanged since the read-only step never commits")
+	if got := lastCommitMessage(t, dir); got != "no-mistakes(document): update README" {
+		t.Fatalf("last commit message = %q", got)
+	}
+	if sctx.Run.HeadSHA == headSHA {
+		t.Error("expected HeadSHA to advance after doc commit")
 	}
 }
 
-// TestDocumentStep_ReadOnly_AgentMutationFailsTheStep proves the read-only
-// contract is enforced, not merely requested: an agent that edits a file after
-// being told this is a read-only review fails the step with a clear error
-// instead of silently discarding the edit and passing on zero findings.
-func TestDocumentStep_ReadOnly_AgentMutationFailsTheStep(t *testing.T) {
+func TestDocumentStep_AgentManaged_NormalizesMultilineCommitSummary(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	gitCmd(t, dir, "checkout", "--detach", headSHA)
@@ -74,27 +71,20 @@ func TestDocumentStep_ReadOnly_AgentMutationFailsTheStep(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# Updated\n"), 0o644); err != nil {
 				return nil, err
 			}
-			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"update README"}`)}, nil
+			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"update README\nand references"}`)}, nil
 		},
 	}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
 
-	step := &DocumentStep{}
-	_, err := step.Execute(sctx)
-	if err == nil {
-		t.Fatal("expected the document step to fail when the agent mutates the worktree")
+	if _, err := (&DocumentStep{}).Execute(sctx); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "read-only") {
-		t.Fatalf("error = %v, want a read-only violation message", err)
-	}
-	if status := gitStatusPorcelain(t, dir); status != "" {
-		t.Fatalf("expected the mutation to be discarded after the failure, got %q", status)
+	if got := lastCommitMessage(t, dir); got != "no-mistakes(document): update README and references" {
+		t.Fatalf("last commit message = %q", got)
 	}
 }
 
-// TestDocumentStep_ReadOnly_UntrackedFileFailsTheStep proves the mutation check
-// also catches a new untracked file, not only edits to tracked ones.
-func TestDocumentStep_ReadOnly_UntrackedFileFailsTheStep(t *testing.T) {
+func TestDocumentStep_AgentManaged_AllowsDocCommentEdits(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	gitCmd(t, dir, "checkout", "--detach", headSHA)
@@ -102,50 +92,8 @@ func TestDocumentStep_ReadOnly_UntrackedFileFailsTheStep(t *testing.T) {
 	ag := &mockAgent{
 		name: "test",
 		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
-			if err := os.WriteFile(filepath.Join(dir, "NOTES.md"), []byte("scratch notes\n"), 0o644); err != nil {
-				return nil, err
-			}
-			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"no gaps"}`)}, nil
-		},
-	}
-	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
-
-	step := &DocumentStep{}
-	_, err := step.Execute(sctx)
-	if err == nil {
-		t.Fatal("expected the document step to fail when the agent leaves an untracked file")
-	}
-	if status := gitStatusPorcelain(t, dir); status != "" {
-		t.Fatalf("expected the untracked file to be cleaned up after the failure, got %q", status)
-	}
-}
-
-// TestDocumentStep_PreexistingDirtyWorktreeIsNotMisattributedToTheAgent proves
-// the read-only verdict is a difference against the entry state, not "is the
-// worktree clean". An earlier step's uncommitted work (the Test step's evidence
-// agent is told to write focused tests and leaves them uncommitted) reaches
-// Document routinely, so it must neither fail the step nor be attributed to
-// this agent, and it must survive the pass untouched.
-func TestDocumentStep_PreexistingDirtyWorktreeIsNotMisattributedToTheAgent(t *testing.T) {
-	t.Parallel()
-	dir, baseSHA, headSHA := setupGitRepo(t)
-	gitCmd(t, dir, "checkout", "--detach", headSHA)
-
-	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# already dirty\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "leftover_test.go"), []byte("package leftover\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	dirtyBefore := gitStatusPorcelain(t, dir)
-	if dirtyBefore == "" {
-		t.Fatal("test setup failed to dirty the worktree")
-	}
-
-	ag := &mockAgent{
-		name: "test",
-		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
-			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"no gaps"}`)}, nil
+			os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\n// documentedThing explains the exported behavior.\nfunc documentedThing() {}\n"), 0o644)
+			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"update doc comment"}`)}, nil
 		},
 	}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
@@ -153,154 +101,27 @@ func TestDocumentStep_PreexistingDirtyWorktreeIsNotMisattributedToTheAgent(t *te
 	step := &DocumentStep{}
 	outcome, err := step.Execute(sctx)
 	if err != nil {
-		t.Fatalf("an earlier step's uncommitted work must not fail the read-only pass: %v", err)
+		t.Fatal(err)
 	}
 	if outcome.NeedsApproval {
-		t.Error("a clean read-only pass must not gate on another step's leftover changes")
+		t.Error("expected no approval when agent resolved doc comment gaps")
 	}
-	if got := gitStatusPorcelain(t, dir); got != dirtyBefore {
-		t.Fatalf("pre-existing worktree changes must survive untouched, before=%q after=%q", dirtyBefore, got)
+	if status := gitStatusPorcelain(t, dir); status != "" {
+		t.Fatalf("expected clean worktree after doc comment commit, got %q", status)
 	}
-	if got := readTestFile(t, filepath.Join(dir, "leftover_test.go")); got != "package leftover\n" {
-		t.Fatalf("leftover_test.go = %q, want the earlier step's content preserved", got)
-	}
-}
-
-// TestDocumentStep_MutationOnTopOfPreexistingDirtyWorktreeStillFails proves the
-// entry-state comparison did not weaken the guarantee: the agent's own mutation
-// is still a failed step, and because another step's work shares the worktree
-// nothing is discarded to clean up after it.
-func TestDocumentStep_MutationOnTopOfPreexistingDirtyWorktreeStillFails(t *testing.T) {
-	t.Parallel()
-	dir, baseSHA, headSHA := setupGitRepo(t)
-	gitCmd(t, dir, "checkout", "--detach", headSHA)
-
-	if err := os.WriteFile(filepath.Join(dir, "leftover_test.go"), []byte("package leftover\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	ag := &mockAgent{
-		name: "test",
-		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
-			if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# rewritten by the agent\n"), 0o644); err != nil {
-				return nil, err
-			}
-			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"fixed the docs"}`)}, nil
-		},
-	}
-	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
-
-	step := &DocumentStep{}
-	if _, err := step.Execute(sctx); err == nil {
-		t.Fatal("expected the agent's mutation to fail the read-only document step")
-	} else if !strings.Contains(err.Error(), "read-only") {
-		t.Fatalf("error = %v, want a read-only violation", err)
-	}
-	if got := readTestFile(t, filepath.Join(dir, "leftover_test.go")); got != "package leftover\n" {
-		t.Fatalf("leftover_test.go = %q, want the earlier step's work preserved, not discarded", got)
-	}
-	if got := readTestFile(t, filepath.Join(dir, "README.md")); got != "# rewritten by the agent\n" {
-		t.Fatalf("README.md = %q, want the tree left untouched when another step's work shares it", got)
+	if got := lastCommitMessage(t, dir); got != "no-mistakes(document): update doc comment" {
+		t.Fatalf("last commit message = %q", got)
 	}
 }
 
-// TestDocumentStep_EditToAPreexistingDirtyFileIsDetected proves the verdict
-// compares content, not porcelain status lines: editing a file that was already
-// untracked leaves its "??" line identical, so a status-only comparison would
-// report a clean read-only pass.
-func TestDocumentStep_EditToAPreexistingDirtyFileIsDetected(t *testing.T) {
-	t.Parallel()
-	dir, baseSHA, headSHA := setupGitRepo(t)
-	gitCmd(t, dir, "checkout", "--detach", headSHA)
-
-	leftover := filepath.Join(dir, "leftover_test.go")
-	if err := os.WriteFile(leftover, []byte("package leftover\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	statusBefore := gitStatusPorcelain(t, dir)
-
-	ag := &mockAgent{
-		name: "test",
-		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
-			if err := os.WriteFile(leftover, []byte("package leftover // edited by the agent\n"), 0o644); err != nil {
-				return nil, err
-			}
-			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"no gaps"}`)}, nil
-		},
-	}
-	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
-
-	if got := gitStatusPorcelain(t, dir); got != statusBefore {
-		t.Fatalf("setup invalidated the premise: status changed before the agent ran")
-	}
-
-	step := &DocumentStep{}
-	if _, err := step.Execute(sctx); err == nil {
-		t.Fatal("expected an edit to an already-dirty file to fail the read-only document step")
-	} else if !strings.Contains(err.Error(), "read-only") {
-		t.Fatalf("error = %v, want a read-only violation", err)
-	}
-	if got := gitStatusPorcelain(t, dir); got != statusBefore {
-		t.Fatalf("premise check: porcelain status must be unchanged by the agent's edit, before=%q after=%q", statusBefore, got)
-	}
-}
-
-// TestDocumentStep_EditToAPreexistingDirtyQuotedPathFileIsDetected proves the
-// verdict survives git's core.quotepath escaping: a pre-existing untracked
-// file whose name needs quoting (non-ASCII bytes) still moves the fingerprint
-// when the agent edits its content, even though its porcelain status line -
-// quoted and escaped either way - never moves.
-func TestDocumentStep_EditToAPreexistingDirtyQuotedPathFileIsDetected(t *testing.T) {
-	t.Parallel()
-	dir, baseSHA, headSHA := setupGitRepo(t)
-	gitCmd(t, dir, "checkout", "--detach", headSHA)
-
-	leftover := filepath.Join(dir, "café.go")
-	if err := os.WriteFile(leftover, []byte("package leftover\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	statusBefore := gitStatusPorcelain(t, dir)
-	if !strings.Contains(statusBefore, `"`) {
-		t.Fatalf("setup invalidated the premise: expected core.quotepath to escape the non-ASCII path, got %q", statusBefore)
-	}
-
-	ag := &mockAgent{
-		name: "test",
-		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
-			if err := os.WriteFile(leftover, []byte("package leftover // edited by the agent\n"), 0o644); err != nil {
-				return nil, err
-			}
-			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"no gaps"}`)}, nil
-		},
-	}
-	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
-
-	if got := gitStatusPorcelain(t, dir); got != statusBefore {
-		t.Fatalf("setup invalidated the premise: status changed before the agent ran")
-	}
-
-	step := &DocumentStep{}
-	if _, err := step.Execute(sctx); err == nil {
-		t.Fatal("expected an edit to an already-dirty quoted-path file to fail the read-only document step")
-	} else if !strings.Contains(err.Error(), "read-only") {
-		t.Fatalf("error = %v, want a read-only violation", err)
-	}
-	if got := gitStatusPorcelain(t, dir); got != statusBefore {
-		t.Fatalf("premise check: porcelain status must be unchanged by the agent's edit, before=%q after=%q", statusBefore, got)
-	}
-}
-
-// TestDocumentStep_ReadOnly_UnresolvedFindingsReportNoChangesApplied proves an
-// analyzer's descriptive summary cannot be persisted as if this report-only
-// step had applied a fix.
-func TestDocumentStep_ReadOnly_UnresolvedFindingsReportNoChangesApplied(t *testing.T) {
+func TestDocumentStep_AgentManaged_UnresolvedFindingsNeedApprovalWithoutAutoFixLoop(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 
 	ag := &mockAgent{
 		name: "test",
 		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
-			return &agent.Result{Output: json.RawMessage(`{"findings":[{"severity":"warning","description":"config docs conflict, needs human decision","action":"ask-user","class":"substantive"}],"summary":"docs mostly updated"}`)}, nil
+			return &agent.Result{Output: json.RawMessage(`{"findings":[{"severity":"warning","description":"config docs conflict, needs human decision","action":"ask-user"}],"summary":"docs mostly updated"}`)}, nil
 		},
 	}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
@@ -316,8 +137,8 @@ func TestDocumentStep_ReadOnly_UnresolvedFindingsReportNoChangesApplied(t *testi
 	if outcome.AutoFixable {
 		t.Error("expected unresolved documentation findings not to trigger an auto-fix round")
 	}
-	if outcome.FixSummary != noChangesAppliedSummary {
-		t.Fatalf("fix summary = %q, want %q", outcome.FixSummary, noChangesAppliedSummary)
+	if outcome.FixSummary != NoChangesAppliedSummary {
+		t.Fatalf("fix summary = %q, want %q", outcome.FixSummary, NoChangesAppliedSummary)
 	}
 	var findings Findings
 	if err := json.Unmarshal([]byte(outcome.Findings), &findings); err != nil {
@@ -331,10 +152,11 @@ func TestDocumentStep_ReadOnly_UnresolvedFindingsReportNoChangesApplied(t *testi
 // TestDocumentStep_PromptAppliesPlacementPolicy pins the placement-policy
 // prompt contract from the 121-PR audit: each fact has one authoritative
 // owner, stale duplicates are removed or reduced to pointers (not
-// synchronized), AGENTS.md never receives incident narratives (invariant +
-// regression-test pointer instead), no new surfaces for perceived gaps, and
-// the scope stays on documentation this change made stale. The old
-// exhaustive-corpus-synchronization incentives must be gone.
+// synchronized), AGENTS.md and CLAUDE.md never receive incident narratives
+// (invariant + regression-test pointer instead) and are edited only to
+// correct factually wrong content - never to fill gaps, no new surfaces for
+// perceived gaps, and the scope stays on documentation this change made
+// stale. The old exhaustive-corpus-synchronization incentives must be gone.
 func TestDocumentStep_PromptAppliesPlacementPolicy(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
@@ -357,10 +179,13 @@ func TestDocumentStep_PromptAppliesPlacementPolicy(t *testing.T) {
 		"exactly one authoritative owner document",
 		"remove the duplicate or reduce it to a short pointer to the owner",
 		"never synchronize prose copies",
-		// No new surfaces, no AGENTS.md postmortems; invariants + test pointers.
+		// No new surfaces, no memory-file postmortems; invariants + test
+		// pointers, and memory files are corrected but never added to.
 		"Do not create a new documentation surface merely to close a perceived gap",
 		"Do not add incident narratives or postmortems to AGENTS.md",
 		"point to the regression test or authoritative implementation",
+		"Edit them only to correct or remove information that is factually wrong",
+		"never add content because something is missing",
 		// Ownership map for the standard surfaces.
 		"README.md owns the user-facing product introduction",
 		"CONTRIBUTING.md owns contribution mechanics",
@@ -371,10 +196,6 @@ func TestDocumentStep_PromptAppliesPlacementPolicy(t *testing.T) {
 		"report one finding proposing the follow-up instead of multiplying edits",
 		// Changed behavior must still land in its authoritative location.
 		"Changed user-facing behavior must leave its authoritative user documentation accurate",
-		// Genuinely read-only: report every defect, never edit.
-		"This is a read-only review",
-		"do not modify, create, or delete any file",
-		"naming the file and line number",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("expected document prompt to contain %q\nprompt:\n%s", want, prompt)
@@ -391,18 +212,9 @@ func TestDocumentStep_PromptAppliesPlacementPolicy(t *testing.T) {
 			t.Errorf("document prompt still carries corpus-sweep incentive %q", forbidden)
 		}
 	}
-	// The agent must never be told to fix anything itself, nor told to withhold
-	// a gap it already "fixed" - either one lets a compliant agent report zero
-	// findings while the discarded edit leaves the real defect unreported.
-	for _, forbidden := range []string{
-		"fix each stale fact",
-		"Fix in the authoritative location",
-		"Do not report gaps you already fixed",
-		"Update each altered fact in its owner document.",
-	} {
-		if strings.Contains(prompt, forbidden) {
-			t.Errorf("document prompt still instructs editing or withholding fixed gaps: %q", forbidden)
-		}
+	// The fused prompt must not instruct read-only assessment.
+	if strings.Contains(prompt, "Do NOT make any file changes") {
+		t.Error("expected fused document prompt not to forbid file changes")
 	}
 }
 
@@ -449,6 +261,7 @@ func TestDocumentStep_UserFix_PassesPreviousFindingsIntoPrompt(t *testing.T) {
 	ag := &mockAgent{
 		name: "test",
 		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			os.WriteFile(filepath.Join(dir, "README.md"), []byte("# Fixed\n"), 0o644)
 			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"address config docs"}`)}, nil
 		},
 	}
@@ -462,7 +275,7 @@ func TestDocumentStep_UserFix_PassesPreviousFindingsIntoPrompt(t *testing.T) {
 		t.Fatal(err)
 	}
 	if outcome.NeedsApproval {
-		t.Error("expected no approval once the agent reports no remaining findings")
+		t.Error("expected no approval after resolving the user-selected findings")
 	}
 	prompt := ag.calls[0].Prompt
 	if !strings.Contains(prompt, "Previous findings to address") {
@@ -474,8 +287,8 @@ func TestDocumentStep_UserFix_PassesPreviousFindingsIntoPrompt(t *testing.T) {
 	if strings.Contains(prompt, "doc-1 =======") || strings.Contains(prompt, "<<<<<<< HEAD") {
 		t.Error("expected user-fix prompt to sanitize finding fields and merge markers")
 	}
-	if status := gitStatusPorcelain(t, dir); status != "" {
-		t.Fatalf("expected clean worktree, got %q", status)
+	if got := lastCommitMessage(t, dir); got != "no-mistakes(document): address config docs" {
+		t.Fatalf("last commit message = %q", got)
 	}
 }
 
@@ -507,11 +320,7 @@ func TestDocumentStep_NoChanges_SkipsAgent(t *testing.T) {
 	}
 }
 
-// TestDocumentStep_MalformedOutput_FailsClosedWithoutMutation keeps upstream's
-// fail-closed analyzer validation intact under the read-only document step: an
-// agent that mutates nothing but returns unparsable output still fails the step
-// rather than certifying opaque output.
-func TestDocumentStep_MalformedOutput_FailsClosedWithoutMutation(t *testing.T) {
+func TestDocumentStep_MalformedOutput_CommitsAndFailsClosed(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	gitCmd(t, dir, "checkout", "--detach", headSHA)
@@ -519,9 +328,10 @@ func TestDocumentStep_MalformedOutput_FailsClosedWithoutMutation(t *testing.T) {
 	ag := &mockAgent{
 		name: "test",
 		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			os.WriteFile(filepath.Join(dir, "README.md"), []byte("# Partial\n"), 0o644)
 			return &agent.Result{
 				Output: json.RawMessage(`{not valid json`),
-				Text:   "I inspected the docs",
+				Text:   "I updated the docs",
 			}, nil
 		},
 	}
@@ -535,42 +345,9 @@ func TestDocumentStep_MalformedOutput_FailsClosedWithoutMutation(t *testing.T) {
 	if outcome != nil {
 		t.Fatalf("Execute() outcome = %+v, want no outcome", outcome)
 	}
+	// Any edits the agent made should still be committed.
 	if status := gitStatusPorcelain(t, dir); status != "" {
-		t.Fatalf("expected clean worktree, got %q", status)
-	}
-}
-
-// TestDocumentStep_MutationTakesPriorityOverMalformedOutput proves the
-// read-only check runs before structured-output parsing: an agent that both
-// mutates the worktree and returns unparsable output is reported as a
-// read-only violation, so the mutation is never hidden behind the analyzer
-// error.
-func TestDocumentStep_MutationTakesPriorityOverMalformedOutput(t *testing.T) {
-	t.Parallel()
-	dir, baseSHA, headSHA := setupGitRepo(t)
-	gitCmd(t, dir, "checkout", "--detach", headSHA)
-
-	ag := &mockAgent{
-		name: "test",
-		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
-			if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# Partial\n"), 0o644); err != nil {
-				return nil, err
-			}
-			return &agent.Result{
-				Output: json.RawMessage(`{not valid json`),
-				Text:   "I updated the docs",
-			}, nil
-		},
-	}
-	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
-
-	step := &DocumentStep{}
-	_, err := step.Execute(sctx)
-	if err == nil {
-		t.Fatal("expected a mutation alongside malformed output to fail the step")
-	}
-	if !strings.Contains(err.Error(), "read-only") {
-		t.Fatalf("error = %v, want a read-only violation message", err)
+		t.Fatalf("expected agent edits committed despite malformed summary, got %q", status)
 	}
 }
 
@@ -652,55 +429,4 @@ func TestDocumentStep_SuccessfulReturnAfterTimeoutFailsWithoutCommit(t *testing.
 	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got != headSHA {
 		t.Fatalf("HEAD = %s, want unchanged %s", got, headSHA)
 	}
-}
-
-// TestDocumentStep_FileAddedInsideAPreexistingUntrackedDirectoryIsDetected
-// covers the collapsed-directory case: git's default porcelain output reports a
-// wholly untracked directory as a single line, so a file the agent adds inside
-// it moves neither that line nor the directory's own hash.
-func TestDocumentStep_FileAddedInsideAPreexistingUntrackedDirectoryIsDetected(t *testing.T) {
-	t.Parallel()
-	dir, baseSHA, headSHA := setupGitRepo(t)
-	gitCmd(t, dir, "checkout", "--detach", headSHA)
-
-	pkg := filepath.Join(dir, "newpkg")
-	if err := os.MkdirAll(pkg, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(pkg, "a_test.go"), []byte("package newpkg\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	statusBefore := gitStatusPorcelain(t, dir)
-
-	ag := &mockAgent{
-		name: "test",
-		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
-			if err := os.WriteFile(filepath.Join(pkg, "b_test.go"), []byte("package newpkg\n"), 0o644); err != nil {
-				return nil, err
-			}
-			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"no gaps"}`)}, nil
-		},
-	}
-	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
-
-	step := &DocumentStep{}
-	if _, err := step.Execute(sctx); err == nil {
-		t.Fatal("expected a file added inside an already-untracked directory to fail the read-only document step")
-	} else if !strings.Contains(err.Error(), "read-only") {
-		t.Fatalf("error = %v, want a read-only violation", err)
-	}
-	if got := gitStatusPorcelain(t, dir); got != statusBefore {
-		t.Fatalf("premise check: default porcelain status must be unchanged by the added file, before=%q after=%q", statusBefore, got)
-	}
-}
-
-// readTestFile returns a worktree file's content, failing the test if it is
-// gone - the discard path this file's tests guard against deletes files.
-func readTestFile(t *testing.T, path string) string {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-	return string(data)
 }
