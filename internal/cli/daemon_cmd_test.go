@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -133,5 +134,47 @@ func TestProofAndPRBaseBranchPushOptionsRoundTrip(t *testing.T) {
 	}
 	if _, err := parseValidationGenerationPushOptions([]string{generationOpt, formatValidationGenerationPushOption("generation-8")}); err == nil {
 		t.Fatal("conflicting validation generations were accepted")
+	}
+}
+
+func TestReconciledPreviousHeadPushOptionRoundTrip(t *testing.T) {
+	head := "1234567890abcdef1234567890abcdef12345678"
+	opt := formatReconciledPreviousHeadPushOption(head)
+	if opt == "" {
+		t.Fatal("reconciled previous head produced no push option")
+	}
+	got, err := parseReconciledPreviousHeadPushOptions([]string{"no-mistakes.skip=review", opt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != head {
+		t.Fatalf("parsed previous head = %q, want %q", got, head)
+	}
+	if formatReconciledPreviousHeadPushOption("   ") != "" {
+		t.Fatal("an empty previous head produced a push option")
+	}
+	if got, err := parseReconciledPreviousHeadPushOptions(nil); err != nil || got != "" {
+		t.Fatalf("absent option = %q, %v", got, err)
+	}
+	if _, err := parseReconciledPreviousHeadPushOptions([]string{"no-mistakes.reconciled-previous-head=refs/heads/main"}); err == nil {
+		t.Fatal("a non-SHA previous head claim was accepted")
+	}
+}
+
+func TestClosingIssueRefsPushOptionsRoundTrip(t *testing.T) {
+	options := formatClosingIssueRefsPushOptions([]string{"42", "owner/repo#9"})
+	got, err := parseClosingIssueRefsPushOptions(append([]string{"ci.skip"}, options...))
+	if err != nil {
+		t.Fatalf("parseClosingIssueRefsPushOptions() error = %v", err)
+	}
+	if refs := strings.Join(got, ","); refs != "42,owner/repo#9" {
+		t.Fatalf("parseClosingIssueRefsPushOptions() = %q, want both references", refs)
+	}
+}
+
+func TestParseClosingIssueRefsPushOptionsRejectsInvalidValue(t *testing.T) {
+	_, err := parseClosingIssueRefsPushOptions([]string{"no-mistakes.closes=42 Fixes #99"})
+	if err == nil {
+		t.Fatal("expected invalid closing issue references push option to fail")
 	}
 }

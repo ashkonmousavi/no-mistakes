@@ -29,6 +29,9 @@ func TestPublishChannelsWorkflowRefreshesManifestWithoutRESTForEndUsers(t *testi
 	if err := yaml.Unmarshal(raw, &wf); err != nil {
 		t.Fatalf("parse workflow: %v", err)
 	}
+	if _, ok := wf.On["workflow_call"]; !ok {
+		t.Fatal("publish-channels must be a reusable workflow so release.yml can invoke it after finalize (GITHUB_TOKEN release events do not cascade)")
+	}
 	if _, ok := wf.On["workflow_dispatch"]; !ok {
 		t.Fatal("publish-channels workflow must allow workflow_dispatch so a manifest can be published without a new versioned release")
 	}
@@ -59,8 +62,25 @@ func TestPublishChannelsWorkflowRefreshesManifestWithoutRESTForEndUsers(t *testi
 	if !ok {
 		t.Fatal("missing publish-channels job")
 	}
-	if job.If != "github.event_name == 'workflow_dispatch' || github.event.release.tag_name != 'channels'" {
-		t.Fatalf("job if = %q, want a skip for the channels tag so uploading the manifest cannot recurse", job.If)
+	for _, tc := range []struct {
+		name    string
+		context workflowConditionContext
+		wantRun bool
+	}{
+		{name: "channels release", context: workflowConditionContext{EventName: "release", ReleaseTagName: "channels"}, wantRun: false},
+		{name: "version release", context: workflowConditionContext{EventName: "release", ReleaseTagName: "v1.72.0"}, wantRun: true},
+		{name: "release workflow call", context: workflowConditionContext{EventName: "push"}, wantRun: true},
+		{name: "workflow dispatch", context: workflowConditionContext{EventName: "workflow_dispatch"}, wantRun: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := evaluateWorkflowCondition(job.If, tc.context)
+			if err != nil {
+				t.Fatalf("evaluate publish-channels condition: %v", err)
+			}
+			if got != tc.wantRun {
+				t.Fatalf("publish-channels runs = %t, want %t", got, tc.wantRun)
+			}
+		})
 	}
 	var sawPublish bool
 	for _, step := range job.Steps {

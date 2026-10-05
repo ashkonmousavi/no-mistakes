@@ -12,7 +12,6 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
-	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 func TestCIStep_MergeConflictDetected_ReturnsNeedsApproval(t *testing.T) {
@@ -64,107 +63,6 @@ func TestCIStep_MergeConflictDetected_ReturnsNeedsApproval(t *testing.T) {
 	}
 	if !foundConflict {
 		t.Fatalf("expected merge conflict finding, got: %+v", findings.Items)
-	}
-}
-
-func TestCIStep_ConflictRepairAgainstNewBaseReturnsNewFinding(t *testing.T) {
-	t.Parallel()
-	dir, baseSHA, repairHeadSHA := setupGitRepo(t)
-
-	// This is the first CI poll after a conflict-only repair restarted from
-	// Review. The old base-A repair had no check targets; main advanced to B
-	// before revalidation completed, so the PR is dirty again with no checks
-	// yet registered. That must reach the normal conflict finding route rather
-	// than waiting for a rerun that cannot start.
-	env := fakeCIGHMergeable(t, "OPEN", `[]`, "CONFLICTING")
-	prURL := "https://github.com/test/repo/pull/42"
-	sctx := newTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, repairHeadSHA, config.Commands{})
-	sctx.Env = env
-	sctx.Run.PRURL = &prURL
-	sctx.Config.CITimeout = 30 * time.Second
-	sctx.Config.AutoFix = config.AutoFix{CI: 0}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sctx.Ctx = ctx
-
-	step := (&CIStep{
-		lastFixedChecks: encodeLastFixedChecks(nil, true, "base-a", repairHeadSHA),
-	}).SetBaseBranchTip(func(context.Context) (string, bool) { return "base-b", true }).SetWaitForNextPoll(func(context.Context, time.Duration) error {
-		cancel()
-		return context.Canceled
-	})
-	outcome, err := driveCI(t, step, sctx)
-	if err != nil {
-		t.Fatalf("CI monitor returned error: %v", err)
-	}
-	if outcome == nil || !outcome.NeedsApproval {
-		t.Fatalf("outcome = %#v, want the normal conflict finding", outcome)
-	}
-	var findings Findings
-	if err := json.Unmarshal([]byte(outcome.Findings), &findings); err != nil {
-		t.Fatal(err)
-	}
-	if len(findings.Items) != 1 || findings.Items[0].Category != types.FindingCategoryCIMergeConflict {
-		t.Fatalf("findings = %+v, want one merge-conflict finding", findings.Items)
-	}
-}
-
-func TestCIStep_UnlimitedConflictRepairAgainstNewBaseReturnsNewFinding(t *testing.T) {
-	t.Parallel()
-	dir, baseSHA, repairHeadSHA := setupGitRepo(t)
-
-	// Unlimited monitoring normally avoids the timeout base-tip lookup. A
-	// retained, verified conflict repair binding still needs that bounded lookup
-	// so a new base cannot be hidden behind the prior conflict suppression.
-	env := fakeCIGHMergeable(t, "OPEN", `[]`, "CONFLICTING")
-	prURL := "https://github.com/test/repo/pull/42"
-	sctx := newTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, repairHeadSHA, config.Commands{})
-	sctx.Env = env
-	sctx.Run.PRURL = &prURL
-	sctx.Config.CITimeout = -1
-	sctx.Config.AutoFix = config.AutoFix{CI: 0}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sctx.Ctx = ctx
-
-	step := (&CIStep{
-		lastFixedChecks: encodeLastFixedChecks(nil, true, "base-a", repairHeadSHA),
-	}).SetBaseBranchTip(func(context.Context) (string, bool) { return "base-b", true }).SetWaitForNextPoll(func(context.Context, time.Duration) error {
-		cancel()
-		return context.Canceled
-	})
-	outcome, err := driveCI(t, step, sctx)
-	if err != nil {
-		t.Fatalf("unlimited CI monitor returned error: %v", err)
-	}
-	if outcome == nil || !outcome.NeedsApproval {
-		t.Fatalf("outcome = %#v, want the normal conflict finding", outcome)
-	}
-}
-
-func TestConflictRepairBindingRequiresIncorporatedTarget(t *testing.T) {
-	t.Parallel()
-	dir, _, featureHead := setupGitRepo(t)
-
-	gitCmd(t, dir, "checkout", "main")
-	if err := os.WriteFile(filepath.Join(dir, "target.txt"), []byte("target\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitCmd(t, dir, "add", "target.txt")
-	gitCmd(t, dir, "commit", "-m", "advanced target")
-	targetSHA := gitCmd(t, dir, "rev-parse", "HEAD")
-	gitCmd(t, dir, "checkout", "feature")
-
-	if base, head := conflictRepairBinding(context.Background(), dir, targetSHA, true, featureHead); base != "" || head != "" {
-		t.Fatalf("non-incorporated target binding = (%q, %q), want empty", base, head)
-	}
-	gitCmd(t, dir, "rebase", "main")
-	repairedHead := gitCmd(t, dir, "rev-parse", "HEAD")
-	if base, head := conflictRepairBinding(context.Background(), dir, targetSHA, true, repairedHead); base != targetSHA || head != repairedHead {
-		t.Fatalf("incorporated target binding = (%q, %q), want (%q, %q)", base, head, targetSHA, repairedHead)
-	}
-	if base, head := conflictRepairBinding(context.Background(), dir, targetSHA, false, repairedHead); base != "" || head != "" {
-		t.Fatalf("unverified target binding = (%q, %q), want empty", base, head)
 	}
 }
 
@@ -325,94 +223,6 @@ func TestCIStep_MergeConflictOnly_AutoFix(t *testing.T) {
 	}
 }
 
-// TestCIStep_MergeConflictOnly_AutoFix_SyncStrategyMerge proves that under
-// sync_strategy: merge the CI conflict-repair prompt tells the agent to
-// integrate with an ordinary merge, never a rebase, and explicitly forbids
-// git rebase, git reset --hard onto another commit, and a force-push - the
-// same repair path TestCIStep_MergeConflictOnly_AutoFix exercises under the
-// default rebase strategy.
-func TestCIStep_MergeConflictOnly_AutoFix_SyncStrategyMerge(t *testing.T) {
-	t.Parallel()
-	upstream := t.TempDir()
-	gitCmd(t, upstream, "init", "--bare")
-
-	dir := t.TempDir()
-	gitCmd(t, dir, "init")
-	gitCmd(t, dir, "config", "user.name", "test")
-	gitCmd(t, dir, "config", "user.email", "test@test.com")
-	gitCmd(t, dir, "checkout", "-b", "main")
-	os.WriteFile(filepath.Join(dir, "init.txt"), []byte("init"), 0o644)
-	gitCmd(t, dir, "add", "-A")
-	gitCmd(t, dir, "commit", "-m", "initial")
-	baseSHA := gitCmd(t, dir, "rev-parse", "HEAD")
-	gitCmd(t, dir, "remote", "add", "origin", upstream)
-	gitCmd(t, dir, "push", "origin", "main")
-
-	gitCmd(t, dir, "checkout", "-b", "feature")
-	os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("feature"), 0o644)
-	gitCmd(t, dir, "add", "-A")
-	gitCmd(t, dir, "commit", "-m", "feature")
-	headSHA := gitCmd(t, dir, "rev-parse", "HEAD")
-	gitCmd(t, dir, "push", "origin", "feature")
-
-	// All checks pass, but merge conflict.
-	checksJSON := `[{"name":"build","state":"SUCCESS","bucket":"pass"},{"name":"test","state":"SUCCESS","bucket":"pass"}]`
-	env := fakeCIGHMergeable(t, "OPEN", checksJSON, "CONFLICTING")
-
-	agentCalled := false
-	var capturedPrompt string
-	ag := &mockAgent{
-		name: "test",
-		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
-			agentCalled = true
-			capturedPrompt = opts.Prompt
-			os.WriteFile(filepath.Join(opts.CWD, "conflict-fix.txt"), []byte("resolved"), 0o644)
-			return &agent.Result{}, nil
-		},
-	}
-
-	prURL := "https://github.com/test/repo/pull/42"
-	sctx := newTestContext(t, ag, dir, baseSHA, headSHA, config.Commands{})
-	sctx.Env = env
-	sctx.Run.PRURL = &prURL
-	sctx.Repo.UpstreamURL = upstream
-	sctx.Run.Branch = "refs/heads/feature"
-	sctx.Config.CITimeout = 30 * time.Second
-	sctx.Config.AutoFix = config.AutoFix{CI: 3}
-	sctx.Config.SyncStrategy = config.SyncStrategyMerge
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sctx.Ctx = ctx
-
-	step := &CIStep{
-		waitForNextPoll: func(ctx context.Context, interval time.Duration) error {
-			cancel()
-			return ctx.Err()
-		},
-	}
-	driveCI(t, step, sctx)
-
-	if !agentCalled {
-		t.Fatal("expected agent to be called to resolve merge conflict")
-	}
-	if strings.Contains(capturedPrompt, "You MUST produce file changes that fix the failing checks") {
-		t.Fatalf("merge-conflict-only prompt should not require file changes for failing checks, got:\n%s", capturedPrompt)
-	}
-	if !strings.Contains(capturedPrompt, "Merge the base branch and resolve the merge conflicts") {
-		t.Fatalf("expected merge-strategy prompt to focus on merge flow, got:\n%s", capturedPrompt)
-	}
-	if strings.Contains(capturedPrompt, "Rebase onto the base branch") {
-		t.Fatalf("expected merge-strategy prompt to never say rebase, got:\n%s", capturedPrompt)
-	}
-	if !strings.Contains(capturedPrompt, "Use git merge, not git rebase") {
-		t.Fatalf("expected prompt to explicitly forbid rebase/reset --hard/force-push, got:\n%s", capturedPrompt)
-	}
-	if !strings.Contains(capturedPrompt, "merge target commit:") {
-		t.Fatalf("expected prompt to label the target commit for a merge, got:\n%s", capturedPrompt)
-	}
-}
-
 func TestCIStep_MergeConflictAutoFixPromptUsesBaseBranchTip(t *testing.T) {
 	t.Parallel()
 	upstream := t.TempDir()
@@ -465,7 +275,6 @@ func TestCIStep_MergeConflictAutoFixPromptUsesBaseBranchTip(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(opts.CWD, "conflict-fix.txt"), []byte("resolved\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			gitCmd(t, opts.CWD, "rebase", "main")
 			return &agent.Result{}, nil
 		},
 	}
@@ -489,7 +298,7 @@ func TestCIStep_MergeConflictAutoFixPromptUsesBaseBranchTip(t *testing.T) {
 		t.Fatalf("buildHost returned nil: %s", skip)
 	}
 	pr := &scm.PR{Number: "42", URL: prURL}
-	repair, err := step.autoFixCI(sctx, host, pr, ciTargetsFor(nil, true))
+	_, err := step.autoFixCI(sctx, host, pr, ciTargetsFor(nil, true))
 	if err != nil {
 		t.Fatalf("auto-fix CI: %v", err)
 	}
@@ -501,9 +310,6 @@ func TestCIStep_MergeConflictAutoFixPromptUsesBaseBranchTip(t *testing.T) {
 	}
 	if strings.Contains(capturedPrompt, "base commit: "+baseSHA) {
 		t.Fatalf("expected prompt to avoid merge-base %s, got:\n%s", baseSHA, capturedPrompt)
-	}
-	if repair.ConflictRepairBaseSHA != mainTip || repair.ConflictRepairHeadSHA != sctx.Run.HeadSHA {
-		t.Fatalf("repair binding = base %q head %q, want incorporated target %q and recorded head %q", repair.ConflictRepairBaseSHA, repair.ConflictRepairHeadSHA, mainTip, sctx.Run.HeadSHA)
 	}
 }
 

@@ -15,7 +15,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 )
+
+// Logging and stateful PR readback consume the same command stdin, not two
+// independent streams. Each helper subprocess represents exactly one command.
+var readFakeBody = sync.OnceValues(func() ([]byte, error) { return io.ReadAll(os.Stdin) })
 
 func main() {
 	mode := os.Getenv("FAKE_CLI_MODE")
@@ -57,6 +62,10 @@ func handleFakeCLI(mode string) {
 		fakeGitRequireNonInteractiveEnvHandler(args)
 	case "git-status-error":
 		fakeGitStatusErrorHandler(args)
+	case "git-stale-dirty-status":
+		fakeGitStaleDirtyStatusHandler(args)
+	case "git-commit-error":
+		fakeGitCommitErrorHandler(args)
 	case "git-remote-error":
 		fakeGitRemoteErrorHandler(args)
 	case "ci-gh":
@@ -91,7 +100,7 @@ func logFakeCLIStdinBody(args []string, logFile string) {
 	if logFile == "" || !argsUseStdinBodyFile(args) {
 		return
 	}
-	body, err := io.ReadAll(os.Stdin)
+	body, err := readFakeBody()
 	if err != nil {
 		return
 	}
@@ -126,6 +135,7 @@ func fakeRecordSuccessHandler() {
 }
 
 func fakeGHHandler(args []string) {
+	fakeGHHandlePRContentCommands(args, strings.Join(args, " "))
 	prURL := os.Getenv("FAKE_CLI_PR_URL")
 	prBase := os.Getenv("FAKE_CLI_PR_BASE")
 	prListJSON, hasPRListJSON := os.LookupEnv("FAKE_CLI_PR_LIST_JSON")
@@ -171,6 +181,10 @@ func fakeGHHandler(args []string) {
 		os.Exit(0)
 	}
 	if len(args) >= 2 && args[0] == "pr" && args[1] == "create" {
+		if os.Getenv("FAKE_CLI_PR_CREATE_EMPTY") == "1" {
+			os.Exit(0)
+		}
+		fakeGHStorePRBody(args)
 		fmt.Println("https://github.com/test/repo/pull/99")
 		os.Exit(0)
 	}
@@ -184,6 +198,23 @@ func fakeGitStatusErrorHandler(args []string) {
 		os.Exit(1)
 	}
 	fakeGitForward(args, realGit)
+}
+
+func fakeGitStaleDirtyStatusHandler(args []string) {
+	realGit := os.Getenv("FAKE_CLI_REAL_GIT")
+	if len(args) >= 2 && args[0] == "status" && args[1] == "--porcelain" {
+		fmt.Println(" M feature.txt")
+		os.Exit(0)
+	}
+	fakeGitForward(args, realGit)
+}
+
+func fakeGitCommitErrorHandler(args []string) {
+	if len(args) > 0 && args[0] == "commit" {
+		fmt.Fprintln(os.Stderr, "intentional commit failure")
+		os.Exit(1)
+	}
+	fakeGitForward(args, os.Getenv("FAKE_CLI_REAL_GIT"))
 }
 
 func fakeGitPassthroughHandler(args []string) {
@@ -469,6 +500,10 @@ func fakeCIGHReconcileHandler(args []string) {
 
 func fakeGHHandlePRContentCommands(args []string, joined string) {
 	if strings.Contains(joined, "pr view") && strings.Contains(joined, "--json title,body") {
+		if raw, ok := os.LookupEnv("FAKE_CLI_PR_CONTENT_JSON"); ok {
+			fmt.Println(raw)
+			os.Exit(0)
+		}
 		title := os.Getenv("FAKE_CLI_PR_TITLE")
 		if title == "" {
 			title = "test pr"
@@ -495,18 +530,24 @@ func fakeGHHandlePRContentCommands(args []string, joined string) {
 			fmt.Fprintln(os.Stderr, editErr)
 			os.Exit(1)
 		}
-		if path := os.Getenv("FAKE_CLI_PR_BODY_FILE"); path != "" {
-			body, err := io.ReadAll(os.Stdin)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-			if err := os.WriteFile(path, body, 0o644); err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-		}
+		fakeGHStorePRBody(args)
 		os.Exit(0)
+	}
+}
+
+func fakeGHStorePRBody(args []string) {
+	path := os.Getenv("FAKE_CLI_PR_BODY_FILE")
+	bodyFile, _ := fakeCLIFlagValue(args, "--body-file")
+	if path == "" || bodyFile != "-" {
+		return // A base-only edit must not erase the fake's body either.
+	}
+	body, err := readFakeBody()
+	if err == nil {
+		err = os.WriteFile(path, body, 0o644)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 }
 
@@ -584,6 +625,10 @@ func fakeCIGHHandler(args []string) {
 	}
 	if strings.Contains(joined, "run rerun") {
 		fakeCIGHRerun()
+	}
+	if strings.Contains(joined, "run view") && strings.Contains(joined, "--json jobs") {
+		printFakeRunJobs()
+		os.Exit(0)
 	}
 	if strings.Contains(joined, "run view") {
 		fmt.Println("error log output")
@@ -694,6 +739,10 @@ func fakeCIGHSequenceHandler(args []string) {
 	}
 	if strings.Contains(joined, "run rerun") {
 		fakeCIGHRerun()
+	}
+	if strings.Contains(joined, "run view") && strings.Contains(joined, "--json jobs") {
+		printFakeRunJobs()
+		os.Exit(0)
 	}
 	if strings.Contains(joined, "run view") {
 		fmt.Println("error log output")
@@ -844,6 +893,17 @@ func fakeCIGHNoChecksHandler(args []string) {
 		os.Exit(0)
 	}
 	os.Exit(1)
+}
+
+// printFakeRunJobs answers `gh run view <id> --json jobs`. The default empty
+// job list is what GitHub reports for a workflow run it is holding for
+// maintainer approval - it concluded without running anything.
+func printFakeRunJobs() {
+	raw := os.Getenv("FAKE_CLI_RUN_JOBS")
+	if raw == "" {
+		raw = "[]"
+	}
+	fmt.Printf("{\"jobs\":%s}\n", raw)
 }
 
 func printFakeWorkflowRuns() {

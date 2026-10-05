@@ -216,7 +216,8 @@ func replayOne(ctx context.Context, store *Store, c Case, session Session, candi
 	// object pools, and Store.Prune all live under <NM_HOME>/eval, so a live
 	// sandbox nested there would sit inside the very state it is replaying.
 	// That isolation outranks moving it off the system temp directory; see the
-	// held-scope note in AGENTS.md ("no-mistakes Owns Its Own Scratch").
+	// held-scope note under "no-mistakes Owns Its Own Scratch" in
+	// .agents/skills/test-evidence-storage/SKILL.md.
 	root, err := os.MkdirTemp("", "nm-eval-replay-")
 	if err != nil {
 		evaluation.Error = safeurl.RedactText(fmt.Sprintf("create isolated replay root: %v", err))
@@ -310,6 +311,7 @@ func replayOne(ctx context.Context, store *Store, c Case, session Session, candi
 		StepResultID:          stepResultID,
 		Fixing:                fixing,
 		SkipFixExecution:      fixing,
+		EvalReplay:            true,
 		ReviewStartingHeadSHA: startingHeadSHA,
 		PreviousFindings:      previousFindings,
 		// Keep NM_HOME on the nested sandbox so replay cannot see or mutate
@@ -324,8 +326,9 @@ func replayOne(ctx context.Context, store *Store, c Case, session Session, candi
 		UserIntent:   c.Intent,
 		IntentSource: c.IntentSource,
 	})
-	// Candidate wall time is the actual review invocation, matching the local
-	// agent-invocation metric rather than charging case restoration setup.
+	// Candidate wall time is the actual review invocations, every rerun
+	// included, matching the local agent-invocation metric rather than
+	// charging case restoration setup.
 	evaluation.DurationMS = observed.durationMS
 	if evaluation.DurationMS == 0 && observed.result == nil {
 		evaluation.DurationMS = time.Since(started).Milliseconds()
@@ -339,12 +342,12 @@ func replayOne(ctx context.Context, store *Store, c Case, session Session, candi
 			evaluation.Error = safeurl.RedactText(fmt.Sprintf("candidate served model %q, requested %q", evaluation.Model, candidate.Model))
 			return evaluation
 		}
-		if observed.result.UsageReported {
+		if !observed.usageMissing {
 			evaluation.TokensReported = true
-			evaluation.InputTokens = int64(observed.result.Usage.InputTokens)
-			evaluation.OutputTokens = int64(observed.result.Usage.OutputTokens)
-			evaluation.CacheReadTokens = int64(observed.result.Usage.CacheReadTokens)
-			evaluation.FreshInputTokens = int64(agent.FreshInputTokens(observed.result.Usage.InputTokens, observed.result.Usage.CacheReadTokens))
+			evaluation.InputTokens = int64(observed.usage.InputTokens)
+			evaluation.OutputTokens = int64(observed.usage.OutputTokens)
+			evaluation.CacheReadTokens = int64(observed.usage.CacheReadTokens)
+			evaluation.FreshInputTokens = int64(observed.freshInputTokens)
 		}
 	}
 	if err != nil {
@@ -481,12 +484,19 @@ func replayConfig(c Case) (*config.Config, error) {
 }
 
 type observedAgent struct {
-	inner        agent.Agent
-	ownership    *e2edaemon.Ownership
-	result       *agent.Result
-	durationMS   int64
-	ownershipErr error
-	mu           sync.Mutex
+	inner      agent.Agent
+	ownership  *e2edaemon.Ownership
+	result     *agent.Result
+	durationMS int64
+	// A review can rerun, so usage sums every attempt, fresh input per attempt
+	// as the captured baseline does. usageMissing marks an attempt with no
+	// reported usage, which makes the sum incomplete rather than a smaller
+	// cost.
+	usage            agent.TokenUsage
+	freshInputTokens int
+	usageMissing     bool
+	ownershipErr     error
+	mu               sync.Mutex
 }
 
 func (a *observedAgent) Name() string { return a.inner.Name() }
@@ -507,10 +517,25 @@ func (a *observedAgent) Run(ctx context.Context, opts agent.RunOpts) (*agent.Res
 			previousLifecycle(event)
 		}
 	}
+	// The adapter retries below this seam and hands back only its last
+	// attempt, so count each attempt as the recorder does. Without this a turn
+	// that burned four attempts would be charged for one and read as cheaper.
+	attempts := 0
+	previousAttempt := opts.OnAttempt
+	opts.OnAttempt = func(attempt agent.Attempt) {
+		if previousAttempt != nil {
+			previousAttempt(attempt)
+		}
+		attempts++
+		a.observeUsage(attempt.Result)
+	}
 	started := time.Now()
 	result, err := a.inner.Run(ctx, opts)
 	a.durationMS += time.Since(started).Milliseconds()
 	a.result = result
+	if attempts == 0 {
+		a.observeUsage(result)
+	}
 	a.mu.Lock()
 	ownershipErr := a.ownershipErr
 	a.mu.Unlock()
@@ -518,6 +543,17 @@ func (a *observedAgent) Run(ctx context.Context, opts agent.RunOpts) (*agent.Res
 		return result, ownershipErr
 	}
 	return result, err
+}
+
+func (a *observedAgent) observeUsage(result *agent.Result) {
+	if result == nil || !result.UsageReported {
+		a.usageMissing = true
+		return
+	}
+	a.usage.InputTokens += result.Usage.InputTokens
+	a.usage.OutputTokens += result.Usage.OutputTokens
+	a.usage.CacheReadTokens += result.Usage.CacheReadTokens
+	a.freshInputTokens += agent.FreshInputTokens(result.Usage.InputTokens, result.Usage.CacheReadTokens)
 }
 
 func findingCount(raw string) int {

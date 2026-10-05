@@ -77,6 +77,7 @@ Step status icons:
 | `✗` | Failed |
 
 Completed steps show their duration.
+Configured repository gates appear immediately after their anchor under names such as `gate.test.mutation-budget`.
 When no lint command is configured, the Document row is labeled `Document + Lint housekeeping`; its duration is the shared documentation-and-lint agent invocation, while Lint shows only its cached-result handoff duration.
 Steps with fixed findings, and steps currently fixing reported findings, show a right-aligned count such as `2/3 fixed` or `0/3 fixed`.
 The first number counts completed fixes, not findings selected for an in-progress fix.
@@ -217,6 +218,7 @@ Press `y` to toggle yolo mode when you want paused approval gates to resolve aut
 Yolo fixes gates with `auto-fix` and `ask-user` findings by selecting every finding, then approves the resulting fix-review gate.
 It approves gates with no findings or only `action: no-op` findings as-is, and fixes each step at most once so unresolved findings do not loop forever.
 The [`protected_paths` refusal rules](/no-mistakes/reference/repo-config/#protected_paths) are an exception to this automatic handling.
+So is a Test budget-cut gate that reports `test-agent-unvalidated-work`: approval is refused there, so yolo stops at it and leaves the choice between fix and abort to you (see [`test_agent_timeout`](/no-mistakes/reference/global-config/#test_agent_timeout)).
 
 ## Outcome banner
 

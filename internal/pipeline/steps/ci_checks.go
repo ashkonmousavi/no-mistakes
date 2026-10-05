@@ -3,8 +3,6 @@ package steps
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
@@ -13,10 +11,8 @@ import (
 )
 
 type lastFixedIssues struct {
-	Checks                []scm.CheckTarget `json:"checks,omitempty"`
-	MergeConflict         bool              `json:"mergeConflict,omitempty"`
-	ConflictRepairBaseSHA string            `json:"conflictRepairBaseSHA,omitempty"`
-	ConflictRepairHeadSHA string            `json:"conflictRepairHeadSHA,omitempty"`
+	Checks        []scm.CheckTarget `json:"checks,omitempty"`
+	MergeConflict bool              `json:"mergeConflict,omitempty"`
 }
 
 // pollInterval returns the polling interval based on elapsed time since CI monitoring started.
@@ -46,6 +42,28 @@ func hasFailingChecks(checks []scm.Check) bool {
 func hasPendingChecks(checks []scm.Check) bool {
 	for _, c := range checks {
 		if c.Pending() {
+			return true
+		}
+	}
+	return false
+}
+
+// hasExecutingPendingChecks returns true if any CI check is still running or
+// queued on its own. A check the provider holds for maintainer approval is
+// pending but will not finish without a human, so it never defers escalation
+// of the other checks' failures.
+func hasExecutingPendingChecks(checks []scm.Check) bool {
+	for _, c := range checks {
+		if c.Pending() && !c.AwaitingApproval {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAwaitingApprovalChecks(checks []scm.Check) bool {
+	for _, c := range checks {
+		if c.AwaitingApproval && c.Pending() {
 			return true
 		}
 	}
@@ -83,33 +101,6 @@ func failingCheckNames(checks []scm.Check) []string {
 			names = append(names, c.Name)
 		}
 	}
-	return names
-}
-
-// failingCheckNamesExcluding hides only the exact provider observations whose
-// accepted rerun has not appeared in the rollup yet. Identity includes the
-// link, so a same-named genuine sibling remains a failure.
-func failingCheckNamesExcluding(checks []scm.Check, excluded map[string]bool) []string {
-	var names []string
-	for _, check := range checks {
-		if check.Failing() && !excluded[checkIdentity(check)] {
-			names = append(names, check.Name)
-		}
-	}
-	return names
-}
-
-func infrastructureFailureNames(keys map[string]bool) []string {
-	names := make([]string, 0, len(keys))
-	seen := map[string]bool{}
-	for key := range keys {
-		name, _, _ := strings.Cut(key, "\x00")
-		if name != "" && !seen[name] {
-			seen[name] = true
-			names = append(names, name)
-		}
-	}
-	sort.Strings(names)
 	return names
 }
 
@@ -231,16 +222,11 @@ func pendingCheckMatchesLastFixed(checks []scm.Check, lastFixedChecks string) bo
 	return false
 }
 
-func encodeLastFixedChecks(checks []scm.CheckTarget, mergeConflict bool, conflictRepairBaseSHA, conflictRepairHeadSHA string) string {
+func encodeLastFixedChecks(checks []scm.CheckTarget, mergeConflict bool) string {
 	if len(checks) == 0 && !mergeConflict {
 		return ""
 	}
-	encoded, err := json.Marshal(lastFixedIssues{
-		Checks:                checks,
-		MergeConflict:         mergeConflict,
-		ConflictRepairBaseSHA: conflictRepairBaseSHA,
-		ConflictRepairHeadSHA: conflictRepairHeadSHA,
-	})
+	encoded, err := json.Marshal(lastFixedIssues{Checks: checks, MergeConflict: mergeConflict})
 	if err != nil {
 		return ""
 	}
@@ -261,11 +247,6 @@ func decodeLastFixedChecks(raw string) (lastFixedIssues, bool) {
 	return issues, true
 }
 
-func (s *CIStep) needsConflictRepairBase(currentHeadSHA string) bool {
-	issues, ok := decodeLastFixedChecks(s.lastFixedChecks)
-	return ok && issues.MergeConflict && issues.ConflictRepairBaseSHA != "" && issues.ConflictRepairHeadSHA == currentHeadSHA
-}
-
 // lastRepairStillUnverified reports whether every issue the last published
 // repair targeted is still terminally failed, meaning the provider has not
 // yet re-run those checks against the repaired head. The two clears that
@@ -275,28 +256,13 @@ func (s *CIStep) needsConflictRepairBase(currentHeadSHA string) bool {
 // one whose targets are all still red as they were. A target that cleared, or
 // a conflict that resolved, is the provider acting on the repair and makes
 // the observation fresh.
-func (s *CIStep) lastRepairStillUnverified(checks []scm.Check, mergeConflict bool, currentBaseSHA, currentHeadSHA string) bool {
+func (s *CIStep) lastRepairStillUnverified(checks []scm.Check, mergeConflict bool) bool {
 	issues, ok := decodeLastFixedChecks(s.lastFixedChecks)
 	if !ok {
 		return false
 	}
 	if issues.MergeConflict && !mergeConflict {
 		return false
-	}
-	if mergeConflict && !issues.MergeConflict {
-		return false
-	}
-	if issues.MergeConflict {
-		// A conflict-only repair has no check target whose freshness can prove
-		// that the provider observed the repaired branch. Keep suppression scoped
-		// to its verified rebase tip and resulting repair head. An unresolved base
-		// deliberately cannot invent a new repair target.
-		if issues.ConflictRepairHeadSHA != "" && currentHeadSHA != issues.ConflictRepairHeadSHA {
-			return false
-		}
-		if issues.ConflictRepairBaseSHA != "" && currentBaseSHA != "" && currentBaseSHA != issues.ConflictRepairBaseSHA {
-			return false
-		}
 	}
 	for _, target := range issues.Checks {
 		if !checkTargetFailedTerminally(checks, target) {
@@ -419,14 +385,15 @@ func ciCheckReadFailureOutcome(err error) *pipeline.StepOutcome {
 // its worktree alive rather than tearing them down, and leaves any further
 // attempt to the operator, who can respond with a fix selection to spend
 // another budget deliberately.
-func ciFixAgentTimeoutOutcome(issueDesc string, dirtyWorktree string, err error) *pipeline.StepOutcome {
+func ciFixAgentTimeoutOutcome(issueDesc string, leftover string, err error) *pipeline.StepOutcome {
 	description := fmt.Sprintf(
 		"The CI auto-fix agent did not finish within its invocation budget while repairing: %s. "+
-			"Reported: %v. Re-running the same request costs another full budget, so no further attempt is made automatically. "+
+			"Reported: %v. The cut itself reflects budget or provider slowness; it does not clear the findings listed with it. "+
+			"Re-running the same request costs another full budget, so no further attempt is made automatically. "+
 			"Check that the configured agent CLI is authenticated and responsive, then respond with a fix selection to spend another budget, or resolve the CI failure outside the pipeline.",
 		issueDesc, err)
-	if dirtyWorktree != "" {
-		description += fmt.Sprintf(" The timed-out agent left uncommitted changes in the run worktree at %s; they are not committed or pushed.", dirtyWorktree)
+	if leftover != "" {
+		description += " " + leftover
 	}
 	findings := Findings{
 		Summary: "CI auto-fix agent exceeded its invocation budget",

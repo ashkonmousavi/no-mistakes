@@ -10,6 +10,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/branchsync"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/testgit"
 )
 
 func TestCIStep_CommitAndPush_CommitsLocallyWithoutPushing(t *testing.T) {
@@ -162,6 +163,61 @@ func TestCIStep_CommitAndPush_NoChanges(t *testing.T) {
 	}
 }
 
+func TestCIStep_CommitAndPush_StaleDirtyStatusWithEmptyIndexIsNoOp(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	realGit, err := testgit.RealGit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := fakeCLIBinDir(t)
+	linkTestBinary(t, binDir, "git")
+
+	sctx := newTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = fakeCLIEnv(binDir, map[string]string{
+		"FAKE_CLI_MODE":     "git-stale-dirty-status",
+		"FAKE_CLI_REAL_GIT": realGit,
+	})
+	repair, err := (&CIStep{}).commitAndPush(sctx)
+	if err != nil {
+		t.Fatalf("empty-index CI handoff must be a successful no-op: %v", err)
+	}
+	if repair.HeadAdvanced {
+		t.Fatal("empty-index CI handoff unexpectedly advanced the run head")
+	}
+	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got != headSHA {
+		t.Fatalf("empty-index CI handoff moved HEAD to %s, want %s", got, headSHA)
+	}
+	t.Logf("CI handoff result: error=%v; head_advanced=%t; HEAD before=%s after=%s; staged paths=%q", err, repair.HeadAdvanced, headSHA, gitCmd(t, dir, "rev-parse", "HEAD"), gitCmd(t, dir, "diff", "--cached", "--name-only"))
+}
+
+func TestCIStep_CommitAndPush_RealCommitFailureStillFails(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	realGit, err := testgit.RealGit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := fakeCLIBinDir(t)
+	linkTestBinary(t, binDir, "git")
+	if err := os.WriteFile(filepath.Join(dir, "ci-fix.txt"), []byte("fixed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sctx := newTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = fakeCLIEnv(binDir, map[string]string{
+		"FAKE_CLI_MODE":     "git-commit-error",
+		"FAKE_CLI_REAL_GIT": realGit,
+	})
+	_, err = (&CIStep{}).commitAndPush(sctx)
+	if err == nil || !strings.Contains(err.Error(), "commit:") || !strings.Contains(err.Error(), "intentional commit failure") {
+		t.Fatalf("commit failure = %v, want the real git commit error", err)
+	}
+	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got != headSHA {
+		t.Fatalf("failed CI commit moved HEAD to %s, want %s", got, headSHA)
+	}
+}
+
 func TestCIStep_InvalidCommitTemplateDoesNotStageChanges(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
@@ -179,11 +235,38 @@ func TestCIStep_InvalidCommitTemplateDoesNotStageChanges(t *testing.T) {
 	}
 }
 
+func TestCIStep_CommitRepairUsesBranchIdentifier(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Run.Branch = "refs/heads/PROJ/123"
+	sctx.Config.CI.RevalidateRepairs = true
+	sctx.Config.Commit = config.Commit{
+		FixMessage:        "{{.Branch}}: {{.Summary}}",
+		BranchPattern:     `^PROJ/([0-9]+)$`,
+		BranchReplacement: "PROJ-${1}",
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "ci-fix.txt"), []byte("fixed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repair, err := (&CIStep{}).commitRepair(sctx, "repair failing checks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !repair.HeadAdvanced {
+		t.Fatal("CI repair did not advance HEAD")
+	}
+	if got, want := lastCommitMessage(t, dir), "PROJ-123: repair failing checks"; got != want {
+		t.Fatalf("CI repair commit subject = %q, want %q", got, want)
+	}
+}
+
 func TestCIStep_CommitAndPush_StatusError(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 
-	realGit, err := exec.LookPath("git")
+	realGit, err := testgit.RealGit()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +324,7 @@ func TestCIStep_CommitAndPush_UsesStepEnvForAllGitCommands(t *testing.T) {
 	gitCmd(t, dir, "push", "origin", "feature")
 	os.WriteFile(filepath.Join(dir, "fix.txt"), []byte("ci fix"), 0o644)
 
-	realGit, err := exec.LookPath("git")
+	realGit, err := testgit.RealGit()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +420,7 @@ func TestCIStep_CommitAndPush_GitCommandsUseStandardCredentialEnv(t *testing.T) 
 	}
 	t.Setenv("HOME", home)
 
-	realGit, err := exec.LookPath("git")
+	realGit, err := testgit.RealGit()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -446,7 +529,7 @@ func TestCIStep_CommitAndPush_NoChanges_ReconcilesStaleDatabaseHeadSHA_UsesStepE
 	actualHeadSHA := gitCmd(t, dir, "rev-parse", "HEAD")
 	gitCmd(t, dir, "push", "origin", "feature")
 
-	realGit, err := exec.LookPath("git")
+	realGit, err := testgit.RealGit()
 	if err != nil {
 		t.Fatal(err)
 	}

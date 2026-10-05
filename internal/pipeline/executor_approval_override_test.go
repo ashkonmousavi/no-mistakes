@@ -129,8 +129,8 @@ func TestExecutor_ApprovalOverride_VerificationErrorFailsClosed(t *testing.T) {
 }
 
 // TestExecutor_ApprovalOverride_OrdinaryStepUnaffected pins that a step which
-// does not implement ApprovalOverrideVerifier (every step but CI today, e.g.
-// review/test/document) behaves exactly as before ActionApprove is answered:
+// does not implement ApprovalOverrideVerifier (today: every step but CI and
+// Test, e.g. review/document) behaves exactly as before ActionApprove is answered:
 // no override column is ever touched, and the plain completion path used for
 // every existing approval test is unchanged.
 func TestExecutor_ApprovalOverride_OrdinaryStepUnaffected(t *testing.T) {
@@ -176,8 +176,12 @@ func TestExecutor_ApprovalOverride_RecoveredPathStillFailing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	step := newOverrideVerifyingApprovalStep(types.StepCI, findings, func(*StepContext) (string, error) {
-		return "live checks for https://example/pr/1 still failing: required-check", nil
+	wantReason := "live checks for https://example/pr/1 still failing: required-check"
+	step := newOverrideVerifyingApprovalStep(types.StepCI, findings, func(sctx *StepContext) (string, error) {
+		if sctx.StepResultID != stepResult.ID {
+			return "wrong recovered step result: " + sctx.StepResultID, nil
+		}
+		return wantReason, nil
 	})
 	exec := NewExecutor(database, p, nil, nil, []Step{step}, nil)
 
@@ -226,8 +230,11 @@ func TestExecutor_ApprovalOverride_RecoveredPathStillFailing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reread.OverrideReason == nil || *reread.OverrideReason == "" {
+	if reread.OverrideReason == nil {
 		t.Fatal("recovered-path OverrideReason = nil, want the still-unresolved reason recorded and durable")
+	}
+	if *reread.OverrideReason != wantReason {
+		t.Fatalf("recovered-path OverrideReason = %q, want %q", *reread.OverrideReason, wantReason)
 	}
 }
 
@@ -237,6 +244,33 @@ func TestExecutor_ApprovalOverride_RecoveredPathStillFailing(t *testing.T) {
 // carry the reason so an attached TUI can show the passed-with-override banner
 // without a snapshot read. Before the fix emitRunEvent dropped the reason and
 // the banner read as a plain green pass on the event path.
+func TestExecutor_CIOverrideReasonIgnoresTestOverride(t *testing.T) {
+	database, _, run, _ := setupTest(t)
+	testStep, err := database.InsertStepResult(run.ID, types.StepTest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetStepOverrideReason(testStep.ID, "configured test command failed"); err != nil {
+		t.Fatal(err)
+	}
+	ciStep, err := database.InsertStepResult(run.ID, types.StepCI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "live checks still failing: required-check"
+	if err := database.SetStepOverrideReason(ciStep.ID, want); err != nil {
+		t.Fatal(err)
+	}
+
+	steps, err := database.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := completionOverrideReasons(steps); got != want {
+		t.Fatalf("completionOverrideReasons() CI = %q, want %q", got, want)
+	}
+}
+
 func TestExecutor_ApprovalOverride_RunCompletedEventCarriesReason(t *testing.T) {
 	database, p, run, repo := setupTest(t)
 

@@ -9,6 +9,9 @@ import "os/exec"
 // exec.CommandContext default of terminating the direct child only.
 func ConfigureShellCommand(cmd *exec.Cmd) {}
 
+// ConfigureCooperativeShellCommand is likewise a no-op on these platforms.
+func ConfigureCooperativeShellCommand(cmd *exec.Cmd) {}
+
 // StartShellCommand starts cmd on platforms without extra process-tree setup.
 // It exists so call sites can use the same lifecycle helpers on every platform.
 func StartShellCommand(cmd *exec.Cmd) error {
@@ -19,3 +22,7 @@ func StartShellCommand(cmd *exec.Cmd) error {
 // primitive, mirroring ConfigureShellCommand. The reap-the-group-on-exit
 // guarantee is best-effort and platform-gated.
 func TerminateShellCommandGroup(cmd *exec.Cmd) {}
+
+// detachFromTerminal is a no-op where there is no POSIX session or controlling
+// terminal for an interactive shell to contend for.
+func detachFromTerminal(cmd *exec.Cmd) {}

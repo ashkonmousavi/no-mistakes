@@ -13,7 +13,7 @@ flowchart TD
   eligible -- "no" --> pause["Pause for user approval"]
   eligible -- "yes" --> fix["Agent applies fixes"]
   fix --> rerun["Re-run step"]
-  rerun --> clean{"Blocking findings remain?"}
+  rerun --> clean{"Blocking or outstanding findings remain?"}
   clean -- "no" --> done
   clean -- "yes, attempts left" --> eligible
   clean -- "yes, limit hit" --> pause
@@ -28,11 +28,14 @@ flowchart TD
 5. If issues remain and attempts are left, the loop continues
 6. Once the limit is reached or all issues are resolved:
    - If issues remain, the step pauses for user approval
-   - If everything passes, the step completes and the pipeline moves on
+   - If no step-specific outstanding condition remains, the step completes and the pipeline moves on
 
-The document step does not follow this loop. Its analysis turn is read-only, and correcting an accepted finding is a separate bounded turn gated on `auto_fix.document`; the [Document step](/no-mistakes/reference/pipeline-steps/#document) owns that model, the finding classes that decide what gates, and the combined documentation-and-lint housekeeping pass.
+Review has an additional step-specific outstanding condition during carry-forward verification; missing coverage or silence can keep its gate parked even when no blocking-severity finding is reported. A clean review that omits its coverage record parks for approval the same way rather than certifying the head. See the [Review step reference](/no-mistakes/reference/pipeline-steps/#review) for the authoritative carry-forward contract.
+
+The document step applies fixes during its initial pass instead of relying on a follow-up automatic fix loop.
+When `commands.lint` is empty, that same invocation is a combined documentation-and-lint housekeeping pass: it updates documentation, detects relevant linters and formatters, applies safe fixes, verifies both duties, and categorizes any unresolved findings for the document or lint gate.
 The lint step consumes a usable lint result from that pass instead of starting a second cold agent invocation; when the combined pass is skipped, cannot produce trustworthy structured output, or loses its in-memory result across a daemon restart, lint falls back to its own agent pass.
-Unresolved blocking lint findings pause for approval instead of entering another automatic fix loop.
+Unresolved documentation findings and unresolved blocking lint findings pause for approval instead of entering another automatic fix loop.
 
 ## Before the agent: deterministic CI reruns
 
@@ -45,7 +48,7 @@ That deterministic rerun sits strictly before the agent rounds described above:
 1. Every check finishes and at least one has failed.
 2. If all of those failures are provider-attributed checks, the pull request has no merge conflict, and the configured budget authorizes it, each one is re-run and the monitor keeps polling. No `auto_fix.ci` attempt is consumed.
 3. When such a detected provider-attributed outcome is the only remaining issue, a check with no authorized or outstanding rerun pauses for a decision without consuming an `auto_fix.ci` attempt.
-4. Every other failure becomes an `auto-fix` finding on its first observation and enters the `auto_fix.ci` loop through the same executor loop described above. A red check from a supported review bot (currently Greptile) becomes `ask-user` findings instead: available unresolved comments become individual findings, or the red check itself remains as one decision finding when no comment can be attached. The bot's opinion therefore parks for a decision rather than spending a fix round.
+4. Every other failure becomes an `auto-fix` finding on its first observation and enters the `auto_fix.ci` loop through the same executor loop described above. A red check from a supported review bot (currently Greptile) becomes `ask-user` findings instead, one per unresolved review comment, so the bot's opinion parks for a decision rather than spending a fix round.
 
 [`ci.rerun_transient`](/no-mistakes/reference/repo-config/#cirerun_transient) owns the budget, the exact classification, and every case that skips the rerun.
 
@@ -72,8 +75,11 @@ An unclassified finding is never eligible for automatic fixing.
 Classification also follows the remedy, not only the topic: when the smallest honest remedy would add new durable state, a schema change, new background, retry, or persistence machinery, a new subsystem, or otherwise extend the change beyond its stated intent rather than correct what it already does, the review agent classifies the finding `ask-user` and says in the description that the remedy, not the defect, is what needs authorization. The review step's dedicated Simplification pass uses the same action for a component the stated intent does not strictly require: it is reported as an `ask-user` warning whose recommended remedy is removal. The [pipeline-step reference](/no-mistakes/reference/pipeline-steps/) owns which repair agents apply the shared removal-first rule. Agents driving the AXI skill should relay `ask-user` findings to the user unless they have explicit `--yes` consent to resolve gates unattended.
 See [AXI `--yes`](/no-mistakes/reference/cli/#no-mistakes-axi-run) and [TUI yolo mode](/no-mistakes/guides/tui/#action-bar) for automatic gate handling and its exceptions.
 
-The `review`, `test`, `ci`, and configured-command `lint` steps use this shared model directly. The CI step derives its findings from the pull request's settled checks rather than from an agent, as the [pipeline-step reference](/no-mistakes/reference/pipeline-steps/#ci) describes. The `document` step also uses the same `action` field, but adds a required class that decides whether a finding gates at all; the [Document step](/no-mistakes/reference/pipeline-steps/#document) owns those rules.
-When `commands.lint` is empty, the combined housekeeping pass routes documentation and lint findings to their owning gates. Its lint half is a read-only assessment, so blocking lint findings pause for approval instead of remaining eligible for another automatic fix loop.
+The `review`, `test`, `ci`, and configured-command `lint` steps use this shared model directly; the CI step derives its findings from the pull request's settled checks rather than from an agent, as the [pipeline-step reference](/no-mistakes/reference/pipeline-steps/#ci) describes. The `document` step also uses the same `action` field, but unresolved documentation findings pause for approval because the initial document pass already attempted the documentation updates it could make safely.
+A failed repository gate returns an `ask-user` finding through the same decision model but has no automatic fix budget. The [`gates` reference](/no-mistakes/reference/repo-config/#gates) owns its operator-authorized repair behavior.
+When `commands.lint` is empty, the combined housekeeping pass routes documentation and lint findings to their owning gates. Its unresolved lint findings describe issues left after safe fixes, so blocking findings pause for approval instead of remaining eligible for another automatic fix loop.
+
+Documentation findings use the same approval UI, but the `document` step treats any finding as an unresolved documentation gap or judgment call that should pause for approval.
 
 ## User-triggered fixes
 
@@ -87,14 +93,14 @@ When the pipeline pauses for approval, you can manually trigger a fix from the T
 The agent receives the merged fix payload for that round: the selected agent findings, any per-finding user notes, any selected user-authored findings added from the TUI or AXI interface, and the shared [finding decision history](/no-mistakes/reference/pipeline-steps/#finding-decision-history).
 The current step's part of that history also includes one-line summaries from earlier fix commits.
 
-After a user-triggered fix, the step re-runs and pauses again to show you the results (`fix_review` status). You can then approve, fix again, skip, or abort, subject to the [`protected_paths` refusal rules](/no-mistakes/reference/repo-config/#protected_paths).
+After a user-triggered fix, the step re-runs. It completes if the check passes and no step-specific outstanding condition remains, or pauses again with the new results in `fix_review` status. For Review, see the [Review step reference](/no-mistakes/reference/pipeline-steps/#review) for its carry-forward condition; an operator can also explicitly approve, fix again, skip, or abort, subject to the [`protected_paths` refusal rules](/no-mistakes/reference/repo-config/#protected_paths).
 
 ## Fix commits
 
-When the Review, Test, Document, Lint, or CI step commits auto-fix changes, its subject comes from `commit.fix_message`.
+When the Review, Test, Document, Lint, CI, or a repository gate repair commits agent changes, its subject comes from `commit.fix_message`.
 The [global config reference](/no-mistakes/reference/global-config/#commitfix_message) owns the template syntax, default, validation rules, size limits, and supported placeholders; the [repo config reference](/no-mistakes/reference/repo-config/#commitfix_message) owns the repository override and trust behavior.
 The pipeline validates the template, agent summary, predicted output size, and final rendered subject before `git add -A`, so a rejected value does not leave changes staged.
-A bounded documentation correction is committed by the Document step, so it uses the Document value for `{{.Step}}`; configured-command lint fixes use the Lint value.
+The combined document-and-lint housekeeping pass runs in the Document step, so its documentation and safe lint fixes use the Document value for `{{.Step}}`; configured-command lint fixes use the Lint value.
 
 Before a step-specific fix commit, the pipeline verifies that the live worktree HEAD still descends from the head recorded after its previous commit.
 It allows a legitimate forward commit made by an agent, but aborts the run if an out-of-band backward or divergent reset would drop the reviewed history.
@@ -110,7 +116,7 @@ A round stores its findings, duration, any selected finding IDs and whether that
 That merged payload can include per-finding user notes and user-authored findings added from the TUI or AXI interface.
 AXI status uses the same round history and the persisted auto-fix limit to show the active fix attempt, for example `auto-fix 1/3` or `fix 2`.
 The step log records a marker when each automatic or user-triggered fix round starts.
-The generated PR surfaces this recorded evidence in deterministic Risk Assessment, Testing, and Pipeline sections. The [pipeline steps reference](/no-mistakes/reference/pipeline-steps/#pr) owns the PR body composition and size-limit contract.
+The generated PR can surface this recorded evidence; the [pipeline steps reference](/no-mistakes/reference/pipeline-steps/#pr) owns the PR body composition and size-limit contract.
 The full round history remains available in the run log.
 
 Round trigger types:
