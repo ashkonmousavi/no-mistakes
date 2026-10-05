@@ -61,9 +61,14 @@ type StepContext struct {
 	DeferredFindings string // JSON findings left unselected when the current fix round began
 	// StepResultID is the DB row ID of the current step's step_results record.
 	// Steps use it to query their own round history for multi-round prompts.
-	StepResultID   string
-	FixSelectionID string
-	CurrentFixUnit *db.FixCheckpoint
+	StepResultID            string
+	FixSelectionID          string
+	CurrentFixUnit          *db.FixCheckpoint
+	FixSelectionFindings    string
+	FixAppliedOrdinals      map[int]bool
+	CompletedFixSelectionID string
+	FixStartingHead         string
+	CIFixSnapshotJSON       string
 	// EvidenceDir is where this run's test-evidence artifacts belong, always
 	// outside the worktree. The executor resolves it once from the app root
 	// (honoring test.evidence.local_root) so every consumer - the test step's

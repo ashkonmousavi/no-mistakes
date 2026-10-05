@@ -10,22 +10,24 @@ import (
 
 // FixCheckpoint binds one selected cause to its exact local head and anchor.
 type FixCheckpoint struct {
-	ID            string
-	RunID         string
-	Step          string
-	StepResultID  string
-	Selection     string
-	Ordinal       int
-	Total         int
-	FindingID     string
-	FindingDigest string
-	SelectionJSON string
-	ParentHead    string
-	AppliedHead   string
-	Ref           string
-	Summary       string
-	NewTests      []string
-	State         string
+	ID                  string
+	RunID               string
+	Step                string
+	StepResultID        string
+	Selection           string
+	Ordinal             int
+	Total               int
+	FindingID           string
+	FindingDigest       string
+	SelectionJSON       string
+	ParentHead          string
+	AppliedHead         string
+	Ref                 string
+	Summary             string
+	NewTests            []string
+	State               string
+	ValidationCompleted bool
+	CISnapshotJSON      string
 }
 
 func (d *DB) BeginFixCheckpoint(c *FixCheckpoint) error {
@@ -151,6 +153,9 @@ func (d *DB) FixProgress(runID string) (*types.FixProgress, error) {
 			p.Current = c.FindingID
 		}
 	}
+	if len(units) > 0 && units[len(units)-1].ValidationCompleted {
+		p.ValidationPending = false
+	}
 	if p.Applied == p.Total && len(units) > 0 && units[0].StepResultID != "" {
 		step, err := d.GetStepResult(units[0].StepResultID)
 		if err != nil {
@@ -167,4 +172,44 @@ func (d *DB) UnfinishedFixBatch(runID string) (bool, error) {
 	var n int
 	e := d.sql.QueryRow(`SELECT COUNT(*) FROM (SELECT selection_id,step, MAX(json_extract(payload,'$.Total')) AS total, SUM(CASE WHEN json_extract(payload,'$.State')='applied' THEN 1 ELSE 0 END) AS applied FROM fix_checkpoints WHERE run_id=? GROUP BY selection_id,step) WHERE applied<total`, runID).Scan(&n)
 	return n > 0, e
+}
+
+// FinishFixValidation records a finished validation attempt, never approval.
+func (d *DB) FinishFixValidation(runID, step, selection, head string) error {
+	if selection == "" {
+		return nil
+	}
+	units, err := d.GetFixCheckpoints(runID, step, selection)
+	if err != nil {
+		return err
+	}
+	if len(units) == 0 {
+		return fmt.Errorf("missing repair selection")
+	}
+	last := units[len(units)-1]
+	if len(units) != last.Total || last.AppliedHead != head {
+		return fmt.Errorf("unfinished repair selection cannot finish validation")
+	}
+	for _, c := range units {
+		if c.State != "applied" {
+			return fmt.Errorf("unfinished repair unit %s", c.FindingID)
+		}
+	}
+	last.ValidationCompleted = true
+	raw, err := json.Marshal(last)
+	if err != nil {
+		return err
+	}
+	res, err := d.sql.Exec(`UPDATE fix_checkpoints SET payload=? WHERE id=? AND EXISTS(SELECT 1 FROM runs WHERE id=? AND head_sha=?)`, string(raw), last.ID, runID, head)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("validation head changed")
+	}
+	return nil
 }

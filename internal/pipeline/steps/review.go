@@ -532,6 +532,9 @@ Risk assessment (after listing all findings):
 			needsApproval = true
 		}
 	}
+	if err := sctx.FinishFixValidation(s.Name()); err != nil {
+		return nil, err
+	}
 	findingsJSON, _ := json.Marshal(findings)
 
 	return approvedReviewOutcome(reviewTargetSHA, &pipeline.StepOutcome{

@@ -35,7 +35,11 @@ func (sctx *StepContext) BeginFixUnit(step types.StepName, finding types.Finding
 	if err != nil {
 		return err
 	}
-	c := &db.FixCheckpoint{RunID: sctx.Run.ID, Step: string(step), StepResultID: sctx.StepResultID, Selection: selection, Ordinal: ordinal, Total: total, FindingID: finding.ID, FindingDigest: fmt.Sprintf("%x", sha256.Sum256(raw)), ParentHead: sctx.Run.HeadSHA, SelectionJSON: sctx.PreviousFindings}
+	selectionJSON := sctx.FixSelectionFindings
+	if selectionJSON == "" {
+		selectionJSON = sctx.PreviousFindings
+	}
+	c := &db.FixCheckpoint{RunID: sctx.Run.ID, Step: string(step), StepResultID: sctx.StepResultID, Selection: selection, Ordinal: ordinal, Total: total, FindingID: finding.ID, FindingDigest: fmt.Sprintf("%x", sha256.Sum256(raw)), ParentHead: sctx.Run.HeadSHA, SelectionJSON: selectionJSON, CISnapshotJSON: sctx.CIFixSnapshotJSON}
 	if err = sctx.DB.BeginFixCheckpoint(c); err != nil {
 		return err
 	}

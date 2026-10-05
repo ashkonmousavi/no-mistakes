@@ -66,11 +66,29 @@ func (s *TestStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 	// detectNewTestFiles reads uncommitted status, so the evidence turn that
 	// follows can no longer see a test file the fixer already committed.
 	var newTestsFromFix []string
+	if sctx.Fixing {
+		var repair types.Findings
+		var err error
+		if raw := testRepairFindings(sctx.PreviousFindings); raw != "" {
+			repair, err = types.ParseFindingsJSON(raw)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if _, err = sctx.PrepareFixContinuation(s.Name(), repair); err != nil {
+			return nil, err
+		}
+		newTestsFromFix, err = sctx.SavedFixTests(s.Name())
+		if err != nil {
+			return nil, err
+		}
+	}
 	var fixSummary string
 	var repairCut error
 	if sctx.Fixing && onlyTestBudgetCutFindings(sctx.PreviousFindings) {
 		sctx.Log("fix selection holds only the Test agent budget cut; re-running validation without a repair turn...")
 		fixSummary = NoChangesAppliedSummary
+		sctx.CompletedFixSelectionID = sctx.FixSelectionID
 	} else if sctx.Fixing {
 		historySection := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx) + planSection + testguidance.Rule
 		fixPrompt := fmt.Sprintf(
@@ -346,6 +364,9 @@ Rules:
 		})
 	}
 
+	if err := sctx.FinishFixValidation(s.Name()); err != nil {
+		return nil, err
+	}
 	findingsJSON, _ := json.Marshal(findings)
 	return &pipeline.StepOutcome{
 		NeedsApproval: needsApproval,
