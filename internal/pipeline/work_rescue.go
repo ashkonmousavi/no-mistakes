@@ -16,9 +16,34 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
+var ErrWorkRetained = errors.New("partial work requires retention")
+
+func (sctx *StepContext) CheckWorkRescue() error {
+	if sctx == nil || sctx.DB == nil || sctx.Run == nil || sctx.WorkDir == "" {
+		return nil
+	}
+	p, err := sctx.DB.LatestWorkRescue(sctx.Run.ID)
+	if err != nil {
+		return fmt.Errorf("%w: cannot read partial work: %v", ErrWorkRetained, err)
+	}
+	if p == nil {
+		return nil
+	}
+	if p.State == "saved" {
+		if err := custody.ValidatePartialWork(sctx.Ctx, sctx.WorkDir, p); err != nil {
+			return fmt.Errorf("%w: cannot verify partial work: %v", ErrWorkRetained, err)
+		}
+		return nil
+	}
+	return fmt.Errorf("%w at %s: %s (%s)", ErrWorkRetained, p.Path, p.State, p.Reason)
+}
+
 func (sctx *StepContext) beginAgentRescue(opts agent.RunOpts) (*types.PartialWork, error) {
 	if sctx == nil || sctx.DB == nil || sctx.Run == nil || sctx.WorkDir == "" {
 		return nil, nil
+	}
+	if err := sctx.CheckWorkRescue(); err != nil {
+		return nil, err
 	}
 	head, err := git.HeadSHA(sctx.Ctx, sctx.WorkDir)
 	if err != nil {
@@ -44,17 +69,17 @@ func (sctx *StepContext) finishAgentRescue(p *types.PartialWork, invocationErr e
 	if p == nil {
 		return nil
 	}
-	if invocationErr == nil {
-		p.State = "settled"
-		p.Reason = ""
-		return sctx.DB.SaveWorkRescue(p)
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if needed, err := custody.WorkNeedsRescue(ctx, sctx.WorkDir); err == nil && !needed {
-		p.State = "settled"
-		p.Reason = ""
-		return sctx.DB.SaveWorkRescue(p)
+	if invocationErr == nil {
+		unfinished, err := custody.GitOperationInProgress(ctx, sctx.WorkDir)
+		if err == nil && !unfinished {
+			p.State = "settled"
+			p.Reason = ""
+			p.Path = ""
+			return sctx.DB.SaveWorkRescue(p)
+		}
+		invocationErr = errors.Join(errors.New("agent left an unfinished Git operation"), err)
 	}
 	activity.mu.Lock()
 	quiescent := activity.launched && activity.exited
@@ -68,6 +93,21 @@ func PreserveRunWork(ctx context.Context, d *db.DB, run *db.Run, dir string, p *
 	if run == nil {
 		return fmt.Errorf("cannot preserve worktree %s without a run", dir)
 	}
+	sweepErr := procreap.Quiesce(ctx, procreap.Options{Worktrees: []procreap.Worktree{{Dir: dir, RepoID: run.RepoID, RunID: run.ID}}, Scopes: []string{dir}})
+	var inspectErr error
+	if sweepErr == nil && quiescent {
+		var needed bool
+		needed, inspectErr = custody.WorkNeedsRescue(ctx, dir)
+		if inspectErr == nil && !needed {
+			if p == nil {
+				return nil
+			}
+			p.State = "settled"
+			p.Reason = ""
+			p.Path = ""
+			return d.SaveWorkRescue(p)
+		}
+	}
 	if p == nil {
 		var e error
 		head, e := git.HeadSHA(ctx, dir)
@@ -79,13 +119,11 @@ func PreserveRunWork(ctx context.Context, d *db.DB, run *db.Run, dir string, p *
 			return e
 		}
 	}
-	// Scoped sweep uses the existing process owner, and verifies every victim
-	// has exited before any content can be called a stable snapshot.
-	sweepErr := procreap.Quiesce(ctx, procreap.Options{Worktrees: []procreap.Worktree{{Dir: dir, RepoID: run.RepoID, RunID: run.ID}}, Scopes: []string{dir}})
 	if sweepErr != nil {
 		quiescent = false
 	}
 	snapshot, e := custody.PreservePartialWork(ctx, dir, p.RunID, p.Step, p.StopID)
+	e = errors.Join(e, inspectErr)
 	if snapshot != nil {
 		p.Ref = snapshot.Ref
 		p.SHA = snapshot.SHA

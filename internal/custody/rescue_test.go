@@ -67,6 +67,36 @@ func TestFixProgressRescuePreservesIndexAndWorkingBytes(t *testing.T) {
 	}
 }
 
+func TestRescueCleanSuperprojectRetainsIgnoredGitlinkBytes(t *testing.T) {
+	dir, _ := recoveryTestRepo(t)
+	sub, _ := recoveryTestRepo(t)
+	if err := os.WriteFile(filepath.Join(sub, ".gitignore"), []byte("private\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, sub, "add", ".gitignore")
+	gitRun(t, sub, "commit", "-m", "ignore private bytes")
+	gitRun(t, dir, "-c", "protocol.file.allow=always", "submodule", "add", sub, "module")
+	gitRun(t, dir, "commit", "-m", "initialized submodule")
+	file := filepath.Join(dir, "module", "private")
+	if err := os.WriteFile(file, []byte("nested unfinished bytes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if status := gitOutput(t, dir, "status", "--porcelain", "--ignore-submodules=none"); status != "" {
+		t.Fatalf("not a clean superproject: %q", status)
+	}
+	needed, err := WorkNeedsRescue(context.Background(), dir)
+	if err != nil || !needed {
+		t.Fatalf("nested bytes deemed disposable: needed=%v err=%v", needed, err)
+	}
+	snapshot, err := PreservePartialWork(context.Background(), dir, "run-1", "review", "stop-1")
+	if err != nil || snapshot.State != "retained" || snapshot.Path != dir {
+		t.Fatalf("nested bytes not retained: %+v %v", snapshot, err)
+	}
+	if got, err := os.ReadFile(file); err != nil || string(got) != "nested unfinished bytes\n" {
+		t.Fatalf("nested bytes changed: %q %v", got, err)
+	}
+}
+
 func TestFixProgressRescueIgnoredWorkRetainsOriginal(t *testing.T) {
 	dir, _ := recoveryTestRepo(t)
 	for name, data := range map[string]string{".gitignore": "private\n", "private": "useful unfinished bytes\n"} {

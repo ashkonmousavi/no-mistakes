@@ -67,7 +67,7 @@ func (d *DB) LatestWorkRescue(runID string) (*types.PartialWork, error) {
 
 func (d *DB) latestWorkRescue(runID string, excludeActive bool) (*types.PartialWork, error) {
 	var raw string
-	e := d.sql.QueryRow(`SELECT payload FROM run_work_rescues WHERE run_id=? AND json_extract(payload,'$.state') NOT IN ('settled','consumed') AND (?=0 OR json_extract(payload,'$.state')!='active') ORDER BY stop_id DESC LIMIT 1`, runID, excludeActive).Scan(&raw)
+	e := d.sql.QueryRow(`SELECT payload FROM run_work_rescues WHERE run_id=? AND COALESCE(json_extract(payload,'$.state'),'') NOT IN ('settled','consumed') AND (?=0 OR COALESCE(json_extract(payload,'$.state'),'')!='active') ORDER BY CASE WHEN json_extract(payload,'$.state')='saved' THEN 1 ELSE 0 END, stop_id DESC LIMIT 1`, runID, excludeActive).Scan(&raw)
 	if errors.Is(e, sql.ErrNoRows) {
 		return nil, nil
 	}

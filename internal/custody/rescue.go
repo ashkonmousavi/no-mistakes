@@ -168,12 +168,10 @@ func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (
 	if len(ignored) > 0 {
 		p.Reason = "ignored files require original checkout"
 	}
-	for _, marker := range []string{"MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"} {
-		if _, e := os.Stat(filepath.Join(gitDir, marker)); e == nil {
-			p.Reason = "unfinished Git operation"
-		} else if !os.IsNotExist(e) {
-			return p, e
-		}
+	if unfinished, e := GitOperationInProgress(ctx, dir); e != nil {
+		return p, e
+	} else if unfinished {
+		p.Reason = "unfinished Git operation"
 	}
 	tree, err := run("write-tree")
 	if err != nil {

@@ -9,6 +9,9 @@ import (
 // Quiesce is the preservation-only form of Sweep. Unlike best-effort cleanup,
 // failure to read the table or confirm a signalled writer's exit is an error.
 func Quiesce(ctx context.Context, opts Options) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	victims, err := Sweep(opts)
 	if err != nil {
 		return err
@@ -18,6 +21,9 @@ func Quiesce(ctx context.Context, opts Options) error {
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		live := false
 		for _, v := range victims {
 			if processAliveFunc(v.PID) {

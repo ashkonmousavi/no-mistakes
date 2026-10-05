@@ -100,7 +100,7 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 	activity := observeAgentActivity(&opts)
 	rescue, err := sctx.beginAgentRescue(opts)
 	if err != nil {
-		return nil, fmt.Errorf("record editing invocation before launch: %w", err)
+		return nil, errors.Join(ErrWorkRetained, fmt.Errorf("record editing invocation before launch: %w", err))
 	}
 	result, runErr := invokeAgent(parent, timeout, working, cause, activity, func(ctx context.Context) (*agent.Result, error) {
 		if sessionRole != "" && sctx != nil && sctx.Sessions != nil {
@@ -112,7 +112,7 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 		return ag.Run(ctx, opts)
 	})
 	if err := sctx.finishAgentRescue(rescue, runErr, activity); err != nil {
-		return nil, errors.Join(runErr, err)
+		return nil, errors.Join(ErrWorkRetained, runErr, err)
 	}
 	return result, runErr
 }

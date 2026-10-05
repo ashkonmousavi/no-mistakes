@@ -35,18 +35,11 @@ func workRescueCleanupReason(d *db.DB, runID, dir string) string {
 			return fmt.Sprintf("partial work ref invalid; retained %s: %v", dir, err)
 		}
 	}
-	needed, err := custody.WorkNeedsRescue(ctx, dir)
-	if err != nil {
-		return fmt.Sprintf("cannot inspect unfinished work; retained %s: %v", dir, err)
-	}
-	if !needed {
-		return ""
-	}
 	run, err := d.GetRun(runID)
 	if err != nil || run == nil {
 		return fmt.Sprintf("cannot bind unfinished work to run %s; retained %s: %v", runID, dir, err)
 	}
-	if err := pipeline.PreserveRunWork(ctx, d, run, dir, p, "terminal cleanup", true); err != nil {
+	if err := pipeline.PreserveRunWork(ctx, d, run, dir, nil, "terminal cleanup", true); err != nil {
 		return err.Error()
 	}
 	return ""

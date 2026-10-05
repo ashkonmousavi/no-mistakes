@@ -205,11 +205,7 @@ func TestRebaseStep_MergeStrategyResolvesConflictAdditively(t *testing.T) {
 	}
 }
 
-// An agent that resolves the files but never concludes the merge leaves
-// MERGE_HEAD set and the index conflicted. Carrying that forward would publish
-// the reviewed head as if the integration had happened, so the step aborts the
-// merge and fails instead.
-func TestRebaseStep_MergeStrategyUnconcludedMergeIsAbortedAndFails(t *testing.T) {
+func TestRebaseStep_MergeStrategyUnconcludedMergeIsRetainedAndFails(t *testing.T) {
 	t.Parallel()
 	f := newMergeFixture(t, true)
 
@@ -228,14 +224,21 @@ func TestRebaseStep_MergeStrategyUnconcludedMergeIsAbortedAndFails(t *testing.T)
 
 	if _, err := (&RebaseStep{}).Execute(sctx); err == nil {
 		t.Fatal("expected an error for an unconcluded merge, got nil")
-	} else if !strings.Contains(err.Error(), "did not complete the merge") {
+	} else if !strings.Contains(err.Error(), "unfinished Git operation") {
 		t.Fatalf("error = %v, want it to name the unconcluded merge", err)
 	}
-	if mergeInProgress(context.Background(), f.dir) {
-		t.Fatal("merge left in progress; it should have been aborted")
+	if !mergeInProgress(context.Background(), f.dir) {
+		t.Fatal("incomplete merge state was discarded")
 	}
 	if head := gitCmd(t, f.dir, "rev-parse", "HEAD"); head != f.headSHA {
-		t.Fatalf("head = %s, want the reviewed head %s after the abort", head, f.headSHA)
+		t.Fatalf("head = %s, want the reviewed head %s", head, f.headSHA)
+	}
+	if got, err := os.ReadFile(filepath.Join(f.dir, "shared.txt")); err != nil || string(got) != "main line\nfeature line\n" {
+		t.Fatalf("partial resolution discarded: %q %v", got, err)
+	}
+	p, err := sctx.DB.LatestWorkRescue(sctx.Run.ID)
+	if err != nil || p == nil || p.State != "retained" || p.Path != f.dir {
+		t.Fatalf("retention unavailable: %+v %v", p, err)
 	}
 }
 
@@ -394,7 +397,7 @@ func TestRebaseStep_MergeStrategyAbortedMergeFails(t *testing.T) {
 // continuity falls back to a guess and publication rewrites the open PR's head.
 // The step must fail rather than log a merge that never happened.
 func TestRebaseStep_MergeStrategyRebasedInsteadOfMergedFails(t *testing.T) {
-	t.Parallel()
+	setRescueFixturePopulation(t)
 	f := newMergeFixture(t, true)
 
 	// The head the agent actually left is captured inside the turn, because the
@@ -474,7 +477,7 @@ func TestRebaseStep_MergeStrategyFollowUpCommitAfterTheMergeIsAccepted(t *testin
 // ancestry catches it. Without that check the run would carry on having never
 // integrated the moved base.
 func TestRebaseStep_MergeStrategyUnrelatedCommitInsteadOfMergeFails(t *testing.T) {
-	t.Parallel()
+	setRescueFixturePopulation(t)
 	f := newMergeFixture(t, true)
 
 	var unrelatedHead string
@@ -522,7 +525,7 @@ func TestRebaseStep_MergeStrategyUnrelatedCommitInsteadOfMergeFails(t *testing.T
 // ancestry check rejects it. It is also the shape that loses the most if the
 // invalid head is retained - the reviewed commits are not in it at all.
 func TestRebaseStep_MergeStrategyResetOntoTargetFails(t *testing.T) {
-	t.Parallel()
+	setRescueFixturePopulation(t)
 	f := newMergeFixture(t, true)
 
 	var resetHead string
@@ -563,14 +566,7 @@ func fixtureGitAllowFail(t *testing.T, dir string, args ...string) {
 	_ = runFixtureGit(dir, args...)
 }
 
-// Abandoning the merge and rebasing onto the same target hits the same
-// conflict, so the rebase stops with rebase state in place. Git sets no
-// MERGE_HEAD for that, so the unconcluded-merge guard passes, and a reset there
-// moves HEAD while the interrupted rebase survives underneath it - a restore
-// reported as successful on a worktree still mid-rebase. The step must abort
-// the rebase and report the un-integrated target with the worktree genuinely
-// restored.
-func TestRebaseStep_MergeStrategyConflictedRebaseLeftInProgressIsAbortedAndFails(t *testing.T) {
+func TestRebaseStep_MergeStrategyConflictedRebaseLeftInProgressIsRetainedAndFails(t *testing.T) {
 	t.Parallel()
 	f := newMergeFixture(t, true)
 
@@ -593,15 +589,28 @@ func TestRebaseStep_MergeStrategyConflictedRebaseLeftInProgressIsAbortedAndFails
 	if err == nil {
 		t.Fatal("expected an error when the agent left a conflicted rebase in progress, got nil")
 	}
-	if !strings.Contains(err.Error(), "did not merge") {
-		t.Fatalf("error = %v, want it to name the missing merge", err)
+	if !strings.Contains(err.Error(), "unfinished Git operation") {
+		t.Fatalf("error = %v, want it to name the incomplete operation", err)
 	}
 
-	if rebaseInProgress(context.Background(), f.dir) {
-		t.Fatal("rebase left in progress after the rejection")
+	if !rebaseInProgress(context.Background(), f.dir) {
+		t.Fatal("incomplete rebase state was discarded")
 	}
 	if ref := gitCmd(t, f.dir, "rev-parse", "refs/heads/feature"); ref != f.headSHA {
 		t.Fatalf("branch ref after the rejection = %s, want the reviewed head %s", ref, f.headSHA)
 	}
-	assertRestoredToReviewedHead(t, f.dir, f.headSHA)
+	p, err := sctx.DB.LatestWorkRescue(sctx.Run.ID)
+	if err != nil || p == nil || p.State != "retained" || p.Path != f.dir {
+		t.Fatalf("retention unavailable: %+v %v", p, err)
+	}
+}
+
+func setRescueFixturePopulation(t *testing.T) {
+	t.Helper()
+	bin := t.TempDir()
+	population := fmt.Sprintf("#!/bin/sh\nprintf '%d 1 %d 00:01 fixture\\n'\n", os.Getpid(), os.Getpid())
+	if err := os.WriteFile(filepath.Join(bin, "ps"), []byte(population), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 }

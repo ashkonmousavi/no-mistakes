@@ -179,7 +179,7 @@ func Sweep(opts Options) ([]Victim, error) {
 		return nil, nil
 	}
 
-	cwds := processCWDsFunc(candidates)
+	cwds, lookupErr := processCWDsFunc(candidates)
 	matchers := worktreeMatchers(opts)
 	var scopes []string
 	for _, scope := range opts.Scopes {
@@ -202,12 +202,12 @@ func Sweep(opts Options) ([]Victim, error) {
 		matched[pid] = dir
 	}
 	if len(matched) == 0 {
-		return nil, nil
+		return nil, lookupErr
 	}
 
 	victims := expandVictims(matched, procs, protected)
 	terminate(victims, opts.Grace)
-	return victims, nil
+	return victims, lookupErr
 }
 
 // SweepAndLog runs Sweep and reports the outcome on the daemon log. It is the

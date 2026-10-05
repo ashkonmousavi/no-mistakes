@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/git"
 )
@@ -34,6 +35,15 @@ func WorkNeedsRescue(ctx context.Context, dir string) (bool, error) {
 	} else if filters != "" {
 		return true, nil
 	}
+	index, err := git.RunRaw(ctx, dir, "-c", "core.fsmonitor=false", "ls-files", "--stage", "-z")
+	if err != nil {
+		return true, err
+	}
+	for _, entry := range strings.Split(string(index), "\x00") {
+		if strings.HasPrefix(entry, "160000 ") {
+			return true, nil
+		}
+	}
 	status, err := git.RunWithEnv(ctx, dir, []string{"GIT_OPTIONAL_LOCKS=0"}, "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none")
 	if err != nil {
 		return true, err
@@ -48,6 +58,10 @@ func WorkNeedsRescue(ctx context.Context, dir string) (bool, error) {
 	if len(ignored) > 0 {
 		return true, nil
 	}
+	return GitOperationInProgress(ctx, dir)
+}
+
+func GitOperationInProgress(ctx context.Context, dir string) (bool, error) {
 	gitDir, err := git.Run(ctx, dir, "rev-parse", "--absolute-git-dir")
 	if err != nil {
 		return true, err
