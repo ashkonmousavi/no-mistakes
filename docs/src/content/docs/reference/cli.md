@@ -337,7 +337,7 @@ Runs with unfinished agent work include an optional `partial_work` object, also 
 `state: retained` names the original worktree `path` and recovery failure `reason`; a best-effort ref may also be present.
 An interrupted invocation whose shutdown could not be confirmed is retained, not reported as safely saved.
 Saved work does not imply a successful repair or successful validation.
-Keep these refs and retained paths until their unfinished work has been reconciled; do not push a rescue snapshot or remove retained work to clear a failure.
+Keep these refs and retained paths until their unfinished work has been reconciled; see the [unfinished-work contract](/no-mistakes/reference/pipeline-steps/#step-statuses).
 Legacy runs without unfinished records omit this object.
 
 When `--run` is omitted, show this branch's run: its active run, else its most recent one.

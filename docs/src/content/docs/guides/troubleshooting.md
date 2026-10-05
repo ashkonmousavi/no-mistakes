@@ -334,8 +334,7 @@ Start a new run only after abort confirms the terminal state; see the [abort com
 
 An interrupted editing invocation may leave a local rescue ref or a retained checkout.
 Read `partial_work` in [`axi status`](/no-mistakes/reference/cli/#no-mistakes-axi-status) before considering cleanup.
-Retention means preservation is incomplete, so inspect the named reason and original checkout instead of deleting it.
-Do not use the unfinished rescue SHA as a feature commit or approval authority.
+Follow the [unfinished-work contract](/no-mistakes/reference/pipeline-steps/#step-statuses) when the named reason requires retaining the original checkout.
 
 Symptom: `~/.no-mistakes/worktrees/<repoID>/<runID>/` - or `<root>/<runID>` when the repository has a [configured worktree root](/no-mistakes/reference/global-config/#worktree_roots) - sticks around after a run ends.
 

@@ -665,16 +665,12 @@ Instructions:
 	return nil
 }
 
-// restorePreMergeHead puts the worktree back on the reviewed head before a
-// shape guard's rejection is returned. Without it a rejected merge leaves the
-// branch on whatever the agent actually produced - a rebase of the reviewed
-// head, a reset onto the target, an unrelated commit - and the step fails while
-// the invalid head stays checked out, so any later hand-off, recovery, or
-// retry reads it as the branch's real state.
-//
-// It is fail-closed: a restore that does not land back exactly on
-// preMergeHead with a clean tree is reported as part of the returned error,
-// never swallowed, so nothing is described as recovered that was not.
+// restorePreMergeHead restores the reviewed head after a concluded attempt
+// fails the merge-shape proof, only when preservation permits the reset.
+// Retained work, unverifiable writer shutdown, or a head differing from the
+// recorded run head leaves the checkout intact for continuity reconciliation.
+// A permitted restore must land exactly on preMergeHead with a clean tree;
+// otherwise the returned error never describes the rejected attempt as recovered.
 func restorePreMergeHead(ctx context.Context, sctx *pipeline.StepContext, preMergeHead string, cause error) error {
 	if err := sctx.CheckWorkRescue(); err != nil {
 		return errors.Join(cause, err)
