@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	gitpkg "github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
@@ -255,20 +256,29 @@ func TestSubscribeToCompletedRunYieldsOneGapThenCloses(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Wait for the run to complete by polling get_run.
-	deadline := time.After(10 * time.Second)
-	for {
-		var result ipc.GetRunResult
-		if err := client.Call(ipc.MethodGetRun, &ipc.GetRunParams{RunID: pushResult.RunID}, &result); err != nil {
-			t.Fatal(err)
-		}
-		if result.Run != nil && (result.Run.Status == types.RunCompleted || result.Run.Status == types.RunFailed || result.Run.Status == types.RunCancelled) {
-			break
-		}
+	// Wait until the run is completed *for subscription purposes*, which is
+	// what this test's precondition needs. get_run cannot answer that: the
+	// executor writes the terminal status, and only afterwards does the run
+	// goroutine finish its post-run housekeeping and close the run's
+	// subscribers. Subscribing inside that window still registers a live
+	// mailbox, so the stream stays open until housekeeping ends - on Windows,
+	// longer than the close budget below.
+	//
+	// A subscription's own close is the daemon's signal for exactly this, so
+	// drain one to the end first. Both orderings are safe: if the run is
+	// already done, this subscription yields its gap and closes immediately.
+	warmup, cancelWarmup, err := ipc.Subscribe(p.Socket(), &ipc.SubscribeParams{RunID: pushResult.RunID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancelWarmup()
+	deadline := time.After(60 * time.Second)
+	for draining := true; draining; {
 		select {
+		case _, ok := <-warmup:
+			draining = ok
 		case <-deadline:
 			t.Fatal("run did not complete in time")
-		case <-time.After(100 * time.Millisecond):
 		}
 	}
 
@@ -346,33 +356,9 @@ func TestRecoverStaleRunsOnStartup(t *testing.T) {
 	}
 	t.Cleanup(func() { d.Close() })
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- RunWithOptions(p, d, func() []pipeline.Step {
-			return []pipeline.Step{&mockPassStep{name: types.StepReview}}
-		})
-	}()
-
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(p.Socket()); err == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	t.Cleanup(func() {
-		client, err := ipc.Dial(p.Socket())
-		if err == nil {
-			client.Call(ipc.MethodShutdown, &ipc.ShutdownParams{}, nil)
-			client.Close()
-		}
-		select {
-		case <-errCh:
-		case <-time.After(3 * time.Second):
-			t.Error("daemon did not stop within 3s")
-		}
-	})
+	runTestDaemon(t, p, d, func() []pipeline.Step {
+		return []pipeline.Step{&mockPassStep{name: types.StepReview}}
+	}, 3*time.Second)
 
 	// Verify the stale run was marked as failed.
 	run, err := d.GetRun(staleRun.ID)
@@ -412,6 +398,7 @@ func TestRecoverOnStartup_FinalizesLegacyTerminalPRRun(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() { _ = database.Close() })
 			repo, err := database.InsertRepoWithID("terminal-pr-"+state, t.TempDir(), "https://github.com/test/repo", "main")
 			if err != nil {
 				t.Fatal(err)
@@ -436,34 +423,7 @@ func TestRecoverOnStartup_FinalizesLegacyTerminalPRRun(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			errCh := make(chan error, 1)
-			go func() {
-				errCh <- RunWithOptions(p, database, func() []pipeline.Step { return []pipeline.Step{&mockPassStep{name: types.StepCI}} })
-			}()
-			defer func() {
-				client, dialErr := ipc.Dial(p.Socket())
-				if dialErr == nil {
-					_ = client.Call(ipc.MethodShutdown, &ipc.ShutdownParams{}, nil)
-					_ = client.Close()
-				}
-				select {
-				case <-errCh:
-				case <-time.After(3 * time.Second):
-					t.Error("isolated daemon did not stop")
-				}
-				_ = database.Close()
-			}()
-
-			deadline := time.Now().Add(5 * time.Second)
-			for {
-				if _, statErr := os.Stat(p.Socket()); statErr == nil {
-					break
-				}
-				if time.Now().After(deadline) {
-					t.Fatal("isolated daemon did not become ready")
-				}
-				time.Sleep(20 * time.Millisecond)
-			}
+			runTestDaemon(t, p, database, func() []pipeline.Step { return []pipeline.Step{&mockPassStep{name: types.StepCI}} }, 3*time.Second)
 
 			got, err := database.GetRun(run.ID)
 			if err != nil {
@@ -739,7 +699,7 @@ func TestRecoverOnStartup_ReconcilesHistoricalCIGateFromCurrentPRState(t *testin
 	}
 }
 
-func TestRecoverCleansUpOrphanedWorktrees(t *testing.T) {
+func TestRecoverCleansUpEmptyOrphanedWorktreesAndRetainsUnboundContent(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "dtest")
 	if err != nil {
 		t.Fatal(err)
@@ -751,12 +711,25 @@ func TestRecoverCleansUpOrphanedWorktrees(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create orphaned worktree directories.
+	// Create orphaned worktree directories, backdated past the default
+	// worktree retention window so startup's retention-aware reap removes it
+	// deterministically rather than waiting out the window.
 	orphanDir := p.WorktreeDir("some-repo", "some-run")
 	if err := os.MkdirAll(orphanDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	os.WriteFile(filepath.Join(orphanDir, "test.txt"), []byte("orphan"), 0o644)
+	emptyOrphanDir := p.WorktreeDir("some-repo", "empty-run")
+	if err := os.MkdirAll(emptyOrphanDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * config.DefaultWorktreeRetention)
+	if err := os.Chtimes(orphanDir, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(emptyOrphanDir, old, old); err != nil {
+		t.Fatal(err)
+	}
 
 	d, err := db.Open(p.DB())
 	if err != nil {
@@ -764,42 +737,26 @@ func TestRecoverCleansUpOrphanedWorktrees(t *testing.T) {
 	}
 	t.Cleanup(func() { d.Close() })
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- RunWithOptions(p, d, func() []pipeline.Step {
-			return []pipeline.Step{&mockPassStep{name: types.StepReview}}
-		})
-	}()
+	runTestDaemon(t, p, d, func() []pipeline.Step {
+		return []pipeline.Step{&mockPassStep{name: types.StepReview}}
+	}, 3*time.Second)
 
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(p.Socket()); err == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	// Empty orphan storage is disposable; unknown bytes lack rescue binding.
+	if _, err := os.Stat(emptyOrphanDir); !os.IsNotExist(err) {
+		t.Errorf("empty orphaned worktree dir still exists: %s", emptyOrphanDir)
 	}
-
-	t.Cleanup(func() {
-		client, err := ipc.Dial(p.Socket())
-		if err == nil {
-			client.Call(ipc.MethodShutdown, &ipc.ShutdownParams{}, nil)
-			client.Close()
-		}
-		select {
-		case <-errCh:
-		case <-time.After(3 * time.Second):
-			t.Error("daemon did not stop within 3s")
-		}
-	})
-
-	// Orphaned worktree directory should be removed.
-	if _, err := os.Stat(orphanDir); !os.IsNotExist(err) {
-		t.Errorf("orphaned worktree dir still exists: %s", orphanDir)
+	if got, err := os.ReadFile(filepath.Join(orphanDir, "test.txt")); err != nil || string(got) != "orphan" {
+		t.Fatalf("unbound work lost: %q %v", got, err)
 	}
 }
 
 func TestRecoverPreservesInterruptedCIMonitorWorktree(t *testing.T) {
-	tmpDir := t.TempDir()
+	// Keep the IPC socket below the macOS Unix-domain path limit.
+	tmpDir, err := os.MkdirTemp("", "dtest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
 	p := paths.WithRoot(tmpDir)
 	if err := p.EnsureDirs(); err != nil {
 		t.Fatal(err)
@@ -845,33 +802,9 @@ func TestRecoverPreservesInterruptedCIMonitorWorktree(t *testing.T) {
 	}
 	t.Cleanup(func() { d.Close() })
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- RunWithOptions(p, d, func() []pipeline.Step {
-			return []pipeline.Step{&mockPassStep{name: types.StepReview}}
-		})
-	}()
-
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(p.Socket()); err == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	t.Cleanup(func() {
-		client, err := ipc.Dial(p.Socket())
-		if err == nil {
-			client.Call(ipc.MethodShutdown, &ipc.ShutdownParams{}, nil)
-			client.Close()
-		}
-		select {
-		case <-errCh:
-		case <-time.After(3 * time.Second):
-			t.Error("daemon did not stop within 3s")
-		}
-	})
+	runTestDaemon(t, p, d, func() []pipeline.Step {
+		return []pipeline.Step{&mockPassStep{name: types.StepReview}}
+	}, 3*time.Second)
 
 	recovered, err := d.GetRun(run.ID)
 	if err != nil {
@@ -962,6 +895,17 @@ func TestSkipWorktreeCleanup_CIMonitorInterrupted(t *testing.T) {
 		skip, _ := skipWorktreeCleanup(ctx, d, run.ID, wtPath)
 		if !skip {
 			t.Fatal("a non-git worktree dir for a ci-interrupted run must fail safe to preserve")
+		}
+	})
+
+	t.Run("reclaims worktree that is already gone", func(t *testing.T) {
+		runID, wtPath := newInterruptedWorktree(t, headSHA)
+		if err := os.RemoveAll(wtPath); err != nil {
+			t.Fatal(err)
+		}
+		skip, reason := skipWorktreeCleanup(ctx, d, runID, wtPath)
+		if skip {
+			t.Fatalf("a run whose worktree directory no longer exists has nothing unpushed to lose, so it should be reclaimed (skip=false), got skip=true: %s", reason)
 		}
 	})
 }

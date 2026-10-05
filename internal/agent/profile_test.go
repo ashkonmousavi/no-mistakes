@@ -90,6 +90,26 @@ func TestNewWithOptions_RawOverrideKeepsWinning(t *testing.T) {
 	}
 }
 
+func TestPiProfileParametersSurviveColdStartAndSessionResume(t *testing.T) {
+	profile := agentcfg.Profile{Model: "openai-codex/gpt-5.4", Effort: agentcfg.EffortHigh}
+	created, err := NewWithOptions(types.AgentPi, "pi", []string{"--provider", "openai-codex"}, Options{Profile: profile, DisableProjectSettings: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer created.Close()
+	pa := created.(*piAgent)
+	for _, session := range []*SessionRef{nil, {}, {ID: "00000000-0000-4000-8000-000000000001"}} {
+		for range 2 { // a retry builds the same arguments again
+			args := strings.Join(pa.buildArgs(session), " ")
+			for _, want := range []string{"--no-context-files", "--provider openai-codex", "--model openai-codex/gpt-5.4", "--thinking high"} {
+				if !strings.Contains(args, want) {
+					t.Errorf("missing %s in %s", want, args)
+				}
+			}
+		}
+	}
+}
+
 // TestNewWithOptions_ZeroProfileLeavesArgvUntouched is the no-op guarantee for
 // every configuration written before the common layer existed.
 func TestNewWithOptions_ZeroProfileLeavesArgvUntouched(t *testing.T) {
@@ -129,6 +149,8 @@ func TestNewWithOptions_RefusesUnmappableKnob(t *testing.T) {
 		{types.AgentRovoDev, agentcfg.Profile{Model: "x"}},
 		{types.AgentAntigravity, agentcfg.Profile{Effort: agentcfg.EffortHigh}},
 		{types.AgentCursor, agentcfg.Profile{Effort: agentcfg.EffortHigh}},
+		{types.AgentDevin, agentcfg.Profile{Effort: agentcfg.EffortHigh}},
+		{types.AgentDevin, agentcfg.Profile{Model: "gpt-6-luna-medium", Effort: agentcfg.EffortLow}},
 		{types.AgentOpenCode, agentcfg.Profile{Model: "gpt-5"}},
 	}
 	for _, tt := range tests {
@@ -144,7 +166,7 @@ func TestNewWithOptions_RefusesUnmappableKnob(t *testing.T) {
 // the model reaches acpx's own flag, positioned among acpx options rather than
 // after the target or the exec subcommand.
 func TestACPModelIsPinnedOnTheAcpxCommand(t *testing.T) {
-	for _, name := range []types.AgentName{types.AgentCursor, "acp:custom"} {
+	for _, name := range []types.AgentName{types.AgentCursor, types.AgentDevin, "acp:custom"} {
 		ag, err := NewWithOptions(name, "acpx", nil, Options{
 			Profile: agentcfg.Profile{Model: "gpt-5"},
 		})
@@ -152,7 +174,8 @@ func TestACPModelIsPinnedOnTheAcpxCommand(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer ag.Close()
-		args := ag.(*acpxAgent).buildArgs(RunOpts{CWD: "/w"})
+		acpxAg := ag.(*acpxAgent)
+		args := acpxAg.buildArgs(acpxAg.rawCommand, RunOpts{CWD: "/w"})
 		modelIdx, execIdx := -1, -1
 		for i, arg := range args {
 			switch arg {
@@ -177,7 +200,8 @@ func TestACPWithoutModelKeepsItsPreviousArgv(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer plain.Close()
-	for _, arg := range plain.(*acpxAgent).buildArgs(RunOpts{CWD: "/w"}) {
+	plainACPX := plain.(*acpxAgent)
+	for _, arg := range plainACPX.buildArgs(plainACPX.rawCommand, RunOpts{CWD: "/w"}) {
 		if arg == "--model" {
 			t.Fatal("acpx received --model with no model pinned")
 		}

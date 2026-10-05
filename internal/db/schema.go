@@ -1,6 +1,25 @@
 package db
 
 const schemaSQL = `
+CREATE TABLE IF NOT EXISTS fix_checkpoints (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    step TEXT NOT NULL,
+    selection_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    UNIQUE(run_id,step,selection_id,ordinal)
+);
+CREATE TABLE IF NOT EXISTS run_work_rescues (
+    stop_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS run_work_rescues_run ON run_work_rescues(run_id, stop_id);
+CREATE UNIQUE INDEX IF NOT EXISTS run_work_rescues_consumer
+ ON run_work_rescues(json_extract(payload,'$.consumed_by'))
+ WHERE json_extract(payload,'$.consumed_by') IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS repos (
     id             TEXT PRIMARY KEY,
     working_path   TEXT NOT NULL UNIQUE,
@@ -35,6 +54,7 @@ CREATE TABLE IF NOT EXISTS runs (
     push_generation         INTEGER,
     push_active             INTEGER NOT NULL DEFAULT 0,
     terminal_head_verified_at INTEGER,
+    gates_json              TEXT,
     error                   TEXT,
     awaiting_agent_since INTEGER,
     parked_ms            INTEGER,
@@ -43,6 +63,9 @@ CREATE TABLE IF NOT EXISTS runs (
     launch_intent_digest TEXT,
     launch_receipt_claimed_at INTEGER,
     pr_base_branch       TEXT,
+    omit_intent          INTEGER NOT NULL DEFAULT 0,
+    pi_profile           TEXT,
+    verification_plan    TEXT,
     created_at           INTEGER NOT NULL,
     updated_at           INTEGER NOT NULL
 );
@@ -184,6 +207,36 @@ CREATE TABLE IF NOT EXISTS intent_cache (
     created_at  INTEGER NOT NULL
 );
 
+-- Answers a human gave to a review turn's questions, keyed by branch so the
+-- next COLD reviewer - in this run or any later one - reads what is already
+-- settled. A mid-turn answer is not a gate response, so it cannot ride the
+-- step_rounds decision channel; nothing deletes these rows, for the same
+-- reason nothing deletes a branch decision. PRIMARY KEY per
+-- branch+question+run+ask: a correction to the SAME ask replaces its earlier
+-- answer, two runs that both happen to use the question id "q1" - ids are
+-- chosen by the agent and unique only by accident - keep their own rows
+-- instead of one overwriting the other's settled decision, and a re-ask of an
+-- id WITHIN one run (a cold rereview in a fix round is shown only the
+-- still-open questions, so it starts numbering at q1 again) records its own
+-- decision instead of overwriting the earlier ask's.
+CREATE TABLE IF NOT EXISTS review_questions (
+    repo_id      TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    branch       TEXT NOT NULL,
+    question_id  TEXT NOT NULL,
+    run_id       TEXT NOT NULL,
+    ask_ordinal  INTEGER NOT NULL,
+    question     TEXT NOT NULL,
+    options_json TEXT,
+    file         TEXT,
+    line         INTEGER,
+    answer       TEXT NOT NULL,
+    answered_by  TEXT,
+    answered_at  TEXT,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, branch, question_id, run_id, ask_ordinal)
+);
+
 -- Per-branch range of pipeline-authored commits whose re-review did not
 -- complete. The next run's initial review reads this so it is not cold on
 -- uncertified fixer commits. PRIMARY KEY per branch: the latest uncertified
@@ -203,6 +256,10 @@ CREATE TABLE IF NOT EXISTS uncertified_pipeline_ranges (
 // were created before the referenced columns existed. Each statement must be
 // idempotent via its error being tolerated when the column already exists.
 var migrationStatements = []string{
+	`ALTER TABLE runs ADD COLUMN verification_plan TEXT`,
+	`CREATE TRIGGER IF NOT EXISTS runs_verification_plan_immutable BEFORE UPDATE OF verification_plan ON runs WHEN NEW.verification_plan IS NOT OLD.verification_plan BEGIN SELECT RAISE(ABORT, 'run verification plan is immutable'); END`,
+	`ALTER TABLE runs ADD COLUMN pi_profile TEXT`,
+	`CREATE TRIGGER IF NOT EXISTS runs_pi_profile_immutable BEFORE UPDATE OF pi_profile ON runs WHEN NEW.pi_profile IS NOT OLD.pi_profile BEGIN SELECT RAISE(ABORT, 'run Pi profile is immutable'); END`,
 	`ALTER TABLE repos ADD COLUMN fork_url TEXT`,
 	`ALTER TABLE step_rounds ADD COLUMN selected_finding_ids TEXT`,
 	`ALTER TABLE step_rounds ADD COLUMN selection_source TEXT`,
@@ -277,12 +334,28 @@ var migrationStatements = []string{
 	// --base-branch). Nullable: absent means fall back to repo config and the
 	// forge default branch.
 	`ALTER TABLE runs ADD COLUMN pr_base_branch TEXT`,
+	// The caller-side, tighten-only decision to keep the generated Intent
+	// section out of the PR body (axi run --no-publish-intent, or
+	// intent.publish_intent: false in global config). Resolved once at run
+	// start and stamped here so recovery and reruns inherit it instead of
+	// re-reading a since-changed global config. It can only reduce
+	// publication; the repository's trusted pr.publish_intent still wins
+	// independently at render time.
+	`ALTER TABLE runs ADD COLUMN omit_intent INTEGER NOT NULL DEFAULT 0`,
 	// The start of the currently displayed execution/fix round is separate
 	// from started_at, which remains the whole-step clock.
 	`ALTER TABLE step_results ADD COLUMN round_started_at INTEGER`,
 	`ALTER TABLE step_results ADD COLUMN last_activity_at INTEGER`,
 	`ALTER TABLE step_results ADD COLUMN last_activity TEXT`,
 	`ALTER TABLE step_results ADD COLUMN agent_pid INTEGER`,
+	// The repository-declared extra gates this run resolved at creation. It is
+	// durable for the same reason worktree_dir is: the gates come from the
+	// trusted default branch, which may gain or lose one while a run is parked,
+	// and recovery re-deriving them would rebuild a step sequence the run never
+	// executed - failing an otherwise healthy parked run as a crash. NULL and
+	// empty both mean the bare core pipeline, which is the only sequence a row
+	// written before this column existed can have had.
+	`ALTER TABLE runs ADD COLUMN gates_json TEXT`,
 	`ALTER TABLE step_results ADD COLUMN auto_fix_limit INTEGER`,
 	`ALTER TABLE step_results ADD COLUMN ci_fix_attempts INTEGER NOT NULL DEFAULT 0`,
 	// Non-nil exactly when a human answered ActionApprove on a step whose gate
@@ -314,4 +387,13 @@ var migrationStatements = []string{
 	`ALTER TABLE agent_invocations ADD COLUMN workload_files INTEGER`,
 	`ALTER TABLE agent_invocations ADD COLUMN workload_lines INTEGER`,
 	`ALTER TABLE agent_invocations ADD COLUMN finding_count INTEGER`,
+	`ALTER TABLE step_results ADD COLUMN approval_reason TEXT`,
+	// Explicit axi run --closes references for the PR body Issues section (nullable;
+	// NULL means none).
+	`ALTER TABLE runs ADD COLUMN closing_issue_refs TEXT`,
+	// Set once, atomically with the read that resolves the closing issue references into
+	// the PR body. NULL means no PR body has sampled the closing issue references yet, so
+	// a late --closes can still reach the Issues section; non-NULL closes that window
+	// (see UpdateRunClosingIssueRefs / ClaimClosingIssueRefsForPRBody).
+	`ALTER TABLE runs ADD COLUMN closing_issue_refs_locked_at INTEGER`,
 }

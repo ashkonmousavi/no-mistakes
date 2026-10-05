@@ -98,10 +98,6 @@ type PR struct {
 	// authoritative once a PR exists and protects resumed CI repair from a
 	// later configuration change.
 	BaseBranch string
-	// BaseSHA is the freshly resolved commit at BaseBranch. Retry admission
-	// requires it because a branch name alone cannot detect that the target
-	// advanced after the first workflow attempt was created.
-	BaseSHA string
 }
 
 // PRContent is the title + body for creating or updating a PR.
@@ -190,32 +186,14 @@ type Check struct {
 	// it can never be true for a genuine test or lint failure, whose job cleared
 	// setup and failed a later step.
 	PreRunFailure bool
-	// InfrastructureFailure marks a failed check in a provider-proven family
-	// initiated by artifact-transfer infrastructure on the exact PR head/base
-	// candidate. Required work after that error is retained as an explicit
-	// recovery dependency; a real test/lint failure refuses the whole family.
-	InfrastructureFailure bool
-	// InfrastructureGroup is the provider's opaque identity for the work one
-	// rerun request targets (for GitHub Actions, the workflow run). It prevents
-	// failures from unrelated runs being combined into one candidate retry.
-	InfrastructureGroup string
-	// InfrastructureReason is a bounded, provider-produced classification label,
-	// never raw logs. It is persisted with the first failure for later readback.
-	InfrastructureReason string
-	// InfrastructureHeadSHA and InfrastructureBaseSHA bind the provider proof
-	// to immutable commits. InfrastructureRerunSafe is false when the provider's
-	// retry primitive would widen beyond the proven failed-job population.
-	InfrastructureHeadSHA   string
-	InfrastructureBaseSHA   string
-	InfrastructureRerunSafe bool
-	// InfrastructureRerunOmission marks the one provider job whose skipped
-	// conclusion is an event-bound member of an otherwise proven retry group.
-	// It never changes the check's visible skipped state.
-	InfrastructureRerunOmission bool
-	// InfrastructureRerunDependent marks a skipped job that the provider will
-	// execute because it is downstream of a classified initiating failure.
-	InfrastructureRerunDependent bool
-	InfrastructureEvidence       InfrastructureEvidenceReceipt
+	// AwaitingApproval marks a check the provider is holding until a human
+	// approves it - GitHub holds a first-time contributor's workflows that
+	// way, concluding the run action_required without running a single job.
+	// Nothing about the commit produced it and no rerun can clear it, so it
+	// is a wait on a maintainer rather than a verdict on the code: such a
+	// check is reported pending, never failing, so the CI step waits for the
+	// approval instead of spending auto-fix rounds on work that never ran.
+	AwaitingApproval bool
 	// App identifies the provider application that published the check, when
 	// the provider reports one: on GitHub it is the check suite's app slug
 	// ("github-actions" for every Actions job, "greptile-apps" for Greptile's
@@ -230,11 +208,9 @@ func (c Check) Failing() bool { return c.Bucket == CheckBucketFail }
 
 // ReviewBot describes a third-party review bot whose pull request check is an
 // opinion about the change rather than a job verdict on it. The CI step routes
-// such a check's failure to a human decision instead of spending an auto-fix
-// round on it. Available unresolved review comments become individual
-// findings; when no comment can be attached, the red check itself remains as
-// one check-level decision finding. The GitHub backend collects only these
-// bots' review-thread comments.
+// such a check's failure to a human decision carrying the bot's unresolved
+// review comments, instead of spending an auto-fix round on it, and the
+// GitHub backend collects only these bots' review-thread comments.
 type ReviewBot struct {
 	// AppSlug is the provider app slug the bot publishes its check under.
 	AppSlug string
@@ -365,9 +341,10 @@ type ReviewCommentsHost interface {
 }
 
 // PRContentReader is an optional interface for hosts that can read the current
-// title and body of an existing PR. The CI repair publisher uses it to rebind
-// a live pipeline attestation to a newly published head without rewriting the
-// rest of the body or inventing an attestation that was not already there.
+// title and raw body of an existing PR. Readers must distinguish an explicitly
+// empty body from missing, null, or malformed content and reject the latter.
+// Author-preserving publication and pre-push/CI attestation refresh depend on
+// this distinction to avoid replacing author text after an incomplete read.
 type PRContentReader interface {
 	GetPRContent(ctx context.Context, pr *PR) (PRContent, error)
 }
@@ -428,23 +405,6 @@ type PRBaseBranchReader interface {
 	GetPRBaseBranch(ctx context.Context, pr *PR) (string, error)
 }
 
-// PRTarget is the forge's current immutable binding for an existing PR. CI
-// retry admission uses all three fields together: a branch name alone cannot
-// prove that either side still names the candidate whose checks were read.
-type PRTarget struct {
-	HeadSHA    string
-	BaseBranch string
-	BaseSHA    string
-}
-
-// PRTargetReader is implemented by providers that can reread the current head
-// and base binding of an existing PR in one request. A provider without this
-// capability cannot admit an infrastructure retry because separate or stale
-// reads could authorize work for a retargeted candidate.
-type PRTargetReader interface {
-	GetPRTarget(ctx context.Context, pr *PR) (PRTarget, error)
-}
-
 // PRBaseRetargeter is implemented by providers that can change an existing
 // PR's target branch. The PR step uses it when a per-run --base-branch override
 // disagrees with the live forge base of an already-open PR. A host that does
@@ -477,61 +437,6 @@ type PreRunFailureDetector interface {
 	// so an unreadable job stays a genuine failure rather than being masked as
 	// infrastructure.
 	PreRunFailures(ctx context.Context, checks []Check) ([]bool, error)
-}
-
-// InfrastructureFailure is the provider's fail-closed disposition for one
-// failed check. Retryable is true only when structured run/job evidence and the
-// provider's failure evidence satisfy the backend's narrow infrastructure
-// policy. Group identifies checks covered by one provider rerun request.
-type InfrastructureFailure struct {
-	Retryable      bool
-	RerunOmission  bool
-	RerunDependent bool
-	Group          string
-	Reason         string
-	HeadSHA        string
-	BaseSHA        string
-	RerunSafe      bool
-	Evidence       InfrastructureEvidenceReceipt
-}
-
-// InfrastructureEvidenceReceipt is bounded provider metadata proving which
-// attempt-specific job log was readable and which non-expired artifacts were
-// still retained before a retry decision. It intentionally contains no log
-// text, paths, or credentials.
-type InfrastructureEvidenceReceipt struct {
-	ProviderRunID  string                          `json:"provider_run_id"`
-	Attempt        int                             `json:"attempt"`
-	LogJobIDs      []int64                         `json:"log_job_ids"`
-	DependentJobs  []int64                         `json:"dependent_job_ids,omitempty"`
-	DependentSteps []InfrastructureStepReceipt     `json:"dependent_steps,omitempty"`
-	Artifacts      []InfrastructureArtifactReceipt `json:"artifacts,omitempty"`
-}
-
-// InfrastructureStepReceipt names work skipped or consequentially failed only
-// after a classified provider failure. The recovered job must reach a green
-// conclusion, making each required step an explicit recovery obligation.
-type InfrastructureStepReceipt struct {
-	JobID  int64  `json:"job_id"`
-	Number int    `json:"number"`
-	Name   string `json:"name"`
-}
-
-type InfrastructureArtifactReceipt struct {
-	ID            int64  `json:"id"`
-	Name          string `json:"name"`
-	Digest        string `json:"digest,omitempty"`
-	ProviderRunID int64  `json:"provider_run_id,omitempty"`
-	HeadSHA       string `json:"head_sha,omitempty"`
-}
-
-// ArtifactInfrastructureFailureDetector classifies artifact-transfer failures
-// after repository steps ran. It is separate from PreRunFailureDetector because
-// the evidence, budget, and failure class are all intentionally independent.
-type ArtifactInfrastructureFailureDetector interface {
-	// ArtifactInfrastructureFailures returns one positional result per check and
-	// fails closed on missing, ambiguous, stale, or malformed provider evidence.
-	ArtifactInfrastructureFailures(ctx context.Context, pr *PR, checks []Check) ([]InfrastructureFailure, error)
 }
 
 // CheckRerunner re-runs the provider-side work behind a failed check without

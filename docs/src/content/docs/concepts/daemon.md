@@ -69,6 +69,9 @@ Every invocation of `daemon stop`, `daemon restart`, or `update` - forced or not
 The daemon writes an identity record to `~/.no-mistakes/daemon.pid` and listens on a Unix socket at `~/.no-mistakes/socket`. On Windows, it uses a localhost TCP listener and a protected endpoint file at the same path. CLI clients bound how long they wait for that socket to accept a connection with `daemon_connect_timeout` (default `3s`, override with `NM_DAEMON_CONNECT_TIMEOUT`), so a daemon process that is alive but stuck fails the connection instead of hanging the caller; see [Troubleshooting](/no-mistakes/guides/troubleshooting/#check-for-stale-artifacts).
 Commands that ensure the daemon is running (`no-mistakes`, `init`, `attach`, `rerun`, `axi run`, `axi respond`) also fail fast rather than silently starting a replacement daemon when the socket file exists but nothing answers at all, such as a dead socket left behind by an unclean exit; `no-mistakes daemon start` self-heals past that case.
 After accepting a shutdown request, `daemon stop` waits for the daemon process itself to exit before returning success. Losing IPC health is not enough because the listener closes near the start of shutdown, while the singleton lock and other process-owned resources are released only at process exit. `daemon restart` uses the same complete-stop handoff before starting the replacement, so the old and new processes do not contend for the root.
+An already parked approval or fix-review gate is suspended during graceful shutdown: its run, findings, worktree, and evidence remain available for the existing validated startup recovery.
+This suspension does not approve the gate or restart an editing call.
+Operator abort and cancellation of executing work retain their existing terminal behavior.
 
 Process launch and daemon readiness are separate states. After taking the singleton lock, the daemon publishes its PID before exclusive crash recovery begins, but startup is not successful until the IPC server returns a real health response. `daemon start` allows up to 45 seconds for cold environment setup and recovery, reports a child that exits before readiness promptly, and never treats the PID file or a bound socket as proof that the daemon is ready. If detached startup times out, the command kills and reaps that child before returning; if managed startup fails, it cleans up the managed attempt before trying the detached fallback and preserves both errors when both paths fail.
 
@@ -89,6 +92,8 @@ When a push arrives via the post-receive hook:
 
 An unresolved [`protected_paths`](/no-mistakes/reference/repo-config/#protected_paths) refusal preserves the index and working files across daemon shutdown, cancellation by a newer push, and crash recovery, including when trusted-config loading fails and the run cannot resume. This retention does not weaken recovery validation or keep a terminal run active: orphan-process cleanup and test-evidence expiry still apply. Successful completion of the refused step releases this protection; deliberate operator skip and abort retain their existing cleanup behavior.
 
+Step 4's cleanup is best effort: a `git worktree remove` failure (for example a vendored `.git` nested somewhere under a large `node_modules` tree) leaves the directory behind rather than retrying immediately. The [`worktree` retention setting](/no-mistakes/reference/global-config/#worktree) is the safety net for that leftover - it reaps eligible directories under the default tree after every finished run and again at startup, so a long-lived daemon converges on the retention budget instead of waiting for the crash-recovery sweep below, which only ever runs once per restart.
+
 Event delivery is bounded, so a slow or wedged client can never stall a run. Under pressure the daemon may drop ordinary log output, but it never silently loses a state change: it coalesces those into a single gap signal, and the TUI and `axi` respond by re-reading authoritative run state. A live view can therefore skip log lines while it is behind, but it converges on the run's real state. After a dropped connection, the TUI retries with a bounded delay and reconciles when it reattaches; if the daemon remains unavailable, it surfaces the connection error instead of retrying forever.
 
 Pipeline agents are prompted to keep intentional writes inside that detached worktree and avoid changing system state outside it, such as Homebrew packages, apps under `/Applications`, or global tool configuration.
@@ -98,6 +103,12 @@ Configured commands and one-shot agent subprocesses are terminated as a process 
 Each process is asked to exit first and only forcibly killed if it is still running a few seconds later.
 A process can still escape that tree by detaching itself into its own session, so when a run finishes the daemon also terminates anything still standing in that run's worktree before removing the directory.
 That sweep is scoped by working directory: it never touches a worktree whose run is still active, and it can never reach a process working outside `~/.no-mistakes/worktrees/` or outside a run worktree a run record names in a configured worktree root.
+
+On Linux, a step that exhausts memory fails only its own run.
+Configured commands, agent subprocesses, and managed agent servers raise their `oom_score_adj` so the kernel OOM killer picks them before the daemon.
+The generated systemd unit sets `OOMPolicy=continue`, so one killed step no longer stops the whole service and fails every other in-flight run with "daemon shutting down".
+When a step process is killed and the daemon's cgroup records a new `oom_kill`, the step fails with "ran out of memory" appended to its original error text, and the step log keeps the command output printed before the kill.
+An existing unit picks up the policy when `no-mistakes daemon start` or `restart` refreshes the service definition.
 
 ## Concurrent push handling
 
@@ -118,6 +129,7 @@ On startup, the daemon checks for runs that were left in `pending` or `running` 
 
 - Completes legacy active rows whose persisted PR state is already `merged` or `closed`, including their CI step, before active-run recovery and parked-run planning
 - Resumes only fully recorded parked approval gates whose worktree and step history can be validated; incomplete or ambiguous active runs fail closed
+- Rebuilds a parked run with the repository gate list pinned in `runs.gates_json` when that run started, never the current default-branch list. An absent pin on an older run means the core pipeline, while an invalid pin refuses recovery
 - Re-resolves and validates any configured repository forge profile before rebuilding the recovered run, so resumed provider checks and agents use the same repository-scoped identity model rather than persisted credentials or ambient active accounts
 - Before resuming a parked CI gate, re-checks its persisted PR URL through the configured provider; a currently merged or closed PR completes the stale gate, while an open, unknown, or unreachable PR remains parked. The [`protected_paths` refusal exception](/no-mistakes/reference/repo-config/#protected_paths) prevents automatic reconciliation
 - Preserves a run that was actively monitoring CI for an already-created PR as `ci_monitor_interrupted` rather than failing it: the PR is still open, so a restart mid-monitor is not a pipeline failure. That run is terminal and never resumed

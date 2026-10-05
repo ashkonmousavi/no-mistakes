@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +13,10 @@ import (
 
 	toon "github.com/toon-format/toon-go"
 
+	"github.com/kunchenguid/no-mistakes/internal/custody"
+	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
+	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -209,8 +213,8 @@ func TestAxiBranchSyncJourney(t *testing.T) {
 }
 
 // TestAxiRunReattachesAfterManagedFix reproduces the v1.39.0 dogfood failure:
-// a review fix advances the active run and gate branch while the submitting
-// worktree remains at its immutable submitted head. A second axi run from that
+// a review fix advances the active run head while the gate branch and submitting
+// worktree remain at the immutable submitted head. A second axi run from that
 // unchanged worktree must reattach without pushing or creating another run.
 func TestAxiRunReattachesAfterManagedFix(t *testing.T) {
 	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: branchSyncScenario(t)})
@@ -253,8 +257,11 @@ func TestAxiRunReattachesAfterManagedFix(t *testing.T) {
 		t.Fatalf("gate head before reattach: %v\n%s", gitErr, gateHeadBeforeBytes)
 	}
 	gateHeadBefore := strings.TrimSpace(string(gateHeadBeforeBytes))
-	if gateHeadBefore != managed.HeadSHA {
-		t.Fatalf("gate head = %s, want managed head %s", gateHeadBefore, managed.HeadSHA)
+	if gateHeadBefore != submitted {
+		t.Fatalf("gate head = %s, want submitted head %s until publication", gateHeadBefore, submitted)
+	}
+	if out, err := h.runGit(context.Background(), gateDir, "cat-file", "-e", managed.HeadSHA+"^{commit}"); err != nil {
+		t.Fatalf("managed fix is not available in the gate: %v\n%s", err, out)
 	}
 	runsBefore := len(h.Runs())
 	tracePath := filepath.Join(t.TempDir(), "git-trace.json")
@@ -363,7 +370,8 @@ func TestAxiCustodyRecoveryJourney(t *testing.T) {
 		t.Fatalf("review fix: %v\n%s", err, fixOut)
 	}
 
-	// Cancel while the pipeline fix commit exists only in the gate branch.
+	// Cancel while the pipeline fix is unpublished; terminalization anchors it
+	// under the run-specific recovery ref without advancing the gate branch.
 	abortOut, abortErr := h.RunInDir(operator, "axi", "abort")
 	if abortErr != nil {
 		t.Fatalf("axi abort: %v\n%s", abortErr, abortOut)
@@ -386,13 +394,19 @@ func TestAxiCustodyRecoveryJourney(t *testing.T) {
 	}
 
 	gateDir := filepath.Join(h.NMHome, "repos", h.repoID()+".git")
-	preservedBytes, err := h.runGit(context.Background(), gateDir, "rev-parse", "refs/heads/feature/recover-journey")
+	preservedBytes, err := h.runGit(context.Background(), gateDir, "rev-parse", custody.RecoveryRef(run.ID))
 	if err != nil {
 		t.Fatalf("gate preserved head: %v\n%s", err, preservedBytes)
 	}
 	preserved := strings.TrimSpace(string(preservedBytes))
+	if preserved != run.HeadSHA {
+		t.Fatalf("recovery ref = %s, want recorded run head %s", preserved, run.HeadSHA)
+	}
 	if preserved == submitted {
-		t.Fatal("pipeline fix commit is not preserved in the gate branch")
+		t.Fatal("pipeline fix commit is not preserved in the recovery ref")
+	}
+	if got, err := h.runGit(context.Background(), gateDir, "rev-parse", "refs/heads/feature/recover-journey"); err != nil || strings.TrimSpace(string(got)) != submitted {
+		t.Fatalf("unpublished gate branch = %s (err %v), want submitted head %s", got, err, submitted)
 	}
 	if got := strings.TrimSpace(h.WorktreeRefSHA("feature/recover-journey")); got != submitted {
 		t.Fatalf("operator branch moved without explicit recovery: %s", got)
@@ -425,7 +439,7 @@ func TestAxiCustodyRecoveryJourney(t *testing.T) {
 	if got := len(h.Runs()); got != runsBefore {
 		t.Fatalf("blocked fresh run changed run count from %d to %d", runsBefore, got)
 	}
-	preservedAfterBlockedRunBytes, gitErr := h.runGit(context.Background(), gateDir, "rev-parse", "refs/heads/feature/recover-journey")
+	preservedAfterBlockedRunBytes, gitErr := h.runGit(context.Background(), gateDir, "rev-parse", custody.RecoveryRef(run.ID))
 	if gitErr != nil || strings.TrimSpace(string(preservedAfterBlockedRunBytes)) != preserved {
 		t.Fatalf("blocked fresh run changed preserved gate head to %s (err %v), want %s", strings.TrimSpace(string(preservedAfterBlockedRunBytes)), gitErr, preserved)
 	}
@@ -490,6 +504,106 @@ func TestAxiCustodyRecoveryJourney(t *testing.T) {
 		t.Fatalf("fresh pipeline did not start cleanly after recovery:\n%s", freshOut)
 	}
 	t.Logf("end-user fresh-run result after custody return:\n%s", freshOut)
+}
+
+func TestAxiTerminalEqualTreeRecoveryJourney(t *testing.T) {
+	h := NewHarness(t, SetupOpts{Agent: "claude"})
+	h.CommitChange("init-terminal-equal-tree", "seed.txt", "seed\n", "seed terminal recovery")
+	initWorktree := h.AddWorktree("init-terminal-equal-tree")
+	if out, err := h.RunInDir(initWorktree, "init"); err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+
+	branch := "feature/terminal-equal-tree"
+	submitted := h.CommitChange(branch, "feature.txt", "operator work\n", "operator work")
+	operator := h.AddWorktree(branch)
+	gateDir := filepath.Join(h.NMHome, "repos", h.repoID()+".git")
+	// Fetch rather than push: a push fires the gate's post-receive hook, which
+	// starts a real run on this branch, and branch sync reports any active run
+	// as owning the branch, so recovery would race that unrelated run.
+	if out, err := h.runGit(context.Background(), gateDir, "fetch", operator, submitted+":refs/heads/"+branch); err != nil {
+		t.Fatalf("seed gate branch: %v\n%s", err, out)
+	}
+	mainBytes, err := h.runGit(context.Background(), gateDir, "rev-parse", submitted+"^")
+	if err != nil {
+		t.Fatalf("gate base: %v\n%s", err, mainBytes)
+	}
+	if err := os.WriteFile(filepath.Join(operator, "feature.txt"), []byte("pipeline reviewed replacement\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, gitErr := h.runGit(context.Background(), operator, "commit", "-am", "recorded reviewed pipeline result"); gitErr != nil {
+		t.Fatalf("record reviewed result: %v\n%s", gitErr, out)
+	}
+	recorded := strings.TrimSpace(h.WorktreeRefSHA(branch))
+	if out, gitErr := h.runGit(context.Background(), gateDir, "fetch", operator, recorded+":refs/no-mistakes/test-recorded"); gitErr != nil {
+		t.Fatalf("import recorded result: %v\n%s", gitErr, out)
+	}
+	treeBytes, err := h.runGit(context.Background(), gateDir, "rev-parse", recorded+"^{tree}")
+	if err != nil {
+		t.Fatalf("recorded tree: %v\n%s", err, treeBytes)
+	}
+	liveBytes, err := h.runGit(context.Background(), gateDir, "-c", "user.name=No Mistakes E2E", "-c", "user.email=e2e@example.com", "commit-tree", strings.TrimSpace(string(treeBytes)), "-p", strings.TrimSpace(string(mainBytes)), "-m", "live equal-tree rewrite")
+	if err != nil {
+		t.Fatalf("commit live rewrite: %v\n%s", err, liveBytes)
+	}
+	live := strings.TrimSpace(string(liveBytes))
+	if out, gitErr := h.runGit(context.Background(), gateDir, "update-ref", "refs/heads/"+branch, live, submitted); gitErr != nil {
+		t.Fatalf("install live gate rewrite: %v\n%s", gitErr, out)
+	}
+	if out, gitErr := h.runGit(context.Background(), operator, "reset", "--hard", submitted); gitErr != nil {
+		t.Fatalf("restore submitted operator head: %v\n%s", gitErr, out)
+	}
+	if out, gitErr := h.runGit(context.Background(), gateDir, "merge-tree", "--write-tree", "--merge-base", strings.TrimSpace(string(mainBytes)), live, submitted); gitErr == nil {
+		t.Fatalf("fixture did not reproduce direct live/local merge conflict: %s", out)
+	}
+	if out, gitErr := h.runGit(context.Background(), gateDir, "update-ref", "-d", "refs/no-mistakes/test-recorded"); gitErr != nil {
+		t.Fatalf("remove fixture ref: %v\n%s", gitErr, out)
+	}
+
+	database, err := db.Open(paths.WithRoot(h.NMHome).DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := database.GetRepo(h.repoID())
+	if err != nil || repo == nil {
+		database.Close()
+		t.Fatalf("registered repo = %#v, err %v", repo, err)
+	}
+	run, err := database.InsertRun(repo.ID, branch, submitted, strings.TrimSpace(string(mainBytes)))
+	if err == nil {
+		err = database.UpdateRunHeadSHA(run.ID, recorded)
+	}
+	if err == nil {
+		err = database.UpdateRunReviewApprovedHeadSHA(run.ID, recorded)
+	}
+	if err == nil {
+		err = database.UpdateRunErrorStatus(run.ID, "terminal worker lost", types.RunFailed)
+	}
+	if closeErr := database.Close(); err != nil || closeErr != nil {
+		t.Fatalf("record terminal run: %v, close %v", err, closeErr)
+	}
+
+	recoverOut, err := h.RunInDir(operator, "axi", "sync", "--recover")
+	if err != nil {
+		t.Fatalf("public equal-tree recovery: %v\n%s", err, recoverOut)
+	}
+	for _, want := range []string{"recovered: true", "changed: true", "state: custody_returned"} {
+		if !strings.Contains(recoverOut, want) {
+			t.Errorf("recover output missing %q:\n%s", want, recoverOut)
+		}
+	}
+	if got := strings.TrimSpace(h.WorktreeRefSHA(branch)); got != live {
+		t.Fatalf("operator HEAD = %s, want live gate head %s", got, live)
+	}
+	for _, ref := range []string{"refs/no-mistakes/recover/" + run.ID, "refs/no-mistakes/recover-local/" + run.ID} {
+		if out, gitErr := h.runGit(context.Background(), operator, "rev-parse", ref); gitErr != nil {
+			t.Fatalf("missing recovery ref %s: %v\n%s", ref, gitErr, out)
+		}
+	}
+	second, err := h.RunInDir(operator, "axi", "sync", "--recover")
+	if err != nil || !strings.Contains(second, "recovered: true") || !strings.Contains(second, "changed: false") {
+		t.Fatalf("idempotent public recovery: %v\n%s", err, second)
+	}
 }
 
 // rebaseCustodyScenario differs from branchSyncScenario in exactly one way that
@@ -597,13 +711,19 @@ func TestAxiCustodyRecoveryAfterRebaseJourney(t *testing.T) {
 	}
 
 	gateDir := filepath.Join(h.NMHome, "repos", h.repoID()+".git")
-	preservedBytes, err := h.runGit(context.Background(), gateDir, "rev-parse", "refs/heads/feature/rebase-recover")
+	preservedBytes, err := h.runGit(context.Background(), gateDir, "rev-parse", custody.RecoveryRef(run.ID))
 	if err != nil {
 		t.Fatalf("gate preserved head: %v\n%s", err, preservedBytes)
 	}
 	preserved := strings.TrimSpace(string(preservedBytes))
+	if preserved != run.HeadSHA {
+		t.Fatalf("recovery ref = %s, want recorded run head %s", preserved, run.HeadSHA)
+	}
 	if got := strings.TrimSpace(h.WorktreeRefSHA("feature/rebase-recover")); got != submitted {
 		t.Fatalf("operator branch moved without explicit recovery: %s", got)
+	}
+	if got, err := h.runGit(context.Background(), gateDir, "rev-parse", "refs/heads/feature/rebase-recover"); err != nil || strings.TrimSpace(string(got)) != submitted {
+		t.Fatalf("unpublished gate branch = %s (err %v), want submitted head %s", got, err, submitted)
 	}
 	// The masking condition, asserted against the real gate: the rebase left
 	// neither head an ancestor of the other.
@@ -869,6 +989,58 @@ func TestAxiPrePushAbortUnmovedHeadCustodyJourney(t *testing.T) {
 }
 
 func operatorContext() context.Context { return context.Background() }
+
+// TestAxiRunSkipsRepositoryPrePushHookForLocalGate reproduces the launch hang
+// from a repository whose ordinary upstream pushes run a substantial pre-push
+// gate. The no-mistakes push is only the control-plane trigger for the real
+// validation pipeline, so invoking that repository hook here can block before
+// the gate's post-receive hook registers any run.
+func TestAxiRunSkipsRepositoryPrePushHookForLocalGate(t *testing.T) {
+	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: axiScenario(t)})
+
+	h.CommitChange("init-pre-push", "seed.txt", "seed\n", "seed for pre-push init")
+	initWorktree := h.AddWorktree("init-pre-push")
+	if out, err := h.RunInDir(initWorktree, "init"); err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+
+	h.CommitChange("feature/pre-push", "feature.txt", "change\n", "add pre-push feature")
+	operator := h.AddWorktree("feature/pre-push")
+	hookDir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "pre-push-ran")
+	hook := "#!/bin/sh\nprintf 'invoked\\n' > \"$NM_E2E_PRE_PUSH_MARKER\"\nexit 97\n"
+	if err := os.WriteFile(filepath.Join(hookDir, "pre-push"), []byte(hook), 0o755); err != nil {
+		t.Fatalf("write pre-push hook: %v", err)
+	}
+	if out, err := h.runGit(context.Background(), operator, "config", "core.hooksPath", hookDir); err != nil {
+		t.Fatalf("configure pre-push hook: %v\n%s", err, out)
+	}
+
+	tracePath := filepath.Join(t.TempDir(), "git-trace.json")
+	out, err := h.RunInDirWithEnv(operator, map[string]string{
+		"GIT_TRACE2_EVENT":       tracePath,
+		"NM_E2E_PRE_PUSH_MARKER": marker,
+	}, "axi", "run", "--intent", "validate without duplicating the repository pre-push gate")
+	if err != nil {
+		t.Fatalf("axi run was blocked by the repository pre-push hook: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "gate:") {
+		t.Fatalf("axi run did not begin the pipeline:\n%s", out)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("repository pre-push hook ran for the local gate push (stat error %v)", err)
+	}
+	trace, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatalf("read git trace: %v", err)
+	}
+	if !strings.Contains(string(trace), `"--no-verify"`) {
+		t.Fatalf("local gate push did not bypass repository hooks:\n%s", trace)
+	}
+	if active := h.ActiveRun("feature/pre-push"); active == nil {
+		t.Fatal("axi run returned without registering the pipeline run")
+	}
+}
 
 func TestAxiAgentJourney(t *testing.T) {
 	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: axiScenario(t)})
@@ -1188,14 +1360,14 @@ func TestAxiRunPreflightGuards(t *testing.T) {
 		t.Fatalf("nm init: %v\n%s", err, out)
 	}
 
-	// Missing --intent on a feature branch.
+	// Missing explicit intent on a feature branch.
 	h.CommitChange("feature/needs-intent", "a.txt", "a\n", "add a")
 	niw := h.AddWorktree("feature/needs-intent")
 	out, err := h.RunInDir(niw, "axi", "run")
 	if err == nil {
-		t.Errorf("axi run without --intent should fail; output:\n%s", out)
+		t.Errorf("axi run without explicit intent should fail; output:\n%s", out)
 	}
-	if !strings.Contains(out, "--intent is required") {
+	if !strings.Contains(out, "--intent or --intent-file is required") {
 		t.Errorf("missing-intent error not surfaced; output:\n%s", out)
 	}
 

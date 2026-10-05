@@ -7,8 +7,11 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/kunchenguid/no-mistakes/internal/agentcfg"
 	"github.com/kunchenguid/no-mistakes/internal/buildinfo"
+	"github.com/kunchenguid/no-mistakes/internal/closingissues"
 	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/kunchenguid/no-mistakes/internal/verificationplan"
 )
 
 // Run represents a pipeline run.
@@ -82,16 +85,33 @@ type Run struct {
 	// It is set by the operator (axi run --base-branch) and takes precedence
 	// over pr.base_branch in repo config for this run only.
 	PRBaseBranch *string
-	CreatedAt    int64
-	UpdatedAt    int64
+	// OmitIntent records the caller-side, tighten-only decision to keep the
+	// generated Intent section out of the PR body for this run. It is the
+	// OR of the per-run flag and the operator's global intent.publish_intent
+	// default, resolved once at run start. It can only reduce publication:
+	// the repository's trusted pr.publish_intent is enforced independently
+	// by the PR step.
+	OmitIntent bool
+	// PiProfile is immutable launch selection; nil retains legacy live config.
+	PiProfile        *agentcfg.PiProfile
+	VerificationPlan *verificationplan.Snapshot
+	// ClosingIssueRefs are the explicit issues (axi run --closes) the generated
+	// PR should close, canonicalized by internal/closingissues.
+	ClosingIssueRefs []string
+	// ClosingIssueRefsLockedAt is non-nil once a PR body composition has sampled
+	// ClosingIssueRefs, after which a reattach can no longer add to them.
+	ClosingIssueRefsLockedAt *int64
+	CreatedAt                int64
+	UpdatedAt                int64
 }
 
-const runColumns = `id, repo_id, branch, head_sha, base_sha, worktree_dir, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, launch_nonce, launch_validation_generation, launch_intent_digest, launch_receipt_claimed_at, pr_base_branch, created_at, updated_at`
+const runColumns = `id, repo_id, branch, head_sha, base_sha, worktree_dir, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, launch_nonce, launch_validation_generation, launch_intent_digest, launch_receipt_claimed_at, pr_base_branch, COALESCE(omit_intent, 0), pi_profile, verification_plan, closing_issue_refs, closing_issue_refs_locked_at, created_at, updated_at`
 
 func scanRun(row interface {
 	Scan(...any) error
 }, r *Run) error {
-	return row.Scan(
+	var storedClosingIssues sql.NullString
+	err := row.Scan(
 		&r.ID, &r.RepoID, &r.Branch, &r.HeadSHA, &r.BaseSHA, &r.WorktreeDir, &r.SubmittedHeadSHA, &r.NoMistakesVersion, &r.NoMistakesBuildSHA, &r.ReviewApprovedHeadSHA, &r.Status,
 		&r.PRURL, &r.PRState, &r.PRStateObservedAt, &r.CIReadyAt, &r.CIReadyNoCI,
 		&r.LastPushedSHA, &r.PushTargetKind, &r.PushTargetFingerprint, &r.PushRef,
@@ -99,9 +119,18 @@ func scanRun(row interface {
 		&r.CustodyReturnedAt, &r.Error, &r.AwaitingAgentSince, &r.ParkedMS,
 		&r.Intent, &r.IntentSource, &r.IntentSessionID, &r.IntentScore,
 		&r.LaunchNonce, &r.LaunchValidationGeneration, &r.LaunchIntentDigest, &r.LaunchReceiptClaimedAt,
-		&r.PRBaseBranch,
+		&r.PRBaseBranch, &r.OmitIntent, &r.PiProfile, &r.VerificationPlan,
+		&storedClosingIssues, &r.ClosingIssueRefsLockedAt,
 		&r.CreatedAt, &r.UpdatedAt,
 	)
+	if err != nil {
+		return err
+	}
+	r.ClosingIssueRefs, err = closingissues.Decode(storedClosingIssues.String)
+	if err != nil {
+		return fmt.Errorf("decode run closing issue references: %w", err)
+	}
+	return nil
 }
 
 // WorktreePath returns the recorded worktree directory of this run, or "" for
@@ -120,13 +149,18 @@ func (d *DB) InsertRun(repoID, branch, headSHA, baseSHA string) (*Run, error) {
 }
 
 func (d *DB) InsertRunWithIntent(repoID, branch, headSHA, baseSHA string, intent *RunIntent, prBaseBranch string) (*Run, error) {
-	return d.InsertRunWithIntentAndLaunchNonce(repoID, branch, headSHA, baseSHA, intent, "", "", "", prBaseBranch)
+	return d.InsertRunWithIntentAndLaunchNonce(repoID, branch, headSHA, baseSHA, intent, "", "", "", prBaseBranch, false, nil)
 }
 
-// InsertRunWithIntentAndLaunchNonce persists an optional proof binding. The
-// partial unique index remains the duplicate defense across daemon processes;
-// callers additionally serialize selection under their branch lock.
-func (d *DB) InsertRunWithIntentAndLaunchNonce(repoID, branch, headSHA, baseSHA string, intent *RunIntent, launchNonce, validationGeneration, intentDigest, prBaseBranch string) (*Run, error) {
+// InsertRunWithIntentAndLaunchNonce persists an optional proof binding and the
+// caller-side omit-intent decision. The partial unique index remains the
+// duplicate defense across daemon processes; callers additionally serialize
+// selection under their branch lock.
+func (d *DB) InsertRunWithIntentAndLaunchNonce(repoID, branch, headSHA, baseSHA string, intent *RunIntent, launchNonce, validationGeneration, intentDigest, prBaseBranch string, omitIntent bool, plan *verificationplan.Snapshot, profiles ...*agentcfg.PiProfile) (*Run, error) {
+	pin := agentcfg.OptionalPiProfile(profiles)
+	if err := pin.Validate(); err != nil {
+		return nil, err
+	}
 	ts := now()
 	version := buildinfo.CurrentVersion()
 	buildSHA := buildinfo.Commit
@@ -139,9 +173,14 @@ func (d *DB) InsertRunWithIntentAndLaunchNonce(repoID, branch, headSHA, baseSHA 
 		SubmittedHeadSHA:   &headSHA,
 		NoMistakesVersion:  &version,
 		NoMistakesBuildSHA: &buildSHA,
+		PiProfile:          pin,
 		Status:             types.RunPending,
 		CreatedAt:          ts,
 		UpdatedAt:          ts,
+	}
+	if plan != nil {
+		r.ID = plan.ID
+		r.VerificationPlan = plan
 	}
 	if launchNonce != "" {
 		r.LaunchNonce = &launchNonce
@@ -158,9 +197,10 @@ func (d *DB) InsertRunWithIntentAndLaunchNonce(repoID, branch, headSHA, baseSHA 
 	if prBaseBranch != "" {
 		r.PRBaseBranch = &prBaseBranch
 	}
+	r.OmitIntent = omitIntent
 	_, err := d.sql.Exec(
-		`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, status, pr_state, intent, intent_source, intent_session_id, intent_score, launch_nonce, launch_validation_generation, launch_intent_digest, pr_base_branch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.RepoID, r.Branch, r.HeadSHA, r.BaseSHA, headSHA, r.NoMistakesVersion, r.NoMistakesBuildSHA, r.Status, r.Intent, r.IntentSource, r.IntentSessionID, r.IntentScore, r.LaunchNonce, r.LaunchValidationGeneration, r.LaunchIntentDigest, r.PRBaseBranch, r.CreatedAt, r.UpdatedAt,
+		`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, status, pr_state, intent, intent_source, intent_session_id, intent_score, launch_nonce, launch_validation_generation, launch_intent_digest, pr_base_branch, omit_intent, pi_profile, verification_plan, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.RepoID, r.Branch, r.HeadSHA, r.BaseSHA, headSHA, r.NoMistakesVersion, r.NoMistakesBuildSHA, r.Status, r.Intent, r.IntentSource, r.IntentSessionID, r.IntentScore, r.LaunchNonce, r.LaunchValidationGeneration, r.LaunchIntentDigest, r.PRBaseBranch, r.OmitIntent, r.PiProfile, r.VerificationPlan, r.CreatedAt, r.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert run: %w", err)
@@ -323,7 +363,15 @@ func (d *DB) GetRunByLaunchNonce(repoID, branch, launchNonce string) (*Run, erro
 // this caller is its first observer. The expected immutable receipt binding,
 // including an explicit PR base branch, is part of the UPDATE predicate, so a
 // conflicting observer cannot consume `created`.
-func (d *DB) ClaimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch string) (*Run, bool, error) {
+func (d *DB) ClaimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch string, omitIntent bool, profiles ...*agentcfg.PiProfile) (*Run, bool, error) {
+	request := agentcfg.OptionalPiProfile(profiles)
+	if err := request.ValidateRequest(); err != nil {
+		return nil, false, err
+	}
+	model, effort := "", ""
+	if request != nil {
+		model, effort = request.Model, string(request.Effort)
+	}
 	prBaseBranch = strings.TrimSpace(prBaseBranch)
 	for {
 		r := &Run{}
@@ -332,9 +380,12 @@ func (d *DB) ClaimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, v
 			 WHERE repo_id = ? AND branch = ? AND launch_nonce = ?
 			   AND submitted_head_sha = ? AND launch_validation_generation = ? AND launch_intent_digest = ?
 			   AND (? = '' OR pr_base_branch = ?)
+			   AND (? = 0 OR omit_intent = ?)
+			   AND (? = '' OR json_extract(pi_profile, '$.model') = ?)
+			   AND (? = '' OR json_extract(pi_profile, '$.effort') = ?)
 			   AND launch_receipt_claimed_at IS NULL
 			 RETURNING `+runColumns,
-			now(), repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, prBaseBranch,
+			now(), repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, prBaseBranch, omitIntent, omitIntent, model, model, effort, effort,
 		), r)
 		if err == nil {
 			return r, true, nil
@@ -346,11 +397,12 @@ func (d *DB) ClaimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, v
 		if err != nil {
 			return nil, false, err
 		}
-		if r == nil || r.LaunchReceiptClaimedAt != nil ||
+		if r == nil || !r.PiProfile.Matches(request) || r.LaunchReceiptClaimedAt != nil ||
 			r.SubmittedHeadSHA == nil || *r.SubmittedHeadSHA != submittedHeadSHA ||
 			r.LaunchValidationGeneration == nil || *r.LaunchValidationGeneration != validationGeneration ||
 			r.LaunchIntentDigest == nil || *r.LaunchIntentDigest != intentDigest ||
-			prBaseBranch != "" && (r.PRBaseBranch == nil || *r.PRBaseBranch != prBaseBranch) {
+			prBaseBranch != "" && (r.PRBaseBranch == nil || *r.PRBaseBranch != prBaseBranch) ||
+			omitIntent && !r.OmitIntent {
 			return r, false, nil
 		}
 		// A creator committed a matching row after UPDATE missed. Retry instead
@@ -507,6 +559,60 @@ func (d *DB) UpdateRunPublication(id string, binding PushBinding) error {
 	return nil
 }
 
+// PushRebind is the exact verified state a rewritten-remote recovery may
+// rebind from and the live head it rebinds to. UpstreamURL and ForkURL are the
+// repo target the live head was verified against.
+type PushRebind struct {
+	Status             types.RunStatus
+	ExpectedPushed     string
+	ExpectedGeneration int64
+	ExpectedHead       string
+	PRState            *string
+	CustodyReturned    bool
+	UpstreamURL        string
+	ForkURL            string
+	TargetKind         string
+	TargetFingerprint  string
+	Ref                string
+	Head               string
+}
+
+// RebindRunPushedHead moves a terminal run's push binding to a head the
+// configured target was verified to hold after a rewrite outside the pipeline.
+// It is a single compare-and-swap over the exact binding and repo target the
+// caller verified (run status, pushed head, generation, recorded run head and
+// custody state, target kind,
+// fingerprint, ref, no active push, no retired PR, no other non-terminal run
+// on the same repo branch, and the repo's current upstream and fork URLs) and
+// reports whether it applied. head_sha follows only
+// when it equalled the old binding, so a custody-returned run keeps its own
+// recorded head.
+func (d *DB) RebindRunPushedHead(id string, rebind PushRebind) (bool, error) {
+	result, err := d.sql.Exec(
+		`UPDATE runs SET head_sha = CASE WHEN head_sha = last_pushed_sha THEN ? ELSE head_sha END, last_pushed_sha = ?, push_generation = COALESCE(push_generation, 0) + 1, updated_at = ?
+		WHERE id = ? AND status = ? AND last_pushed_sha = ? AND COALESCE(push_generation, 0) = ?
+			AND head_sha = ? AND (custody_returned_at IS NOT NULL) = ?
+			AND push_target_kind = ? AND push_target_fingerprint = ? AND push_ref = ? AND COALESCE(push_active, 0) = 0
+			AND pr_state IS ? AND COALESCE(pr_state, '') NOT IN ('merged', 'closed')
+			AND NOT EXISTS (SELECT 1 FROM runs other WHERE other.repo_id = runs.repo_id AND other.branch = runs.branch AND other.id <> runs.id
+				AND other.status NOT IN (?, ?, ?, ?))
+			AND EXISTS (SELECT 1 FROM repos WHERE repos.id = runs.repo_id AND repos.upstream_url = ? AND COALESCE(repos.fork_url, '') = ?)`,
+		rebind.Head, rebind.Head, now(), id, string(rebind.Status), rebind.ExpectedPushed, rebind.ExpectedGeneration,
+		rebind.ExpectedHead, rebind.CustodyReturned,
+		rebind.TargetKind, rebind.TargetFingerprint, rebind.Ref, rebind.PRState,
+		string(types.RunCompleted), string(types.RunFailed), string(types.RunCancelled), string(types.RunCIMonitorInterrupted),
+		rebind.UpstreamURL, rebind.ForkURL,
+	)
+	if err != nil {
+		return false, fmt.Errorf("rebind run pushed head: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("rebind run pushed head: %w", err)
+	}
+	return affected == 1, nil
+}
+
 // SetRunCustodyReturned stamps the moment a guarded recovery explicitly
 // returned custody of this run's branch to the operator worktree. Stamping is
 // idempotent: the first timestamp wins so the record keeps the original
@@ -532,32 +638,6 @@ func (d *DB) SetRunsCustodyReturned(ids []string) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("set runs custody returned: commit: %w", err)
-	}
-	return nil
-}
-
-// ReleaseRunPushBindingAndCustody retires a terminal run's claim on its branch
-// in one transaction: the successful-push provenance that made the run the
-// branch's binding owner is cleared, and custody is stamped as returned to the
-// operator. It never touches head_sha, submitted_head_sha, terminal head
-// evidence, or any Git ref - the run's own history stays readable, only its
-// live claim on the branch is withdrawn. Callers must have proven the run is
-// terminal and holds no in-flight push first; this function does not re-check.
-//
-// Clearing last_pushed_sha is what makes the release real rather than
-// cosmetic: branchsync selects and classifies a branch from that column, and
-// steps.lastKnownBranchTip uses it as the force-with-lease fast path. Dropping
-// it removes a fast path only - resolveForcePushDecision then runs the full
-// remoteCommitsNotIncorporated analysis - so a later run fails closed rather
-// than trusting a binding the operator has declared stale.
-func (d *DB) ReleaseRunPushBindingAndCustody(id string) error {
-	ts := now()
-	_, err := d.sql.Exec(
-		`UPDATE runs SET last_pushed_sha = NULL, last_pushed_at = NULL, push_target_kind = NULL, push_target_fingerprint = NULL, push_ref = NULL, push_active = 0, custody_returned_at = COALESCE(custody_returned_at, ?), updated_at = ? WHERE id = ?`,
-		ts, ts, id,
-	)
-	if err != nil {
-		return fmt.Errorf("release run push binding and custody: %w", err)
 	}
 	return nil
 }
@@ -705,52 +785,17 @@ func (d *DB) SetRunCIReady(id string, ready bool) error {
 }
 
 func (d *DB) SetRunCIReadyWithReason(id string, ready, declaredNoCI bool) error {
-	return setRunCIReadyWithReason(d.sql, id, ready, declaredNoCI, now())
-}
-
-func (d *DB) SetRunCIReadyAndClearStepOverride(runID, stepID string, declaredNoCI bool) error {
-	tx, err := d.sql.Begin()
-	if err != nil {
-		return fmt.Errorf("begin green CI readiness update: %w", err)
-	}
-	defer tx.Rollback()
-
-	if err := setRunCIReadyWithReason(tx, runID, true, declaredNoCI, now()); err != nil {
-		return err
-	}
-	result, err := tx.Exec(`UPDATE step_results SET override_reason = NULL WHERE id = ? AND run_id = ?`, stepID, runID)
-	if err != nil {
-		return fmt.Errorf("clear step override for green CI: %w", err)
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("clear step override for green CI rows affected: %w", err)
-	}
-	if rows != 1 {
-		return fmt.Errorf("clear step override for green CI: updated %d rows", rows)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit green CI readiness update: %w", err)
-	}
-	return nil
-}
-
-type ciReadinessExecer interface {
-	Exec(query string, args ...any) (sql.Result, error)
-}
-
-func setRunCIReadyWithReason(execer ciReadinessExecer, id string, ready, declaredNoCI bool, ts int64) error {
 	readyValue := 0
 	declaredValue := 0
 	var readyAt any
 	if ready {
 		readyValue = 1
-		readyAt = ts
+		readyAt = now()
 		if declaredNoCI {
 			declaredValue = 1
 		}
 	}
-	_, err := execer.Exec(`UPDATE runs SET ci_ready_at = ?, ci_ready_no_ci = ?, updated_at = ? WHERE id = ? AND ((ci_ready_at IS NULL AND ? = 1) OR (ci_ready_at IS NOT NULL AND ? = 0) OR (COALESCE(ci_ready_no_ci, 0) != ?))`, readyAt, declaredValue, ts, id, readyValue, readyValue, declaredValue)
+	_, err := d.sql.Exec(`UPDATE runs SET ci_ready_at = ?, ci_ready_no_ci = ?, updated_at = ? WHERE id = ? AND ((ci_ready_at IS NULL AND ? = 1) OR (ci_ready_at IS NOT NULL AND ? = 0) OR (COALESCE(ci_ready_no_ci, 0) != ?))`, readyAt, declaredValue, now(), id, readyValue, readyValue, declaredValue)
 	if err != nil {
 		return fmt.Errorf("set run CI ready: %w", err)
 	}
@@ -830,6 +875,16 @@ func (d *DB) UpdateRunStatusWithVerifiedHead(id string, status types.RunStatus, 
 	return nil
 }
 
+func (d *DB) VerifyTerminalRunHeadRewrite(id string, status types.RunStatus, recordedHead, liveHead string) (bool, error) {
+	ts := now()
+	result, err := d.sql.Exec(`UPDATE runs SET head_sha = ?, push_active = 0, terminal_head_verified_at = ?, updated_at = ? WHERE id = ? AND status = ? AND head_sha = ? AND review_approved_head_sha = ? AND terminal_head_verified_at IS NULL AND custody_returned_at IS NULL`, liveHead, ts, ts, id, status, recordedHead, recordedHead)
+	if err != nil {
+		return false, fmt.Errorf("verify terminal run head rewrite: %w", err)
+	}
+	updated, err := result.RowsAffected()
+	return updated == 1, err
+}
+
 // RecordRunTerminalHeadEvidence records a managed worktree head that was
 // verified immediately before crash recovery makes the run terminal. The
 // subsequent stale-run status transition deliberately preserves this stamp.
@@ -878,6 +933,170 @@ func (d *DB) UpdateRunIntent(id string, intent RunIntent) error {
 		return fmt.Errorf("update run intent: %w", err)
 	}
 	return nil
+}
+
+// ErrClosingIssueRefsLocked reports that a PR body composition already sampled
+// a run's closing issue references, so a later update cannot reach the Issues section. It is
+// the fail-closed half of the claim protocol described on
+// ClaimClosingIssueRefsForPRBody: callers must surface it rather than treat the
+// write as applied.
+var ErrClosingIssueRefsLocked = errors.New("closing issue references already consumed by PR body composition")
+
+// UpdateRunClosingIssueRefs sets the canonical closing issue references on a
+// run record. The PR step renders them in its stable Issues section.
+//
+// The write is refused with ErrClosingIssueRefsLocked once the PR step has claimed
+// the value (closing_issue_refs_locked_at is non-NULL). Reporting success for a write
+// that can no longer change the PR body is the race this guard closes: the
+// reattach path in `axi run --closes` would otherwise tell the caller the link
+// was applied while the already-composed body shipped without it.
+func (d *DB) UpdateRunClosingIssueRefs(id string, refs []string) error {
+	encoded, err := closingissues.Encode(refs)
+	if err != nil {
+		return fmt.Errorf("update run closing issue references: %w", err)
+	}
+	var value any
+	if encoded != "" {
+		value = encoded
+	}
+	res, err := d.sql.Exec(
+		`UPDATE runs SET closing_issue_refs = ?, updated_at = ? WHERE id = ? AND closing_issue_refs_locked_at IS NULL`,
+		value, now(), id,
+	)
+	if err != nil {
+		return fmt.Errorf("update run closing issue references: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update run closing issue references: %w", err)
+	}
+	if affected > 0 {
+		return nil
+	}
+	// No row changed: either the run is gone or its closing issue references are locked.
+	// Distinguish the two so a missing run does not masquerade as a race.
+	var locked sql.NullInt64
+	switch err := d.sql.QueryRow(`SELECT closing_issue_refs_locked_at FROM runs WHERE id = ?`, id).Scan(&locked); {
+	case err == sql.ErrNoRows:
+		return fmt.Errorf("update run closing issue references: run not found: %s", id)
+	case err != nil:
+		return fmt.Errorf("update run closing issue references: %w", err)
+	case locked.Valid:
+		return ErrClosingIssueRefsLocked
+	default:
+		// The lock was released between the update and this read, which the
+		// claim protocol never does. Treat an unexplained no-op as a failure
+		// rather than reporting a write that did not happen.
+		return fmt.Errorf("update run closing issue references: no row updated for run %s", id)
+	}
+}
+
+// MergeRunClosingIssueRefs adds refs to an unclaimed run without dropping
+// values supplied when the run started or by an earlier reattachment.
+func (d *DB) MergeRunClosingIssueRefs(id string, refs []string) error {
+	incoming, err := closingissues.Normalize(refs)
+	if err != nil {
+		return fmt.Errorf("merge run closing issue references: %w", err)
+	}
+	if len(incoming) == 0 {
+		return nil
+	}
+
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("merge run closing issue references: %w", err)
+	}
+	defer tx.Rollback()
+
+	var storedRefs sql.NullString
+	var lockedAt sql.NullInt64
+	if err := tx.QueryRow(
+		`SELECT closing_issue_refs, closing_issue_refs_locked_at FROM runs WHERE id = ?`, id,
+	).Scan(&storedRefs, &lockedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("merge run closing issue references: run not found: %s", id)
+		}
+		return fmt.Errorf("merge run closing issue references: %w", err)
+	}
+	existing, err := closingissues.Decode(storedRefs.String)
+	if err != nil {
+		return fmt.Errorf("merge run closing issue references: %w", err)
+	}
+	if closingissues.Covers(existing, incoming) {
+		// Already recorded (for example at run creation from the same
+		// --closes values), so nothing can be missed even after the claim.
+		return nil
+	}
+	if lockedAt.Valid {
+		return ErrClosingIssueRefsLocked
+	}
+	encoded, err := closingissues.Encode(append(existing, incoming...))
+	if err != nil {
+		return fmt.Errorf("merge run closing issue references: %w", err)
+	}
+	res, err := tx.Exec(
+		`UPDATE runs SET closing_issue_refs = ?, updated_at = ? WHERE id = ? AND closing_issue_refs_locked_at IS NULL`,
+		encoded, now(), id,
+	)
+	if err != nil {
+		return fmt.Errorf("merge run closing issue references: %w", err)
+	}
+	if affected, err := res.RowsAffected(); err != nil {
+		return fmt.Errorf("merge run closing issue references: %w", err)
+	} else if affected == 0 {
+		return ErrClosingIssueRefsLocked
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("merge run closing issue references: %w", err)
+	}
+	return nil
+}
+
+// ClaimClosingIssueRefsForPRBody returns the run's closing issue references and
+// marks them as consumed by PR body composition in one transaction. After the claim, a
+// concurrent UpdateRunClosingIssueRefs fails with ErrClosingIssueRefsLocked instead of
+// silently landing too late to appear in the composed body.
+//
+// The claim is deliberately never released. A PR step that runs again (a
+// resume, or a later update of an existing PR) recomposes from the value it
+// already claimed, so refusing the late write stays correct; the caller is told
+// to edit the PR or start a fresh run rather than being told a link was added
+// that never appears.
+func (d *DB) ClaimClosingIssueRefsForPRBody(id string) ([]string, error) {
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("claim closing issue references: %w", err)
+	}
+	defer tx.Rollback()
+
+	var storedRefs sql.NullString
+	var lockedAt sql.NullInt64
+	err = tx.QueryRow(
+		`SELECT closing_issue_refs, closing_issue_refs_locked_at FROM runs WHERE id = ?`, id,
+	).Scan(&storedRefs, &lockedAt)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("claim closing issue references: run not found: %s", id)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claim closing issue references: %w", err)
+	}
+
+	if !lockedAt.Valid {
+		if _, err := tx.Exec(
+			`UPDATE runs SET closing_issue_refs_locked_at = ? WHERE id = ? AND closing_issue_refs_locked_at IS NULL`,
+			now(), id,
+		); err != nil {
+			return nil, fmt.Errorf("claim closing issue references: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("claim closing issue references: %w", err)
+	}
+	refs, err := closingissues.Decode(storedRefs.String)
+	if err != nil {
+		return nil, fmt.Errorf("claim closing issue references: %w", err)
+	}
+	return refs, nil
 }
 
 // SetRunAwaitingAgent marks a run as parked awaiting the driving agent,
@@ -1081,6 +1300,35 @@ func recoveryExclusionClause(preserved map[string]struct{}) (string, []any) {
 		args = append(args, id)
 	}
 	return " AND id NOT IN (" + strings.Join(placeholders, ", ") + ")", args
+}
+
+// GetRunGates returns the gate list pinned to a run at creation, or the empty
+// string for a run that pinned none. The payload is opaque here: config owns
+// its shape (config.MarshalGates/ParseGates), and the database only guarantees
+// that what was written survives a restart.
+func (d *DB) GetRunGates(id string) (string, error) {
+	var gates sql.NullString
+	err := d.sql.QueryRow(`SELECT gates_json FROM runs WHERE id = ?`, id).Scan(&gates)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get run gates: %w", err)
+	}
+	return gates.String, nil
+}
+
+// SetRunGates records the repository-declared gates this run executes. The
+// caller writes it once, at run creation, before the executor can record a
+// single step, so the run's step sequence is fixed from the moment anything can
+// observe it and stays fixed even if the trusted default branch's gates change
+// while the run is in flight.
+func (d *DB) SetRunGates(id, gates string) error {
+	_, err := d.sql.Exec(`UPDATE runs SET gates_json = ?, updated_at = ? WHERE id = ?`, gates, now(), id)
+	if err != nil {
+		return fmt.Errorf("set run gates: %w", err)
+	}
+	return nil
 }
 
 // GetRunCIRerunState returns the CI step's persisted rerun budget for a run, or

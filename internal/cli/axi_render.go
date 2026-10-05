@@ -8,10 +8,13 @@ import (
 
 	toon "github.com/toon-format/toon-go"
 
+	"github.com/kunchenguid/no-mistakes/internal/agentcfg"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline/steps"
 	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/kunchenguid/no-mistakes/internal/verificationplan"
 	"github.com/spf13/cobra"
 )
 
@@ -19,13 +22,12 @@ import (
 // can pin the clock when asserting how long a run has been parked.
 var nowUnix = func() int64 { return time.Now().Unix() }
 
-// maxFindingDesc caps a finding description rendered inline. Findings are the
-// decision content at a gate, so the limit is generous; only pathological
-// descriptions get truncated, with the full length disclosed.
-const (
-	maxFindingDesc = 600
-	maxGateSummary = 1200
-)
+// maxGateSummary bounds a step summary in default views. A Test, Lint, or
+// repository gate summary carries up to 64 KiB of command output whose complete
+// copy lives in the step log, so `axi logs --full` is the full-read path.
+// Finding descriptions are deliberately never bounded: they are the decision
+// content a driver must relay verbatim for ask-user findings.
+const maxGateSummary = 1200
 
 // Row types carry `toon` tags so the encoder renders a []row slice as a
 // tabular array (name[N]{cols}:) with one comma-delimited line per element.
@@ -103,7 +105,6 @@ type stepView struct {
 	AgentPID         *int
 	RoundCount       int
 	FixRoundCount    int
-	RoundTrigger     string
 	AutoFixLimit     int
 	PendingFixSource string
 	QuietWarning     time.Duration
@@ -112,13 +113,17 @@ type stepView struct {
 
 // runView is a render-ready view of a pipeline run.
 type runView struct {
-	ID          string
-	Branch      string
-	Status      string
-	HeadSHA     string
-	PRURL       string
-	CIReady     bool
-	CIReadyNoCI bool
+	FixProgress      *types.FixProgress
+	PartialWork      *types.PartialWork
+	PiProfile        *agentcfg.PiProfile
+	VerificationPlan *verificationplan.Snapshot
+	ID               string
+	Branch           string
+	Status           string
+	HeadSHA          string
+	PRURL            string
+	CIReady          bool
+	CIReadyNoCI      bool
 	// AwaitingAgentSince is the unix-seconds time the run parked at a gate
 	// awaiting the driving agent, or nil when the run is not parked. It powers
 	// the top-level parked signal in the run object.
@@ -128,11 +133,14 @@ type runView struct {
 	// live check (see pipeline.ApprovalOverrideVerifier). outcomeForRun uses
 	// it to keep a deliberate override from reading identically to a
 	// genuinely green run in agent-facing output.
-	CIOverrideReason string
+	CIOverrideReason   string
+	TestOverrideReason string
 }
 
 func runViewFromIPC(r *ipc.RunInfo) runView {
 	rv := runView{
+		FixProgress:        r.FixProgress,
+		PartialWork:        r.PartialWork,
 		ID:                 r.ID,
 		Branch:             r.Branch,
 		Status:             string(r.Status),
@@ -141,6 +149,9 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 		CIReadyNoCI:        r.CIReadyNoCI,
 		AwaitingAgentSince: r.AwaitingAgentSince,
 		CIOverrideReason:   r.CIOverrideReason,
+		TestOverrideReason: r.TestOverrideReason,
+		PiProfile:          r.PiProfile,
+		VerificationPlan:   r.VerificationPlan,
 	}
 	if r.PRURL != nil {
 		rv.PRURL = *r.PRURL
@@ -157,7 +168,6 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 			AgentPID:         s.AgentPID,
 			RoundCount:       s.RoundCount,
 			FixRoundCount:    s.FixRoundCount,
-			RoundTrigger:     s.RoundTrigger,
 			AutoFixLimit:     s.AutoFixLimit,
 			PendingFixSource: s.PendingFixSource,
 			WorkScope:        s.WorkScope,
@@ -179,11 +189,17 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 
 func runViewFromDB(r *db.Run, steps []*db.StepResult, database *db.DB) runView {
 	rv := runView{
+		PiProfile:          r.PiProfile,
+		VerificationPlan:   r.VerificationPlan,
 		ID:                 r.ID,
 		Branch:             r.Branch,
 		Status:             string(r.Status),
 		HeadSHA:            r.HeadSHA,
 		AwaitingAgentSince: r.AwaitingAgentSince,
+	}
+	if database != nil {
+		rv.PartialWork = database.WorkRescueStatus(r.ID)
+		rv.FixProgress, _ = database.FixProgress(r.ID)
 	}
 	if r.PRURL != nil {
 		rv.PRURL = *r.PRURL
@@ -218,11 +234,13 @@ func runViewFromDB(r *db.Run, steps []*db.StepResult, database *db.DB) runView {
 		if s.FindingsJSON != nil {
 			sv.FindingsJSON = *s.FindingsJSON
 		}
-		// Mirror executor.runOverrideReason / RunInfo.CIOverrideReason: the run's
-		// override reason is the first step that recorded one. Without this the
-		// DB-backed status path reads a passed-with-override run as a plain pass,
-		// disagreeing with the live IPC path and outcomeForRun.
-		if rv.CIOverrideReason == "" && s.OverrideReason != nil && *s.OverrideReason != "" {
+		if reason := s.TestOverrideReason(); reason != "" {
+			rv.TestOverrideReason = reason
+		}
+		// Mirror executor.ciOverrideReason / RunInfo.CIOverrideReason. Without
+		// this the DB-backed status path reads a CI passed-with-override run as a
+		// plain pass, disagreeing with the live IPC path and outcomeForRun.
+		if s.StepName == types.StepCI && rv.CIOverrideReason == "" && s.OverrideReason != nil && *s.OverrideReason != "" {
 			rv.CIOverrideReason = *s.OverrideReason
 		}
 		rv.Steps = append(rv.Steps, sv)
@@ -324,11 +342,15 @@ func (rv runView) findingsTally() string {
 
 // fixRows flattens fix-attempt summaries in step then round order. Dispatching
 // a fix round does not prove a change was applied; legacy empty summaries
-// must not manufacture that claim.
+// must not manufacture that claim, and a round that changed nothing is not a
+// fix at all.
 func (rv runView) fixRows() []fixRow {
 	var rows []fixRow
 	for _, s := range rv.Steps {
 		for _, summary := range s.FixSummaries {
+			if summary == steps.NoChangesAppliedSummary {
+				continue
+			}
 			if summary == "" {
 				summary = "fix attempted (no result recorded)"
 			}
@@ -397,16 +419,6 @@ func (s stepView) agentPIDString() string {
 }
 
 func (s stepView) roundSummary() string {
-	// A round triggered by the final head moving is not an ordinary repeat:
-	// naming it keeps "why is this step running again" answerable from axi
-	// status alone. Review restarts when the advance touched code;
-	// Test restarts when it was documentation and records only.
-	if s.Name == string(types.StepReview) && s.RoundTrigger == string(pipeline.RestartReasonFinalHeadRereview) {
-		return fmt.Sprintf("final_head_rereview %d", s.RoundCount)
-	}
-	if s.Name == string(types.StepTest) && s.RoundTrigger == string(pipeline.RestartReasonDocumentationHeadRecheck) {
-		return fmt.Sprintf("documentation_head_recheck %d", s.RoundCount)
-	}
 	if s.Status == string(types.StepStatusFixing) {
 		attempt := s.FixRoundCount
 		if s.PendingFixSource != "" {
@@ -482,6 +494,43 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 	}
 	fields = append(fields, toon.Field{Key: "head", Value: shortSHA(rv.HeadSHA)})
 	fields = append(fields, toon.Field{Key: "head_sha", Value: rv.HeadSHA})
+	if p := rv.FixProgress; p != nil {
+		fields = append(fields, toon.Field{Key: "fix_progress", Value: toon.NewObject(
+			toon.Field{Key: "applied", Value: p.Applied}, toon.Field{Key: "total", Value: p.Total}, toon.Field{Key: "current", Value: p.Current}, toon.Field{Key: "saved_head", Value: p.SavedHead}, toon.Field{Key: "validation_pending", Value: p.ValidationPending},
+		)})
+	}
+	if p := rv.PartialWork; p != nil {
+		fields = append(fields, toon.Field{Key: "partial_work", Value: toon.NewObject(
+			toon.Field{Key: "state", Value: p.State},
+			toon.Field{Key: "ref", Value: p.Ref},
+			toon.Field{Key: "sha", Value: p.SHA},
+			toon.Field{Key: "parent_head", Value: p.ParentHead},
+			toon.Field{Key: "source_run", Value: p.RunID},
+			toon.Field{Key: "consumed_by", Value: p.ConsumedBy},
+			toon.Field{Key: "consumption_completed", Value: p.ConsumptionCompleted},
+			toon.Field{Key: "path", Value: p.Path},
+			toon.Field{Key: "reason", Value: p.Reason},
+		)})
+	}
+	if rv.TestOverrideReason != "" {
+		fields = append(fields, toon.Field{Key: "test_override_reason", Value: rv.TestOverrideReason})
+	}
+	if p := rv.VerificationPlan; p != nil {
+		fields = append(fields, toon.Field{Key: "verification_plan", Value: toon.NewObject(
+			toon.Field{Key: "path", Value: p.Path},
+			toon.Field{Key: "sha256", Value: p.SHA256},
+			toon.Field{Key: "source_path", Value: p.SourcePath},
+			toon.Field{Key: "captured_at", Value: p.CapturedAt},
+		)})
+	} else {
+		fields = append(fields, toon.Field{Key: "verification_plan", Value: "none"})
+	}
+	if rv.PiProfile != nil {
+		fields = append(fields, toon.Field{Key: "pi_profile", Value: toon.NewObject(
+			toon.Field{Key: "model", Value: rv.PiProfile.Model},
+			toon.Field{Key: "effort", Value: string(rv.PiProfile.Effort)},
+		)})
+	}
 	if rv.PRURL != "" {
 		fields = append(fields, toon.Field{Key: "pr", Value: rv.PRURL})
 	}
@@ -526,15 +575,42 @@ func gateFields(gate stepView) []toon.Field {
 		"Run `no-mistakes axi respond --action approve` to accept this step and continue",
 		"Run `no-mistakes axi respond --action fix --findings <ids>` to have the pipeline fix the selected findings (do not edit files yourself)",
 	}
+	// A review parked in waiting-on-answers is not asking for a verdict: its
+	// reviewer asked questions and cannot finish without them. Approving or
+	// fixing would discard the pass it paused, so answering leads the help.
+	// Keyed on the shared predicate, the same one the two auto-resolve paths
+	// read, rather than on a second rendering of the questions: each open
+	// question is already a finding in the rows below, carrying its id and the
+	// options the reviewer stated.
+	if pipeline.HasUnansweredReviewQuestion(gate.FindingsJSON) {
+		help = append([]string{
+			"This review is waiting on answers to the question(s) its reviewer asked; each is a `question-<id>` finding below. Answer each with `no-mistakes axi answer --question <id> --answer \"<one of its options>\"` and the same reviewer resumes and finishes its pass; the answer that closes the last one blocks like `axi respond` and returns the next gate or outcome",
+			"Do not approve or fix to get past a review question: that throws away the paused review pass instead of answering it",
+		}, help...)
+	}
 	if pipeline.HasProtectedPathRefusal(gate.FindingsJSON) {
 		help = []string{
 			"Protected-path refusals require an explicit operator response; Approve is rejected.",
 			"Have the operator inspect and resolve the reported protected-path edit through the repository's authorized workflow, then run `no-mistakes axi respond --action fix` to retry the refused step, including its commit and publication.",
 		}
 	}
+	skip := "Run `no-mistakes axi respond --action skip` to skip this step"
+	if pipeline.HasFixSizingRefusal(gate.FindingsJSON) {
+		help = []string{
+			"The fixer was not launched because its estimate exceeded the invocation deadline after a safety margin. Completed correction commits and outstanding findings are preserved.",
+			"Inspect the finding's scope or adjust the existing invocation budget, then explicitly retry with `no-mistakes axi respond --action fix --findings <original finding ids>`. No cause is automatically decomposed or retried.",
+		}
+	}
+	if pipeline.HasUnvalidatedWorkRefusal(gate.FindingsJSON) {
+		help = []string{
+			"Approve is rejected: the run worktree holds work a timed-out Test agent left that no Test turn validated, and approval would publish it. The findings name that work and how to inspect it.",
+			"Run `no-mistakes axi respond --action fix --findings <ids>` to validate that work (do not edit files yourself), or `no-mistakes axi abort` to stop the run",
+		}
+		skip = "Do not skip this step: the steps after Test would commit and publish the unvalidated work, so skipping needs the operator's explicit decision"
+	}
 	return gateFieldsWithHelp(gate, append(help,
-		"Run `no-mistakes axi respond --action skip` to skip this step",
-		fmt.Sprintf("Run `%s` to read the full step log", axiLogsFullCommand(gate.Name, "")),
+		skip,
+		fmt.Sprintf("Run `%s` to read the complete step summary and log", axiLogsFullCommand(gate.Name, "")),
 		"A long-running call is working, not stalled - background it if your harness needs to, but the run never advances past a gate on its own. Read every return; on a `gate:`, respond; loop until an `outcome:`.",
 		preserveGateFixCommitsGuidance,
 	))
@@ -543,7 +619,7 @@ func gateFields(gate stepView) []toon.Field {
 func inspectionOnlyGateFields(gate stepView, runID string) []toon.Field {
 	return gateFieldsWithHelp(gate, []string{
 		fmt.Sprintf("The explicitly selected gate for run %s is inspection-only; no run-scoped response command exists", runID),
-		fmt.Sprintf("Run `%s` to read the full step log", axiLogsFullCommand(gate.Name, runID)),
+		fmt.Sprintf("Run `%s` to read the complete step summary and log", axiLogsFullCommand(gate.Name, runID)),
 	})
 }
 
@@ -559,31 +635,61 @@ func gateFieldsWithHelp(gate stepView, help []string) []toon.Field {
 	if parsed.RiskLevel != "" {
 		gfields = append(gfields, toon.Field{Key: "risk", Value: parsed.RiskLevel})
 	}
-	if gate.RoundTrigger == string(pipeline.RestartReasonFinalHeadRereview) || gate.RoundTrigger == string(pipeline.RestartReasonDocumentationHeadRecheck) {
-		gfields = append(gfields, toon.Field{Key: "reason", Value: gate.RoundTrigger})
-	}
 	// Point-of-use reminder at the review gate: review auto-fix defaults to
 	// disabled, so agents should expect blocking and ask-user findings to park
 	// unless config explicitly opts back in.
 	if gate.Name == string(types.StepReview) {
 		gfields = append(gfields, toon.Field{Key: "note", Value: "Review auto-fix is disabled by default (`auto_fix.review: 0`; a repo or global `auto_fix.review > 0` override re-enables it), so blocking and ask-user review findings park for your decision rather than being silently self-fixed."})
 	}
-	rows := make([]findingRow, 0, len(parsed.Items))
-	for _, f := range parsed.Items {
-		rows = append(rows, findingRow{
-			ID:          f.ID,
-			Severity:    f.Severity,
-			File:        f.File,
-			Action:      f.Action,
-			Description: truncate(f.Description, maxFindingDesc),
-		})
-	}
-	gfields = append(gfields, toon.Field{Key: "findings", Value: rows})
+	gfields = append(gfields, toon.Field{Key: "findings", Value: findingRows(parsed.Items)})
 
 	return []toon.Field{
 		{Key: "gate", Value: toon.NewObject(gfields...)},
 		{Key: "help", Value: help},
 	}
+}
+
+func findingRows(items []types.Finding) []findingRow {
+	rows := make([]findingRow, 0, len(items))
+	for _, f := range items {
+		rows = append(rows, findingRow{
+			ID:          f.ID,
+			Severity:    f.Severity,
+			File:        f.File,
+			Action:      f.Action,
+			Description: f.Description,
+		})
+	}
+	return rows
+}
+
+// recordedFindingsFields renders a step's persisted summary and findings for
+// `axi logs`, which keeps them readable after the gate resolves and for any
+// explicitly selected run. It reports whether the summary was bounded.
+// Unparseable findings surface as a findings_error field rather than vanishing,
+// so a damaged record does not read as a step that recorded nothing.
+func recordedFindingsFields(findingsJSON string, full bool) ([]toon.Field, bool) {
+	if findingsJSON == "" {
+		return nil, false
+	}
+	parsed, err := types.ParseFindingsJSON(findingsJSON)
+	if err != nil {
+		return []toon.Field{{Key: "findings_error", Value: fmt.Sprintf("recorded findings could not be parsed: %v", err)}}, false
+	}
+	var fields []toon.Field
+	bounded := false
+	if parsed.Summary != "" {
+		summary := parsed.Summary
+		if !full {
+			summary = truncate(summary, maxGateSummary)
+			bounded = summary != parsed.Summary
+		}
+		fields = append(fields, toon.Field{Key: "summary", Value: summary})
+	}
+	if len(parsed.Items) > 0 {
+		fields = append(fields, toon.Field{Key: "findings", Value: findingRows(parsed.Items)})
+	}
+	return fields, bounded
 }
 
 func axiLogsFullCommand(step, runID string) string {

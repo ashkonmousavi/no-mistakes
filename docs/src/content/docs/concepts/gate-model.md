@@ -57,7 +57,7 @@ That is a core design choice, not an implementation detail.
 3. Git writes an admitted push into the local bare gate repo.
 4. The gate repo's `post-receive` hook notifies the daemon.
 5. The daemon creates a detached worktree for this run.
-6. The pipeline runs in order: `intent -> rebase -> review -> test -> document -> lint -> push -> pr -> ci`.
+6. The nine core steps run in order: `intent -> rebase -> review -> test -> document -> lint -> push -> pr -> ci`. Repository gates, when configured, run immediately after their anchors.
 7. If a step pauses, you can attach with the TUI or use `no-mistakes axi respond` to approve, fix, or skip.
    Use `no-mistakes axi abort` only when you mean to cancel the whole run.
    AXI run objects show `awaiting_agent: parked <duration>` while a non-terminal run is parked at that gate, so a supervising agent can distinguish a waiting run from active work in one status read.
@@ -72,7 +72,7 @@ That is a core design choice, not an implementation detail.
 - **Named remote** - `origin` is never hijacked. You push to `no-mistakes` on purpose, so regular `git push` still works normally.
 - **Recursive-run containment** - managed gate identity and authenticated daemon peer ancestry prevent active validation steps from starting or controlling another pipeline. `NO_MISTAKES_GATE` is diagnostic evidence only, not authorization.
 - **Disposable worktrees** - each run happens in its own detached worktree, under `~/.no-mistakes/worktrees/` by default or under the directory [`worktree_roots`](/no-mistakes/reference/global-config/#worktree_roots) names for that repository. The daemon can safely modify files, run tests, and commit fixes without touching your working directory.
-- **Fixed pipeline** - the step order is opinionated and not configurable: `intent → rebase → review → test → document → lint → push → pr → ci`. What you _can_ configure is the commands each step runs, how many auto-fix attempts are allowed, and whether transcript-based intent extraction is used when intent is not supplied directly.
+- **Fixed pipeline** - the step order is opinionated and not configurable: `intent → rebase → review → test → document → lint → push → pr → ci`. What you _can_ configure is the commands each step runs, how many auto-fix attempts are allowed, whether transcript-based intent extraction is used when intent is not supplied directly, and extra [`gates`](/no-mistakes/reference/repo-config/#gates) that run after a core step - additions only, never a removal or a reordering.
 - **Remote data-loss guard** - force-pushes are checked against the live push target and refused when they would discard commits the run did not incorporate.
 
 ## Why it is built this way
@@ -92,6 +92,87 @@ Git operations on the gate name the bare repo explicitly with `--git-dir`
 instead of relying on working-directory discovery, so hardened environments
 that set `safe.bareRepository=explicit` (common in agent harnesses and CI)
 work unchanged.
+
+### Private mirror reconciliation
+
+A rebase can leave the gate branch on an older history that rejects the next
+ordinary push. Reconciliation compares exact commit heads and per-file
+`git patch-id --stable` identities; commit messages are not evidence. Historical
+patch matches also require a clean three-way merge of the private head into the
+live head whose resulting tree equals the live tree. This prevents changes
+discarded by a merge or revert from being counted as surviving content. If that
+survival check cannot prove preservation, the private-only range is reported
+as at risk.
+
+**Recovery-anchor preservation credit (issue #1233):** a private-only commit
+that a `refs/no-mistakes/recover/<run>` anchor reaches is *preserved*, so it is
+re-derived out of the at-risk set. Those anchors are the tool's own sanctioned
+preservation record - terminalization pins every verified unpublished head at
+that ref before the managed worktree can be removed, and
+`custody.PreserveRecoveryAnchor` never replaces evidence (a conflicting or
+symbolic anchor fails closed and is never dereferenced). The credit exists so
+the sanctioned `sync --recover` -> rerun -> push loop cannot deadlock against
+the very anchor that loop wrote to declare the work preserved.
+
+This is a **preservation credit, not containment evidence**. It says nothing
+about whether the content lands in the published tree; ancestry, patch
+identity and final-tree survival remain the only proofs of that, and Decision
+41-A below remains the only head exception. The archive-before-delete contract
+is unchanged, so a credited reconciliation still archives the exact private
+head before removing the branch ref. A commit no anchor reaches is still
+refused, and the refusal names every proof that would clear it.
+
+The credit scan never walks what the anchors can see. Recovery anchors
+accumulate for the life of the gate, so each membership scan is a `git
+rev-list` of candidates that excludes the live head as well as every
+anchor; because the candidates are private-only, that walk is bounded by the
+private-only range. Only credited commits are then attributed to the first
+anchor that reaches them. When no recovery anchor exists no credit is possible
+and the ordinary at-risk refusal is returned. Otherwise the candidates are
+scanned in successive batches of `maxRecoveryCandidates` (in
+`internal/gate/reconcile.go`), so a long, fully anchored history still earns
+its credit; the scan is never truncated or refused by size, because dropping
+candidates would drop their preservation credit and silently reintroduce the
+deadlock the credit exists to end.
+
+**Accepted Decision 41-A (issue #983):** pipeline publication may replace a
+private mirror head that is **exactly equal to a head the publishing run itself
+placed on the mirror** without patch-ID or tree-survival proof: its
+`Run.SubmittedHeadSHA`, or, once it has published, its durable
+`Run.LastPushedSHA`. The last pushed head is recorded only after a verified push to the configured
+push target and mirror settlement, so it is never an external or newer head.
+This narrow policy exception permits reviewed rebases and conflict resolutions
+to change the submitted patch, including a CI merge-conflict repair that is
+revalidated from Review after the run has already published. The replacement
+head must still be review-approved, and the force push to the configured target
+stays leased on the same last pushed head. Ownership is not containment evidence. The
+exception does not extend to another recorded head, an agent-created head, an
+abbreviated SHA, or an external, newer, or divergent private head. Fresh AXI
+submissions do not receive this exception.
+
+Reconciliation requires direct private branch and archive refs; symbolic refs,
+including dangling symbolic refs, are refused before containment checks. Ref
+creation and deletion use exact names without dereferencing and expected old
+values. Before deleting a reconciled branch ref, the gate archives its exact
+head at `refs/tags/no-mistakes-abandoned/<branch>/<sha>`. Outside Decision 41-A
+and the recovery-anchor credit above, unproven private content refuses before
+upstream publication, leaves the private branch untouched, and names every
+at-risk commit. An ancestor already supports an ordinary fast-forward. A gate
+head that is a newer descendant of the published head stays untouched,
+including through the detached worktree's shared branch refs.
+
+Correction and CI-repair recording persist the agent-created worktree head in
+the run and database without moving a branch ref shared with the gate. Repairs
+awaiting review retain their uncertified range. Publication reconciliation
+therefore still sees any intervening private head; ordinary worktrees with
+separate ref storage retain their local branch bookkeeping.
+
+Publication plans reconciliation before pushing and applies it only after
+verifying the upstream head. If mirror settlement then fails or is cancelled,
+it restores the archived branch when no intervening ref has appeared, so a
+retry can still resolve the branch. AXI reconciles before its ordinary submission
+push and restores an archived ref after a failed submission if no intervening
+ref has appeared. Neither path forces the private mirror.
 
 ### Daemon
 
@@ -160,8 +241,8 @@ branch, marking the remaining steps as skipped.
 
 1. Execute the step
 2. If the step finds `action: auto-fix` findings, the step result is auto-fixable, and auto-fix is enabled, loop back with the agent to fix them (up to the configured limit)
-3. If blocking findings remain, or any finding has `action: ask-user`, pause and wait for user action
-4. `action: no-op` findings are informational only; the user can approve, fix selected findings, skip, or cancel the run when the step pauses
+3. If blocking findings remain, any finding has `action: ask-user`, or Review has a selected finding still awaiting positive rereview verification, pause and wait for user action. The Review carry-forward rule is detailed in the [pipeline-step reference](/no-mistakes/reference/pipeline-steps/#review).
+4. `action: no-op` findings are informational only unless a Review finding was selected for fixing and remains outstanding; the user can approve, fix selected findings, skip, or cancel the run when the step pauses
 
 While the executor is paused at an approval or fix-review gate, it persists a run-level awaiting-agent timestamp that AXI renders as `awaiting_agent: parked <duration>`.
 That timestamp is observability only and does not alter approval behavior.

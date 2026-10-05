@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
+	"github.com/kunchenguid/no-mistakes/internal/agentcfg"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/custody"
 	"github.com/kunchenguid/no-mistakes/internal/db"
@@ -29,6 +30,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/kunchenguid/no-mistakes/internal/verificationplan"
 	"github.com/kunchenguid/no-mistakes/internal/worktrees"
 )
 
@@ -39,7 +41,12 @@ import (
 // age floor because it owns that run.
 var orphanProcessMinAge = procreap.DefaultMinAge
 
-var applyShellEnvToProcess = shellenv.ApplyToProcess
+// applyShellEnvToProcess is the startup probe: it may wait for a login shell
+// binary that a boot-time race has not yet produced (see
+// shellenv.DefaultShellRetryWindow).
+var applyShellEnvToProcess = func(excluded ...string) error {
+	return shellenv.ApplyToProcessWithShellRetryExcept(shellenv.DefaultShellRetryWindow, excluded...)
+}
 var createDaemonPIDTempFile = os.CreateTemp
 var renameDaemonPIDFile = os.Rename
 
@@ -119,16 +126,21 @@ func prepareDaemonEnvironment() error {
 			return fmt.Errorf("unset %s: %w", key, err)
 		}
 	}
-	if err := applyShellEnvToProcess(); err != nil {
+	if err := applyLoginShellEnvironment(applyShellEnvToProcess, nmHome); err != nil {
 		return fmt.Errorf("apply login shell environment: %w", err)
-	}
-	if nmHome != "" {
-		if err := os.Setenv("NM_HOME", nmHome); err != nil {
-			return fmt.Errorf("restore NM_HOME: %w", err)
-		}
 	}
 	logDaemonPathSummary()
 	return nil
+}
+
+// applyLoginShellEnvironment applies a login-shell probe to the process and
+// keeps the service-supplied NM_HOME authoritative over anything the shell's
+// rc files export.
+func applyLoginShellEnvironment(apply func(...string) error, nmHome string) error {
+	if nmHome != "" {
+		return apply("NM_HOME")
+	}
+	return apply()
 }
 
 // logDaemonPathSummary records the effective PATH at daemon startup so that
@@ -177,7 +189,8 @@ func RunWithOptions(p *paths.Paths, d *db.DB, stepFactory StepFactory) error {
 	// bound, and held for the rest of the process lifetime - otherwise a
 	// second daemon racing to start against the same root can mark another
 	// live daemon's active runs as crashed and delete worktrees out from
-	// under it (see AGENTS.md "Daemon Singleton Lock").
+	// under it (see "Daemon Singleton Lock" in
+	// .agents/skills/daemon-runtime/SKILL.md).
 	lock, err := acquireSingletonLock(p)
 	if err != nil {
 		return err
@@ -443,11 +456,30 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 	reportUnusableWorktreeRoots(d, layout)
 	leftover := leftoverRecordedRunWorktrees(d, p)
 
+	global, cfgErr := config.LoadGlobal(p.ConfigFile())
+	if cfgErr != nil {
+		slog.Warn("failed to load global config for cleanup reaping, using defaults", "error", cfgErr)
+		global = nil
+	}
+	now := time.Now()
+	wtPolicy := worktreeReapPolicyFor(global)
+
+	// The retention decision is resolved before the process sweep so a
+	// default-tree worktree the policy is keeping is never treated as
+	// orphaned: RunActive alone (pending/running/CI-interrupted) says nothing
+	// about retention, and sweeping first would kill a process still using a
+	// checkout the operator configured to retain.
 	orphanProcStarted := time.Now()
-	sweepOrphanRunProcesses(d, p, sweepableWorktrees(leftover, activeWorktrees))
+	sweepOrphanRunProcesses(d, p, sweepableWorktrees(leftover, activeWorktrees), retainedDefaultTreeRunIDs(d, p, wtPolicy, now))
 	logStartupPhase("orphan_processes", orphanProcStarted)
 
+	// reapWorktrees applies the operator's retention policy to the default
+	// <NM_HOME>/worktrees tree before cleanupOrphanWorktrees runs its
+	// unconditional sweep of operator-placed (worktree_roots) leftovers, so a
+	// disabled or wide retention window is honored on the default tree
+	// instead of being bypassed by startup cleanup.
 	worktreeStarted := time.Now()
+	reapWorktrees(d, p, wtPolicy, now)
 	cleanupOrphanWorktrees(d, p, leftover)
 	logStartupPhase("worktree_cleanup", worktreeStarted)
 
@@ -455,16 +487,11 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 	// are: every run's status is settled by now, so the active-run guard can
 	// tell a crashed run's leftovers from work still in flight.
 	evidenceStarted := time.Now()
-	global, cfgErr := config.LoadGlobal(p.ConfigFile())
-	if cfgErr != nil {
-		slog.Warn("failed to load global config for evidence reaping, using defaults", "error", cfgErr)
-		global = nil
-	}
 	policy := evidenceReapPolicyFor(global)
 	root := evidenceRootFor(p, global)
-	now := time.Now()
 	reapEvidence(d, root, policy, now)
 	reapLegacyEvidence(d, root, policy, now)
+	reapRunLogs(d, p.LogsDir(), policy, now)
 	logStartupPhase("evidence_cleanup", evidenceStarted)
 
 	mgr.resumeRecoveredRuns(plans)
@@ -545,7 +572,12 @@ func isGitAncestor(ctx context.Context, dir, ancestor, descendant string) bool {
 // is limited to the directories our own run rows name, matching what cleanup
 // there may remove, and a placement the operator has since reconfigured away is
 // still swept because the run recorded it.
-func sweepOrphanRunProcesses(d *db.DB, p *paths.Paths, worktrees []procreap.Worktree) {
+//
+// retained is the set of default-tree run IDs worktreeReapCandidates decided
+// to keep (see retainedDefaultTreeRunIDs): a terminal run alone does not mean
+// orphaned once retention exists, so a run in this set is left alone here too,
+// exactly like the removal-scoped sweep reapWorktrees runs for itself later.
+func sweepOrphanRunProcesses(d *db.DB, p *paths.Paths, worktrees []procreap.Worktree, retained map[string]bool) {
 	ctx := context.Background()
 	wtRoot := p.WorktreesDir()
 	pathByRun := make(map[string]string, len(worktrees))
@@ -557,6 +589,9 @@ func sweepOrphanRunProcesses(d *db.DB, p *paths.Paths, worktrees []procreap.Work
 		Worktrees:     worktrees,
 		MinAge:        orphanProcessMinAge,
 		RunActive: func(repoID, runID string) bool {
+			if retained[runID] {
+				return true
+			}
 			wtPath := pathByRun[runID]
 			if wtPath == "" {
 				wtPath = filepath.Join(wtRoot, repoID, runID)
@@ -565,6 +600,30 @@ func sweepOrphanRunProcesses(d *db.DB, p *paths.Paths, worktrees []procreap.Work
 			return skip
 		},
 	}, "daemon_startup")
+}
+
+// retainedDefaultTreeRunIDs is the run IDs of default-tree worktrees the
+// worktree retention policy is keeping. The startup process sweep runs before
+// reapWorktrees decides what to remove, so it consults the same decision here
+// rather than treating "run is terminal" alone as orphaned - otherwise a
+// restart could kill a process still using a checkout the operator configured
+// to retain (see worktreeReapCandidates).
+func retainedDefaultTreeRunIDs(d *db.DB, p *paths.Paths, policy worktreeReapPolicy, now time.Time) map[string]bool {
+	removable, _ := defaultTreeOrphanWorktrees(d, p)
+	if len(removable) == 0 {
+		return nil
+	}
+	removing := make(map[string]bool, len(removable))
+	for _, wt := range worktreeReapCandidates(removable, policy, now) {
+		removing[wt.runID] = true
+	}
+	retained := make(map[string]bool, len(removable))
+	for _, wt := range removable {
+		if !removing[wt.runID] {
+			retained[wt.runID] = true
+		}
+	}
+	return retained
 }
 
 // sweepableWorktrees is the procreap view of the run worktrees outside the
@@ -743,17 +802,21 @@ func reportUnusableWorktreeRoots(d *db.DB, layout *worktrees.Layout) {
 }
 
 // cleanupOrphanWorktrees removes worktree directories left behind by runs
-// that are no longer active. It is DB-aware: a worktree is only removed when
-// its run row is terminal, or when there is no matching run row at all.
-// This is what keeps cleanup from deleting the checkout out from under a
-// pipeline that is still actually running (see skipWorktreeCleanup).
-// Called from recoverOnStartup after
+// that are no longer active, for the operator-placed leftovers named by
+// recordedOrphanWorktrees (see worktree_roots in the global config) - that
+// directory is the operator's own, so every eligible leftover there is
+// removed unconditionally, once, at startup. It is DB-aware: a worktree is
+// only removed when its run row is terminal, or when there is no matching
+// run row at all. This is what keeps cleanup from deleting the checkout out
+// from under a pipeline that is still actually running (see
+// skipWorktreeCleanup). Called from recoverOnStartup after
 // RecoverStaleRuns, so in the normal single-daemon path every run this loop
-// sees has already been resolved to a terminal status; it is factored out
-// separately so it can also be exercised - and its DB-aware skip behavior
-// verified - independent of stale-run recovery's side effects. Worktrees the
-// operator placed outside this tree are named by recordedOrphanWorktrees, which
-// never walks a directory it does not own.
+// sees has already been resolved to a terminal status.
+//
+// Leftovers under the default <NM_HOME>/worktrees tree are NOT removed here:
+// that tree is bounded by the operator's retention policy via reapWorktrees,
+// which recoverOnStartup runs first, so this only reclaims the (now likely
+// empty) per-repo directories reapWorktrees left behind.
 //
 // Every directory it is going to remove is swept in ONE process snapshot before
 // any of them is removed. The sweep-before-removal invariant is what matters
@@ -765,8 +828,8 @@ func reportUnusableWorktreeRoots(d *db.DB, layout *worktrees.Layout) {
 // slower to start the more there is to clean up.
 func cleanupOrphanWorktrees(d *db.DB, p *paths.Paths, leftover []db.RunWorktree) {
 	ctx := context.Background()
-	removable, repoDirs := defaultTreeOrphanWorktrees(d, p)
-	removable = append(removable, recordedOrphanWorktrees(d, p, leftover)...)
+	_, repoDirs := defaultTreeOrphanWorktrees(d, p)
+	removable := recordedOrphanWorktrees(d, p, leftover)
 
 	sweepable := make([]procreap.Worktree, 0, len(removable))
 	for _, wt := range removable {
@@ -775,7 +838,7 @@ func cleanupOrphanWorktrees(d *db.DB, p *paths.Paths, leftover []db.RunWorktree)
 	sweepRunWorktrees(p.WorktreesDir(), sweepable, "worktree_cleanup")
 
 	for _, wt := range removable {
-		removeOrphanWorktree(ctx, wt)
+		removeOrphanWorktree(ctx, d, wt)
 	}
 	for _, dir := range repoDirs {
 		os.Remove(dir)
@@ -855,8 +918,9 @@ func recordedOrphanWorktrees(d *db.DB, p *paths.Paths, leftover []db.RunWorktree
 }
 
 // removableOrphanWorktree combines the active-run guard with refusal retention.
-// This removal decision does not exempt retained terminal runs from the
-// independent startup process sweep or evidence expiry.
+// This removal decision does not exempt retained terminal runs from evidence
+// expiry (a separate, unrelated budget); the startup process sweep now applies
+// the same worktree retention policy through retainedDefaultTreeRunIDs.
 func removableOrphanWorktree(d *db.DB, wt orphanWorktree) bool {
 	if skip, reason := skipWorktreeCleanup(context.Background(), d, wt.runID, wt.dir); skip {
 		slog.Info("skipping worktree cleanup", "path", wt.dir, "reason", reason)
@@ -875,17 +939,25 @@ func removableOrphanWorktree(d *db.DB, wt orphanWorktree) bool {
 }
 
 // removeOrphanWorktree removes one run worktree directory its caller has
-// already decided on and swept (see cleanupOrphanWorktrees).
-func removeOrphanWorktree(ctx context.Context, wt orphanWorktree) {
+// already decided on and swept (see cleanupOrphanWorktrees). It reports
+// whether the directory was actually removed, since git worktree remove and
+// its os.RemoveAll fallback can both fail and merely log a warning.
+func removeOrphanWorktree(ctx context.Context, d *db.DB, wt orphanWorktree) bool {
+	if refusal := workRescueCleanupReason(d, wt.runID, wt.dir); refusal != "" {
+		slog.Warn("preserving run worktree", "path", wt.dir, "reason", refusal)
+		return false
+	}
 	gateDir, wtPath := wt.gateDir, wt.dir
 	if err := git.WorktreeRemove(ctx, gateDir, wtPath); err != nil {
 		slog.Warn("git worktree remove failed, falling back to os.RemoveAll", "path", wtPath, "error", err)
 		if err := os.RemoveAll(wtPath); err != nil {
 			slog.Warn("failed to remove orphaned worktree", "path", wtPath, "error", err)
+			return false
 		}
 	} else {
 		slog.Info("removed orphaned worktree", "path", wtPath)
 	}
+	return true
 }
 
 // skipWorktreeCleanup reports whether the worktree directory for runID must
@@ -918,6 +990,14 @@ func skipWorktreeCleanup(ctx context.Context, d *db.DB, runID, wtPath string) (b
 		return true, fmt.Sprintf("run %s is %s", runID, run.Status)
 	}
 	if run != nil && run.Status == types.RunCIMonitorInterrupted {
+		if _, statErr := os.Stat(wtPath); errors.Is(statErr, os.ErrNotExist) {
+			// The worktree directory is already gone (e.g. reaped by
+			// reapWorktrees/cleanupOrphanWorktrees, both of which apply this
+			// same guard before removing it). With no local checkout left,
+			// there is nothing unpushed to lose, so this is not the
+			// "unreadable HEAD" ambiguity below - it is safe to proceed.
+			return false, ""
+		}
 		head, err := git.HeadSHA(ctx, wtPath)
 		if err != nil {
 			return true, fmt.Sprintf("run %s ci monitor interrupted; worktree head unreadable (%v); preserving", runID, err)
@@ -1095,6 +1175,29 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		return &ipc.ShutdownResult{OK: true}, nil
 	})
 
+	srv.Handle(ipc.MethodUpdateRunClosingIssueRefs, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		if err := refuseNested(ctx, false); err != nil {
+			return nil, err
+		}
+		var p ipc.UpdateRunClosingIssueRefsParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		if err := d.MergeRunClosingIssueRefs(p.RunID, p.ClosingIssueRefs); err != nil {
+			// The PR body already sampled the closing issue references, so this update
+			// could not reach the Issues section. Report a structured rejection rather
+			// than success for a write that will never be visible.
+			if errors.Is(err, db.ErrClosingIssueRefsLocked) {
+				return &ipc.UpdateRunClosingIssueRefsResult{
+					OK:     false,
+					Reason: ipc.ClosingIssueRefsRejectedPRBodyComposed,
+				}, nil
+			}
+			return nil, fmt.Errorf("update closing issue references: %w", err)
+		}
+		return &ipc.UpdateRunClosingIssueRefsResult{OK: true}, nil
+	})
+
 	srv.Handle(ipc.MethodGetRun, func(_ context.Context, params json.RawMessage) (interface{}, error) {
 		var p ipc.GetRunParams
 		if err := json.Unmarshal(params, &p); err != nil {
@@ -1214,6 +1317,9 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		if strings.TrimSpace(p.Gate) == "" {
 			return nil, fmt.Errorf("gate path is required")
 		}
+		if _, err := ownedGateRepoID(mgr.paths, p.Gate); err != nil {
+			return nil, err
+		}
 		result, err := classify(ctx, "", false, true)
 		if err != nil {
 			return nil, err
@@ -1236,15 +1342,21 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		if err != nil {
 			return nil, err
 		}
-		run, claimed, err := d.ClaimLaunchReceipt(p.RepoID, p.Branch, p.LaunchNonce, p.SubmittedHeadSHA, p.ValidationGeneration, p.IntentDigest, prBaseBranch)
+		run, claimed, err := d.ClaimLaunchReceipt(p.RepoID, p.Branch, p.LaunchNonce, p.SubmittedHeadSHA, p.ValidationGeneration, p.IntentDigest, prBaseBranch, p.OmitIntent, p.PiProfile)
 		if err != nil {
 			return nil, fmt.Errorf("claim launch receipt: %w", err)
 		}
 		if run == nil {
 			return &ipc.ClaimLaunchReceiptResult{}, nil
 		}
+		if !run.PiProfile.Matches(p.PiProfile) {
+			return nil, fmt.Errorf("conflicting launch_nonce: Pi profile differs from run pin")
+		}
 		if !launchPRBaseBranchMatches(run, prBaseBranch) {
 			return nil, conflictingLaunchPRBaseBranch(p.LaunchNonce)
+		}
+		if p.OmitIntent && !run.OmitIntent {
+			return nil, conflictingLaunchOmitIntent(p.LaunchNonce)
 		}
 
 		receipt, err := receiptForRun(run, claimed)
@@ -1255,6 +1367,64 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 			return nil, fmt.Errorf("conflicting launch_nonce is already bound to a different validation generation, submitted head, or intent")
 		}
 		return &ipc.ClaimLaunchReceiptResult{Receipt: &receipt}, nil
+	})
+
+	// Capability probe for --no-publish-intent: see ipc.ProbeOmitIntentResult.
+	srv.Handle(ipc.MethodProbeOmitIntent, func(context.Context, json.RawMessage) (interface{}, error) {
+		return &ipc.ProbeOmitIntentResult{OK: true}, nil
+	})
+
+	srv.Handle(ipc.MethodCaptureVerificationPlan, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		if err := refuseNested(ctx, false); err != nil {
+			return nil, err
+		}
+		var p ipc.CaptureVerificationPlanParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		repo, err := d.GetRepo(p.RepoID)
+		if err != nil {
+			return nil, err
+		}
+		if repo == nil {
+			return nil, fmt.Errorf("unknown repository")
+		}
+		return verificationplan.Capture(mgr.paths.RunInputsDir(), p.SourcePath, p.RepoID, p.Branch, p.HeadSHA)
+	})
+
+	srv.Handle(ipc.MethodReleaseVerificationPlan, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		var p ipc.ReleaseVerificationPlanParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		// Serialize ownership lookup and deletion with every launch for this branch.
+		_, err := mgr.withBranchLock(p.RepoID, p.Branch, func() (string, error) {
+			run, err := d.GetRun(p.CaptureID)
+			if err != nil || run != nil {
+				return "", err
+			}
+			plan, err := verificationplan.Resolve(mgr.paths.RunInputsDir(), p.CaptureID, p.RepoID, p.Branch, p.HeadSHA)
+			if err != nil {
+				return "", err
+			}
+			if plan == nil {
+				return "", fmt.Errorf("verification plan capture ID is required")
+			}
+			return "", os.RemoveAll(filepath.Dir(plan.Path))
+		})
+		return nil, err
+	})
+
+	srv.Handle(ipc.MethodResolvePiProfile, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		var request agentcfg.PiProfile
+		if err := json.Unmarshal(params, &request); err != nil {
+			return nil, fmt.Errorf("invalid Pi profile request")
+		}
+		cfg, err := config.LoadGlobal(mgr.paths.ConfigFile())
+		if err != nil {
+			return nil, fmt.Errorf("load global config: %w", err)
+		}
+		return cfg.ResolvePiProfile(&request)
 	})
 
 	srv.Handle(ipc.MethodStartFreshRun, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
@@ -1280,7 +1450,7 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
-		runID, err := mgr.HandleRerun(ctx, p.RepoID, p.Branch, p.PreviousRunID, p.SkipSteps, p.Intent, p.PRBaseBranch, p.CallerHeadSHA)
+		runID, err := mgr.HandleRerun(ctx, p.RepoID, p.Branch, p.PreviousRunID, p.SkipSteps, p.Intent, p.PRBaseBranch, p.OmitIntent, p.CallerHeadSHA, p.VerificationPlanID, p.ClosingIssueRefs, p.PiProfile)
 		if err != nil {
 			return nil, err
 		}
@@ -1313,10 +1483,21 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
-		if err := mgr.HandleRespondWithOverrides(p.RunID, p.Step, p.Action, p.FindingIDs, p.Instructions, p.AddedFindings); err != nil {
+		if err := mgr.HandleRespondWithOverrides(p.RunID, p.Step, p.Action, p.FindingIDs, p.Instructions, p.AddedFindings, p.ApprovalReason); err != nil {
 			return nil, err
 		}
 		return &ipc.RespondResult{OK: true}, nil
+	})
+
+	srv.Handle(ipc.MethodAnswerReview, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		if err := refuseNested(ctx, false); err != nil {
+			return nil, err
+		}
+		var p ipc.AnswerReviewQuestionParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		return mgr.HandleAnswerReviewQuestion(p.RunID, p.QuestionID, p.Answer, p.AnsweredBy)
 	})
 
 	srv.Handle(ipc.MethodCancelRun, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
@@ -1417,17 +1598,25 @@ func runToInfo(d *db.DB, r *db.Run, steps []*db.StepResult) *ipc.RunInfo {
 		CIReady:            r.CIReadyAt != nil,
 		CIReadyNoCI:        r.CIReadyNoCI,
 		PRBaseBranch:       r.PRBaseBranch,
+		OmitIntent:         r.OmitIntent,
+		PiProfile:          r.PiProfile,
+		VerificationPlan:   r.VerificationPlan,
 		AwaitingAgent:      r.AwaitingAgentSince != nil,
 		AwaitingAgentSince: r.AwaitingAgentSince,
 		CreatedAt:          r.CreatedAt,
 		UpdatedAt:          r.UpdatedAt,
 	}
+	info.PartialWork = d.WorkRescueStatus(r.ID)
+	info.FixProgress, _ = d.FixProgress(r.ID)
 	if len(steps) > 0 {
 		info.Steps = make([]ipc.StepResultInfo, 0, len(steps))
 		for _, s := range steps {
 			stepInfo := stepToInfo(d, s)
 			info.Steps = append(info.Steps, stepInfo)
-			if info.CIOverrideReason == "" && stepInfo.OverrideReason != "" {
+			if reason := s.TestOverrideReason(); reason != "" {
+				info.TestOverrideReason = reason
+			}
+			if s.StepName == types.StepCI && info.CIOverrideReason == "" && stepInfo.OverrideReason != "" {
 				info.CIOverrideReason = stepInfo.OverrideReason
 			}
 		}
@@ -1477,7 +1666,6 @@ func stepToInfo(d *db.DB, s *db.StepResult) ipc.StepResultInfo {
 	if rounds, err := d.StepRoundStats(s.ID); err == nil {
 		info.RoundCount = rounds.TotalRounds
 		info.FixRoundCount = rounds.FixRounds
-		info.RoundTrigger = rounds.LatestTrigger
 		info.PendingFixSource = rounds.PendingFixSource
 	}
 	return info

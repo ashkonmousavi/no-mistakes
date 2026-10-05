@@ -1077,6 +1077,102 @@ func TestAxiSyncCheckSurfacesRecoveryForTerminalPrePushRun(t *testing.T) {
 	}
 }
 
+// TestAxiSyncRecoversRemoteRewrittenBindingEndToEnd reproduces issue #652:
+// after an operator synchronized to the pipeline head, the push target was
+// force-rewritten outside the pipeline. The check must name the explicit
+// recovery, and that recovery must anchor the superseded pipeline head and
+// rebind the push binding without touching the worktree or the remote.
+func TestAxiSyncRecoversRemoteRewrittenBindingEndToEnd(t *testing.T) {
+	f := newCLISyncFixture(t)
+	if out, err := executeCmd("axi", "sync"); err != nil {
+		t.Fatalf("initial sync: %v\n%s", err, out)
+	}
+	writer := filepath.Join(t.TempDir(), "writer")
+	cliGit(t, filepath.Dir(writer), "-c", "core.autocrlf=false", "clone", f.remote, writer)
+	cliGit(t, writer, "config", "user.name", "Writer")
+	cliGit(t, writer, "config", "user.email", "writer@example.com")
+	cliGit(t, writer, "checkout", "feature/sync")
+	cliGit(t, writer, "checkout", "--orphan", "rewrite")
+	cliGit(t, writer, "rm", "-rf", ".")
+	if err := os.WriteFile(filepath.Join(writer, "rewrite.txt"), []byte("rewrite\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, writer, "add", "rewrite.txt")
+	cliGit(t, writer, "commit", "-m", "rewrite")
+	cliGit(t, writer, "push", "--force", "origin", "HEAD:refs/heads/feature/sync")
+	rewritten := cliGit(t, writer, "rev-parse", "HEAD")
+
+	out, err := executeCmd("axi", "sync", "--check")
+	var ee *exitError
+	if err == nil || !asExitError(err, &ee) || ee.code != 1 {
+		t.Fatalf("rewritten check should exit 1, got %#v\n%s", err, out)
+	}
+	for _, want := range []string{"state: remote_rewritten", "safety: blocked_remote_rewritten", "code: recover_remote_rewritten", "command: no-mistakes axi sync --recover"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rewritten check missing %q:\n%s", want, out)
+		}
+	}
+	t.Logf("operator check before recovery:\n%s", out)
+	previousInteractive := syncInteractive
+	syncInteractive = func() bool { return true }
+	t.Cleanup(func() { syncInteractive = previousInteractive })
+	human := newRootCmd()
+	humanOut := new(bytes.Buffer)
+	human.SetOut(humanOut)
+	human.SetErr(humanOut)
+	human.SetIn(strings.NewReader("no\n"))
+	human.SetArgs([]string{"sync", "--recover"})
+	if err := human.Execute(); err != nil {
+		t.Fatalf("human recovery confirmation: %v\n%s", err, humanOut.String())
+	}
+	for _, want := range []string{"anchors the superseded pipeline head in a ref", "rebinds the recorded", "push binding to the verified live head without moving the worktree", "Cancelled"} {
+		if !strings.Contains(humanOut.String(), want) {
+			t.Errorf("human recovery confirmation missing %q:\n%s", want, humanOut.String())
+		}
+	}
+	t.Logf("human confirmation (declined):\n%s", humanOut.String())
+	out, err = executeCmd("axi", "sync", "--recover")
+	if err != nil {
+		t.Fatalf("recover: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "\nerror:") || !strings.Contains(out, "the superseded pipeline head was anchored at "+"refs/no-mistakes/recover-rewritten/"+f.runID+"/1") || !strings.Contains(out, "the branch, worktree, and remote were not changed") || !strings.Contains(out, "local and pipeline-pushed histories have diverged") || strings.Contains(out, "no files or refs were changed") {
+		t.Errorf("successful rebind must keep divergence in branch_sync.note without a top-level error:\n%s", out)
+	}
+	anchor := "refs/no-mistakes/recover-rewritten/" + f.runID + "/1"
+	for _, want := range []string{"recovered: true", "changed: false", "source: remote_rewritten", "archive_ref: " + anchor, "proof: worktree"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("recover output missing %q:\n%s", want, out)
+		}
+	}
+	for key, sha := range map[string]string{"pushed_head": rewritten, "preserved_head": f.pushed} {
+		if !toonHasValue(out, key, sha) {
+			t.Errorf("recover output missing %s %s:\n%s", key, sha, out)
+		}
+	}
+	t.Logf("operator recovery result:\n%s", out)
+	if got := cliGit(t, f.local, "rev-parse", anchor); got != f.pushed {
+		t.Fatalf("anchor = %s, want superseded pipeline head %s", got, f.pushed)
+	}
+	if got := cliGit(t, f.local, "rev-parse", "HEAD"); got != f.pushed {
+		t.Fatalf("recover moved HEAD to %s", got)
+	}
+	if got := cliGit(t, f.remote, "rev-parse", "refs/heads/feature/sync"); got != rewritten {
+		t.Fatalf("recover moved the remote to %s", got)
+	}
+
+	out, _ = executeCmd("axi", "sync", "--check")
+	if strings.Contains(out, "blocked_remote_rewritten") || !toonHasValue(out, "pushed_head", rewritten) {
+		t.Fatalf("post-recover check still stranded:\n%s", out)
+	}
+	t.Logf("operator check after recovery:\n%s", out)
+}
+
+// toonHasValue reports whether TOON output renders key with value, which the
+// encoder quotes when a SHA could otherwise read as a number.
+func toonHasValue(out, key, value string) bool {
+	return strings.Contains(out, key+": "+value+"\n") || strings.Contains(out, key+": \""+value+"\"\n")
+}
+
 func TestAxiSyncRecoverReturnsCustodyEndToEnd(t *testing.T) {
 	f := newCLIRecoverFixture(t)
 	out, err := executeCmd("axi", "sync", "--recover")
@@ -1098,6 +1194,150 @@ func TestAxiSyncRecoverReturnsCustodyEndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(out, "state: custody_returned") {
 		t.Fatalf("post-recover check:\n%s", out)
+	}
+}
+
+// rebaseReturnedCustodyBranch recreates the reported lane-staleness shape: a
+// recovered branch is published, rebased onto a newer main, given a follow-up
+// commit, then force-with-lease pushed to originURL. The gate still holds the
+// pre-rebase head because no pipeline run has yet seen the rewrite.
+func rebaseReturnedCustodyBranch(t *testing.T, f cliRecoverFixture, originURL string, publishRebase bool) string {
+	t.Helper()
+	if out, err := executeCmd("axi", "sync", "--recover"); err != nil {
+		t.Fatalf("return custody: %v\n%s", err, out)
+	}
+	cliGit(t, f.local, "remote", "add", "origin", originURL)
+	cliGit(t, f.local, "push", "origin", "main:refs/heads/main")
+	cliGit(t, f.local, "push", "origin", "HEAD:refs/heads/feature/recover")
+
+	cliGit(t, f.local, "checkout", "main")
+	if err := os.WriteFile(filepath.Join(f.local, "upstream.txt"), []byte("newer main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, f.local, "add", "upstream.txt")
+	cliGit(t, f.local, "commit", "-m", "advance main")
+	cliGit(t, f.local, "push", "origin", "main:refs/heads/main")
+
+	cliGit(t, f.local, "checkout", "feature/recover")
+	cliGit(t, f.local, "rebase", "main")
+	if err := os.WriteFile(filepath.Join(f.local, "follow-up.txt"), []byte("post-rebase follow-up\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, f.local, "add", "follow-up.txt")
+	cliGit(t, f.local, "commit", "-m", "post-rebase follow-up")
+	rebased := cliGit(t, f.local, "rev-parse", "HEAD")
+	if publishRebase {
+		cliGit(t, f.local, "push", "--force-with-lease=refs/heads/feature/recover:"+f.preserved, "origin", "HEAD:refs/heads/feature/recover")
+	}
+	return rebased
+}
+
+// TestAxiSyncAdoptPublishedRebasedLane reproduces the observed ordinary Git
+// failure before it tests the supported recovery. `axi run` uses the same
+// unforced HEAD-to-gate push, so this non-fast-forward is the failure that
+// previously stopped it before a run could be created.
+func TestAxiSyncAdoptPublishedRebasedLane(t *testing.T) {
+	f := newCLIRecoverFixture(t)
+	rebased := rebaseReturnedCustodyBranch(t, f, f.remote, true)
+	cliGit(t, f.local, "push", f.gate, f.preserved+":refs/heads/feature/sibling")
+	sibling := cliGit(t, f.gate, "rev-parse", "refs/heads/feature/sibling")
+
+	if err := git.Push(context.Background(), f.local, f.gate, "refs/heads/feature/recover", "", false); err == nil {
+		t.Fatal("unforced push to the stale gate unexpectedly succeeded")
+	}
+	if got := cliGit(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+		t.Fatalf("rejected gate push moved lane to %s, want pre-rebase %s", got, f.preserved)
+	}
+
+	status, err := executeCmd("axi", "status")
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, status)
+	}
+	for _, want := range []string{
+		"state: custody_returned",
+		"relation: diverged",
+		"code: adopt_published",
+		"command: no-mistakes axi sync --adopt-published",
+	} {
+		if !strings.Contains(status, want) {
+			t.Errorf("rebased status missing %q:\n%s", want, status)
+		}
+	}
+
+	out, err := executeCmd("axi", "sync", "--adopt-published")
+	if err != nil {
+		t.Fatalf("adopt published rebased head: %v\n%s", err, out)
+	}
+	for _, want := range []string{"state: custody_returned", "safety: gate_ready", "changed: true", "code: run_pipeline"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("adoption output missing %q:\n%s", want, out)
+		}
+	}
+	if got := cliGit(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != rebased {
+		t.Fatalf("gate lane = %s, want published rebased head %s", got, rebased)
+	}
+	if got := cliGit(t, f.gate, "rev-parse", "refs/heads/feature/sibling"); got != sibling {
+		t.Fatalf("adoption changed sibling lane to %s, want %s", got, sibling)
+	}
+	// The exact no-op push lets axi run take its existing rerun path instead of
+	// failing before the daemon observes the lane.
+	if err := git.Push(context.Background(), f.local, f.gate, "refs/heads/feature/recover", "", false); err != nil {
+		t.Fatalf("gate push after adoption: %v", err)
+	}
+}
+
+func TestAxiSyncAdoptPublishedRefusesUnpublishedRebase(t *testing.T) {
+	f := newCLIRecoverFixture(t)
+	rebased := rebaseReturnedCustodyBranch(t, f, f.remote, false)
+
+	out, err := executeCmd("axi", "sync", "--adopt-published")
+	var ee *exitError
+	if err == nil || !asExitError(err, &ee) || ee.code != 1 {
+		t.Fatalf("unpublished rebase recovery should refuse, got %#v\n%s", err, out)
+	}
+	for _, want := range []string{"safety: blocked_published_head_mismatch", "no files or gate refs were changed"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("unpublished rebase refusal missing %q:\n%s", want, out)
+		}
+	}
+	if got := cliGit(t, f.local, "rev-parse", "HEAD"); got != rebased {
+		t.Fatalf("refused recovery moved local branch to %s, want %s", got, rebased)
+	}
+	if got := cliGit(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+		t.Fatalf("refused recovery moved gate lane to %s, want %s", got, f.preserved)
+	}
+}
+
+// TestAxiSyncAdoptPublishedIgnoresForeignWorktreeOrigin proves the published
+// head is verified against the registered push target and not against whatever
+// the invoking worktree calls origin. Here the rebase is published only to an
+// unrelated remote that origin points at, so adoption must refuse: the target
+// the pipeline publishes to has never seen this head.
+func TestAxiSyncAdoptPublishedIgnoresForeignWorktreeOrigin(t *testing.T) {
+	f := newCLIRecoverFixture(t)
+	foreign := filepath.Join(t.TempDir(), "foreign.git")
+	cliGit(t, filepath.Dir(foreign), "init", "--bare", foreign)
+	rebased := rebaseReturnedCustodyBranch(t, f, foreign, true)
+	// The registered push target still carries only the pre-rebase head.
+	cliGit(t, f.local, "push", f.remote, f.preserved+":refs/heads/feature/recover")
+
+	if got := cliGit(t, foreign, "rev-parse", "refs/heads/feature/recover"); got != rebased {
+		t.Fatalf("foreign remote = %s, want the published rebase %s", got, rebased)
+	}
+	if got := cliGit(t, f.remote, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+		t.Fatalf("registered push target = %s, want the pre-rebase head %s", got, f.preserved)
+	}
+
+	out, err := executeCmd("axi", "sync", "--adopt-published")
+	var ee *exitError
+	if err == nil || !asExitError(err, &ee) || ee.code != 1 {
+		t.Fatalf("foreign-origin adoption should refuse, got %#v\n%s", err, out)
+	}
+	if !strings.Contains(out, "safety: blocked_published_head_mismatch") {
+		t.Errorf("foreign-origin refusal missing the target mismatch:\n%s", out)
+	}
+	if got := cliGit(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+		t.Fatalf("foreign-origin refusal moved gate lane to %s, want %s", got, f.preserved)
 	}
 }
 
@@ -1315,10 +1555,14 @@ func TestSyncRecoverFlagValidation(t *testing.T) {
 	newCLIRecoverFixture(t)
 	for _, args := range [][]string{
 		{"sync", "--check", "--recover"},
+		{"sync", "--check", "--adopt-published"},
+		{"sync", "--recover", "--adopt-published"},
 		{"sync", "--keep-local"},
 		{"sync", "--bind-archive-ref", "refs/heads/archive/test", "--recover"},
 		{"sync", "--bind-archive-ref", "refs/heads/archive/test", "--yes"},
 		{"axi", "sync", "--check", "--recover"},
+		{"axi", "sync", "--check", "--adopt-published"},
+		{"axi", "sync", "--recover", "--adopt-published"},
 		{"axi", "sync", "--keep-local"},
 		{"axi", "sync", "--bind-archive-ref", "refs/heads/archive/test", "--check"},
 	} {

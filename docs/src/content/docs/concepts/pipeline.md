@@ -3,7 +3,7 @@ title: Pipeline
 description: The nine steps that run on every gated push.
 ---
 
-The pipeline runs a fixed, opinionated sequence of steps. Order is not configurable. What each step runs *is*.
+The pipeline has a fixed, opinionated sequence of nine core steps. Their order is not configurable. What each core step runs is.
 
 ```
 intent → rebase → review → test → document → lint → push → pr → ci
@@ -21,12 +21,15 @@ flowchart LR
 
 This page is the overview. For each step's exact behavior, defaults, skip rules, and fix-commit format, see [Pipeline Steps](/no-mistakes/reference/pipeline-steps/).
 
+A repository can add to this sequence but never subtract from it: [`gates`](/no-mistakes/reference/repo-config/#gates) declares extra checks that run immediately after a core step, and nothing there can skip, reorder, or replace one.
+
 ## What a passed gate means
 
 The pipeline is opinionated so that "passed the gate" has a stable meaning:
 
 - the branch was checked against fresh remote upstream and the pushed-branch target first
 - review, tests, user-facing test evidence when available, docs, and lint happened before any branch push to the configured target
+- every repository-declared gate ran at its configured point before Push, unless the operator explicitly skipped it after a failure
 - the human stayed in control when a step needed judgment
 - the final branch update was guarded against discarding unincorporated commits already on the push target
 - push, PR creation, and CI monitoring only happened after the local gate was satisfied
@@ -39,8 +42,8 @@ The pipeline is opinionated so that "passed the gate" has a stable meaning:
 | 2 | **Rebase** | Fetch fresh remote upstream and the configured branch target, then rebase your branch onto them | `3` |
 | 3 | **Review** | AI code review of your diff | `0` (requires approval) |
 | 4 | **Test** | Targeted local validation of the change and intent (not a full CI suite), plus evidence when intent is available | `3` |
-| 5 | **Document** | Review docs for accuracy, classify each gap, and correct accepted ones in a bounded turn | `3` (corrections capped at one round per pass) |
-| 6 | **Lint** | Run lint/static analysis; shares the document step's housekeeping pass when no lint command is configured | `3` |
+| 5 | **Document** | Update docs when needed and report unresolved gaps | initial pass |
+| 6 | **Lint** | Run lint/static analysis; shares the document step's initial housekeeping pass when no lint command is configured | `3` |
 | 7 | **Push** | Safely push the validated branch to the configured target | n/a |
 | 8 | **PR** | Create or update the pull request | n/a |
 | 9 | **CI** | Watch CI + mergeability, auto-fix failures | `3` |
@@ -51,23 +54,22 @@ The pipeline is opinionated so that "passed the gate" has a stable meaning:
 - **Rebase next** so everything else runs against the latest upstream and pushed-branch target.
   It also stops when the branch would silently bundle commits from a local default branch that were never pushed to `origin/<default_branch>`.
   If there's no diff left after the rebase, the pipeline skips the rest.
-  The trusted [`sync_strategy`](/no-mistakes/reference/repo-config/#sync_strategy) key (default `rebase`) selects the integration mechanism: `rebase` rewrites history as above, while `sync_strategy: merge` integrates with an ordinary `git merge` instead - a merge commit, or a fast-forward when possible - so the pushed head always stays an ancestor of the new head. It applies identically to the CI step's merge-conflict repair.
 - **Review before test** so the agent reads fresh code, not code it may have touched during fixes.
   A later run's initial review also receives fix-round provenance for any uncertified pipeline-authored commits left on the branch when a previous run's re-review did not complete.
 - **Document after test** so docs are updated against code that's known to work.
 - **Lint last among local checks** so it doesn't churn over code that may still change.
 - **Push → PR → CI** happens after all local checks pass.
-  CI publishes a repair through the Push step's guarded path and keeps monitoring only when it can prove the repair descends from the reviewed head; otherwise the repair revalidates from Review before Push republishes it, which is what a merge-conflict repair always does under the default `sync_strategy: rebase` (under `sync_strategy: merge` a merge-conflict repair's continuity is provable like any other repair). [`ci.revalidate_repairs`](/no-mistakes/reference/repo-config/#cirevalidate_repairs) sets that intent: `false` (default) publishes when it is provable, `true` revalidates every repair.
-  CI is the only step that talks to the outside world for validation.
+  CI publishes a repair through the Push step's guarded path and keeps monitoring only when it can prove the repair descends from the reviewed head; otherwise the repair revalidates from Review before Push republishes it, which is what a merge-conflict repair always does. [`ci.revalidate_repairs`](/no-mistakes/reference/repo-config/#cirevalidate_repairs) sets that intent: `false` (default) publishes when it is provable, `true` revalidates every repair.
+  CI owns remote validation after publication. A repository gate command still runs before Push, although the command itself may contact an external service.
 
-## What each step can do
+## What core steps can do
 
-Every step can:
+Core steps use these outcomes as applicable:
 
 - **Complete** cleanly and advance the pipeline.
 - **Return findings** with severity (`error`, `warning`, `info`) and an action (`auto-fix`, `ask-user`, `no-op`).
-- **Trigger auto-fix** if the step's `auto_fix` limit is above 0, the step result is auto-fixable, and any finding is `auto-fix`-eligible. The document step is the exception to the shape of that loop: see the [Document step](/no-mistakes/reference/pipeline-steps/#document).
-- **Pause for approval** if blocking findings remain after auto-fix, or if any finding is `ask-user`.
+- **Trigger auto-fix** if the step's `auto_fix` limit is above 0, the step result is auto-fixable, and any finding is `auto-fix`-eligible. The document step applies safe documentation fixes during its initial pass and, when `commands.lint` is empty, combines that pass with initial safe lint fixes before the lint step consumes its findings.
+- **Pause for approval** if blocking findings remain after auto-fix, any finding is `ask-user`, or Review has a selected finding still awaiting positive rereview verification. The [Review step reference](/no-mistakes/reference/pipeline-steps/#review) owns that carry-forward rule.
 - **Skip** when there's nothing to do (e.g., no diff, unsupported host).
 - **Fail** on fatal errors and stop the pipeline.
 
@@ -78,11 +80,12 @@ See [Auto-Fix Loop](/no-mistakes/concepts/auto-fix/) for how the fix cycle works
 You can't reorder steps. You *can*:
 
 - Swap the agent, or configure an ordered fallback list, globally or per-repo.
-- Set explicit `commands.lint`, `commands.format`, and an optional **targeted** `commands.test` (local intent validation only; not a full CI suite), with `commands.prepare` when their dependencies must be materialized once in the isolated worktree.
+- Set explicit `commands.lint`, `commands.format`, and an optional **targeted** `commands.test` (local intent validation only; not a full CI suite), with the [repository preparation settings](/no-mistakes/reference/repo-config/#commandsprepare) when the isolated worktree needs dependencies for configured commands or agent-only Test.
 - Store test evidence locally, upload GitHub.com/GHEC image/video attachments at PR time, and optionally publish an orphan evidence branch with `test.evidence`.
 - Control auto-fix limits per step.
 - Ignore paths during review and documentation checks.
 - Disable or tune transcript-based intent extraction when intent is not supplied directly.
+- Add repository gates after selected core steps.
 - Skip steps for one run with `no-mistakes --skip <steps>`, `git push -o no-mistakes.skip=<steps>`, `no-mistakes axi run --skip <steps>`, or from the TUI.
 
 See [Configuration](/no-mistakes/guides/configuration/).
@@ -91,6 +94,6 @@ See [Configuration](/no-mistakes/guides/configuration/).
 
 - The step order.
 - Skipping specific steps permanently - per-run skips are allowed, but the pipeline itself always has all nine.
-- Adding new steps.
+- Removing or replacing a core step. A repository can add extra [`gates`](/no-mistakes/reference/repo-config/#gates) after one, which only ever adds to what a pass means.
 
-This is intentional. The pipeline is opinionated so that "passed the gate" means the same thing across repos.
+This is intentional. A pass has the same core guarantees across repositories, and repository gates can add guarantees without removing any of them.

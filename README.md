@@ -38,7 +38,7 @@
 Push to `no-mistakes` instead of `origin`, and it spins up a disposable worktree, runs an AI-driven validation pipeline, forwards the branch to the configured push target only after every check passes, and opens a clean PR automatically.
 
 - **Non-blocking** - the pipeline runs in an isolated worktree without disrupting your work.
-- **Agent-agnostic** - `claude`, `codex`, `grok`, `rovodev`, `opencode`, `pi`, `copilot`, `antigravity`, or `cursor` / `acp:<target>` via `acpx`, with ordered fallbacks; every gate requires a runnable configured pipeline agent.
+- **Agent-agnostic** - `claude`, `codex`, `grok`, `rovodev`, `opencode`, `pi`, `copilot`, `antigravity`, or `cursor` / `devin` / `acp:<target>` via `acpx`, with ordered fallbacks; every gate requires a runnable configured pipeline agent.
 - **Agent-native** - `/no-mistakes` lets your coding agent do a task and gate it, or gate existing committed work: it runs the pipeline, has the pipeline apply safe fixes, and escalates the rest to you.
 - **Human stays in charge** - auto-fix or review findings, your call.
 - **Clean PRs by default** - push, open PR, watch CI, and auto-fix failures in one shot.
@@ -64,7 +64,7 @@ Each step either passes on its own or stops with a **finding** for you to act on
 Safe, mechanical fixes are applied automatically; anything that touches your intent is escalated for you to **approve**, **fix**, or **skip**.
 The initial change reaches the configured push target only after every local gate is green.
 
-When CI reports an auto-fixable code, test, or build failure, the pipeline repairs it and publishes that repair through the same guarded force-push path - but only when it can prove the repair builds on the head you already reviewed. When it cannot prove that, the repair goes back through Review before it is published, so unrelated history cannot replace the reviewed commit. Merge-conflict repairs rewrite history, so they always take that safer route. Review-bot opinions and unresolved provider or transient failures park for your decision; see the [CI step reference](https://kunchenguid.github.io/no-mistakes/reference/pipeline-steps/#ci).
+When CI itself fails, the pipeline repairs it and publishes that repair through the same guarded force-push path - but only when it can prove the repair builds on the head you already reviewed. When it cannot prove that, the repair goes back through Review before it is published, so unrelated history cannot replace the reviewed commit. Merge-conflict repairs rewrite history, so they always take that safer route.
 Set [`ci.revalidate_repairs: true`](https://kunchenguid.github.io/no-mistakes/reference/repo-config/#cirevalidate_repairs) if *every* CI repair must itself be reviewed, at the cost of another full pass over your change each time CI is repaired.
 
 ## Install
@@ -73,7 +73,7 @@ Set [`ci.revalidate_repairs: true`](https://kunchenguid.github.io/no-mistakes/re
 curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh
 ```
 
-Windows, Go install, and build-from-source instructions are in the [installation guide](https://kunchenguid.github.io/no-mistakes/start-here/installation/).
+Windows, Go install, Nix, and build-from-source instructions are in the [installation guide](https://kunchenguid.github.io/no-mistakes/start-here/installation/).
 
 ## Quick Start
 

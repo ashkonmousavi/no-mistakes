@@ -14,6 +14,12 @@ It verifies, in order:
    pass on an older attestation;
 4. `review`, `test`, and `document` each recorded `status == "completed"`.
    Quota skips and agent skips are not compliant.
+5. a `test` step whose attestation carries a non-empty `override_reason` is
+   treated as approved over a failing configured `commands.test`. That is
+   non-compliant unless the attestation also carries a non-empty
+   `allow_test_command_override` reason (copied from trusted
+   `test.allow_approve_over_failure`). Older attestations without
+   `override_reason` are unchanged: they are not approved-over-failure.
 
 Missing or unparseable attestation reports the no-mistakes `>= 1.46.0` floor;
 a missing signature reports the not-raised-via-no-mistakes guidance.
@@ -137,18 +143,18 @@ of scope for this action.
 
 ## Rollout
 
-This repository publishes the action for downstream repositories but does not
-self-enforce it. Its former `.github/workflows/no-mistakes-required.yml` caller
-was removed when the fork's delivery policy withdrew automatic AI
-review/attestation as an acceptance requirement. Do not infer self-enforcement
-from the action's presence or reintroduce the caller without an explicit policy
-decision.
+This repository's own gate (`.github/workflows/no-mistakes-required.yml`) is a
+thin caller of this action, pinned to the commit that first published it. GitHub
+downloads `uses:` actions at job setup, so the pin must always name a ref that
+already carries the action; a caller pinned to a tag that predates it fails
+closed on every pull request.
 
-An enforcing downstream repository must pin the gate to an already-published
-commit. GitHub downloads `uses:` actions at job setup, so the pin must name a
-ref that already carries the action; a caller pinned to a tag that predates it
-fails closed on every pull request. The pinned copy, not code from the judged
-pull request, remains that caller's self-certification guard.
+Pinning the gate to an already-published commit is the self-certification guard.
+A pull request that edits this action is fully **tested** on its own head - the
+repository's Go tests execute `verify.py` from the working tree - while the
+required check judging that pull request keeps running the published pinned copy. The
+gate is therefore never rewritten by the change it is judging. Bumping the pin
+is a deliberate, separate pull request.
 
 Migrating the other enforcing repositories follows the same rule: pin a released
 tag or a commit SHA, never `@main`.

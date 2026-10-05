@@ -89,64 +89,45 @@ const (
 	FindingCategoryLint          = "lint"
 )
 
-// Finding class constants for the document step. The class answers "what does
-// correcting this actually protect", which is a different question from
-// severity ("how bad does the analyzer feel about it") and from the file's
-// extension. It is required on every documentation finding.
-//
-// FindingClassEditorial is a preference: optional wording, cosmetic
-// formatting, a suggested rephrasing. It is recorded as a note and NEVER
-// gates - a reviewer's taste must not become a release blocker.
-//
-// FindingClassSubstantive is a documentation defect that misinforms: a
-// contradiction between the implementation and a required specification, a
-// misleading operator instruction, missing required evidence, or a false
-// completion claim. It gates.
-//
-// FindingClassBehavioural is a substantive defect in a file that influences
-// executable behaviour, generated output, or delivery authority - whatever its
-// extension, `.md` included. It gates AND requires the project's own test
-// command to be re-run against any correction, because the correction can
-// change what the product does rather than only what it says.
-const (
-	FindingClassEditorial   = "editorial"
-	FindingClassSubstantive = "substantive"
-	FindingClassBehavioural = "behavioural"
-)
-
-var knownFindingClasses = []string{FindingClassEditorial, FindingClassSubstantive, FindingClassBehavioural}
-
-// NormalizeFindingClass trims and lower-cases one class so equivalent
-// spellings compare equal. It does not check membership; see
-// IsKnownFindingClass.
-func NormalizeFindingClass(class string) string {
-	return strings.ToLower(strings.TrimSpace(class))
-}
-
-// IsKnownFindingClass reports whether class, once normalized, is part of the
-// documentation finding class vocabulary.
-func IsKnownFindingClass(class string) bool {
-	return slices.Contains(knownFindingClasses, NormalizeFindingClass(class))
-}
-
-// KnownFindingClasses returns the class vocabulary, for error messages and
-// prompts that have to name what they accept.
-func KnownFindingClasses() []string { return slices.Clone(knownFindingClasses) }
-
 // Finding category constants for the CI step's check findings. The CI step
 // turns each settled issue on the pull request into one finding and the fix
 // half routes by this category: a check finding names its provider check in
 // Finding.Check, a merge-conflict finding asks for a rebase, a transient
 // finding is a provider-attributed outcome no code change can clear, and a
-// review-bot finding carries an available unresolved comment from a
-// third-party review bot's check, or the red check itself as a fallback when
-// no comment can be attached.
+// review-bot finding carries one unresolved comment from a third-party
+// review bot's check.
 const (
 	FindingCategoryCICheck         = "ci-check"
 	FindingCategoryCIMergeConflict = "ci-merge-conflict"
 	FindingCategoryCITransient     = "ci-transient"
 	FindingCategoryCIReviewBot     = "ci-review-bot"
 )
+
+// FindingCategoryReviewQuestion marks the synthetic finding the review step
+// emits for each question its reviewer asked and nobody has answered yet. It
+// is always an ask-user warning, which is what parks the step in
+// waiting-on-answers; the ID is derived from the question id so the same
+// question keeps the same finding across rounds. See
+// docs/src/content/docs/concepts/review-conversation.md.
+const FindingCategoryReviewQuestion = "review-question"
+
+// FindingCategoryTestCommand marks the deterministic finding produced when a
+// configured commands.test exits non-zero. The Test step's
+// ApprovalOverrideVerifier keys on it so an approval over that failure is
+// recorded as an override rather than a silent green completion.
+const FindingCategoryTestCommand = "test-command"
+
+// FindingIDTestAgentTimeout is the Test-step park when an evidence or repair
+// invocation burned its wall-clock budget. It is a budget/provider-slowness
+// cut, not a product defect; TestOverrideReason treats an approval of this
+// finding as a Test exception rather than a silent green pass.
+const FindingIDTestAgentTimeout = "test-agent-timeout"
+
+// FindingIDTestAgentUnvalidatedWork accompanies FindingIDTestAgentTimeout
+// when the run worktree holds commits or changes no Test turn validated. The
+// executor refuses Approve on that gate: the steps after Test would commit and
+// publish the work.
+const FindingIDTestAgentUnvalidatedWork = "test-agent-unvalidated-work"
 
 // Test scenario result constants: the vocabulary the test step's evidence
 // prompt instructs the agent to use for each derived scenario.
@@ -220,12 +201,6 @@ type Finding struct {
 	// findings into their owning gates and the CI step's findings by kind
 	// (see the FindingCategoryCI* constants). Empty everywhere else.
 	Category string `json:"category,omitempty"`
-	// Class is the document step's editorial/substantive/behavioural
-	// classification. It decides whether the finding gates and whether a
-	// correction owes a test re-run. Empty on every other step's findings, and
-	// on documentation findings recorded before the classification existed -
-	// which is why readers use ClassOrDefault rather than reading it raw.
-	Class string `json:"class,omitempty"`
 	// Check is the provider check name a CI finding was derived from. CheckID
 	// is the provider's opaque identity for that exact check, so same-named
 	// checks remain distinct through selection and repair. Both are empty on
@@ -233,24 +208,6 @@ type Finding struct {
 	Check   string `json:"check,omitempty"`
 	CheckID string `json:"check_id,omitempty"`
 }
-
-// ClassOrDefault resolves a finding's effective document class, defaulting an
-// empty/unknown class to substantive (gates). Fail-safe in the same direction
-// as ActionOrDefault: an unclassified documentation finding must reach a human,
-// never be silently demoted to a non-blocking editorial note. A pre-contract
-// findings payload replayed from an older run therefore keeps its old gating
-// behaviour instead of quietly losing it.
-func (f Finding) ClassOrDefault() string {
-	normalized := NormalizeFindingClass(f.Class)
-	if !IsKnownFindingClass(normalized) {
-		return FindingClassSubstantive
-	}
-	return normalized
-}
-
-// IsEditorial reports whether this finding is a recorded, non-gating editorial
-// note.
-func (f Finding) IsEditorial() bool { return f.ClassOrDefault() == FindingClassEditorial }
 
 // TestScenario is one named end-to-end scenario the test step derived from the
 // user intent and the change, and the result of driving it.
@@ -318,10 +275,16 @@ type findingWire struct {
 	UserInstructions    string `json:"user_instructions,omitempty"`
 	ReviewScope         string `json:"review_scope,omitempty"`
 	Category            string `json:"category,omitempty"`
-	Class               string `json:"class,omitempty"`
 	Check               string `json:"check,omitempty"`
 	CheckID             string `json:"check_id,omitempty"`
 	RequiresHumanReview *bool  `json:"requires_human_review,omitempty"`
+}
+
+// WithdrawnFinding is one carried finding an answer round retracted, naming
+// the finding by the id it was carried under and why the answer disproved it.
+type WithdrawnFinding struct {
+	ID     string `json:"id"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // Findings is the structured findings payload exchanged across pipeline, IPC, and TUI.
@@ -331,40 +294,52 @@ type findingWire struct {
 // written before the contract existed, so an older recorded run still parses
 // and simply renders no scenario table.
 type Findings struct {
-	Items          []Finding      `json:"findings"`
-	Summary        string         `json:"summary"`
-	Tested         []string       `json:"tested,omitempty"`
-	TestingSummary string         `json:"testing_summary,omitempty"`
-	Artifacts      []TestArtifact `json:"artifacts,omitempty"`
-	Scenarios      []TestScenario `json:"scenarios,omitempty"`
-	Verdict        string         `json:"verdict,omitempty"`
-	TestedHeadSHA  string         `json:"tested_head_sha,omitempty"`
-	RiskLevel      string         `json:"risk_level"`
-	RiskRationale  string         `json:"risk_rationale"`
-	RiskScope      string         `json:"risk_scope,omitempty"`
-	// CorrectedPaths names the files a document-step bounded correction
-	// actually committed in this round, in the order git reported them. It is
-	// the durable, per-round record of what the pipeline changed on the
-	// branch, so the PR body can state the correction rather than leave a
-	// reader to infer it from "Fix applied". Empty on every other step and on
-	// every round that applied no correction.
-	CorrectedPaths []string `json:"corrected_paths,omitempty"`
+	Items   []Finding `json:"findings"`
+	Summary string    `json:"summary"`
+	// ReviewedPaths is the review step's coverage record: the changed files the
+	// review turn actually examined and judged. It is the positive-verification
+	// signal that lets a finding the operator selected for a fix leave the
+	// outstanding set (see pipeline.resolveVerifiedFindingsJSON). A review turn
+	// that does not list a path has not proven anything about it, so silence is
+	// never read as resolution. Empty on every non-review payload.
+	ReviewedPaths []string `json:"reviewed_paths,omitempty"`
+	// WithdrawnFindings is an answer round's explicit re-adjudication: the
+	// carried findings the reviewer now says no longer hold, each with its
+	// reason. On an answer round a carried finding leaves the outstanding set
+	// ONLY by appearing here. Silence keeps it, so covering a file can no
+	// longer clear an unrelated finding in it. Empty on every other payload.
+	WithdrawnFindings []WithdrawnFinding `json:"withdrawn_findings,omitempty"`
+	Tested            []string           `json:"tested,omitempty"`
+	TestingSummary    string             `json:"testing_summary,omitempty"`
+	Artifacts         []TestArtifact     `json:"artifacts,omitempty"`
+	Scenarios         []TestScenario     `json:"scenarios,omitempty"`
+	Verdict           string             `json:"verdict,omitempty"`
+	TestedHeadSHA     string             `json:"tested_head_sha,omitempty"`
+	// UnvalidatedSinceSHA is set only on a Test budget-cut park: the head its
+	// unvalidated-work check measured from, carried so a repeated cut before any
+	// evidence turn completes re-measures from that same head.
+	UnvalidatedSinceSHA string `json:"unvalidated_since_sha,omitempty"`
+	RiskLevel           string `json:"risk_level"`
+	RiskRationale       string `json:"risk_rationale"`
+	RiskScope           string `json:"risk_scope,omitempty"`
 }
 
 type findingsWire struct {
-	Items          []Finding      `json:"findings"`
-	Legacy         []Finding      `json:"items"`
-	Summary        string         `json:"summary"`
-	Tested         []string       `json:"tested"`
-	TestingSummary string         `json:"testing_summary"`
-	Artifacts      []TestArtifact `json:"artifacts"`
-	Scenarios      []TestScenario `json:"scenarios"`
-	Verdict        string         `json:"verdict"`
-	TestedHeadSHA  string         `json:"tested_head_sha"`
-	RiskLevel      string         `json:"risk_level"`
-	RiskRationale  string         `json:"risk_rationale"`
-	RiskScope      string         `json:"risk_scope"`
-	CorrectedPaths []string       `json:"corrected_paths"`
+	Items               []Finding          `json:"findings"`
+	Legacy              []Finding          `json:"items"`
+	Summary             string             `json:"summary"`
+	ReviewedPaths       []string           `json:"reviewed_paths"`
+	WithdrawnFindings   []WithdrawnFinding `json:"withdrawn_findings"`
+	Tested              []string           `json:"tested"`
+	TestingSummary      string             `json:"testing_summary"`
+	Artifacts           []TestArtifact     `json:"artifacts"`
+	Scenarios           []TestScenario     `json:"scenarios"`
+	Verdict             string             `json:"verdict"`
+	TestedHeadSHA       string             `json:"tested_head_sha"`
+	UnvalidatedSinceSHA string             `json:"unvalidated_since_sha"`
+	RiskLevel           string             `json:"risk_level"`
+	RiskRationale       string             `json:"risk_rationale"`
+	RiskScope           string             `json:"risk_scope"`
 }
 
 // ParseFindingsJSON decodes findings JSON, accepting current and legacy item
@@ -379,18 +354,20 @@ func ParseFindingsJSON(raw string) (Findings, error) {
 		items = wire.Legacy
 	}
 	return Findings{
-		Items:          items,
-		Summary:        wire.Summary,
-		Tested:         wire.Tested,
-		TestingSummary: wire.TestingSummary,
-		Artifacts:      wire.Artifacts,
-		Scenarios:      wire.Scenarios,
-		Verdict:        wire.Verdict,
-		TestedHeadSHA:  wire.TestedHeadSHA,
-		RiskLevel:      wire.RiskLevel,
-		RiskRationale:  wire.RiskRationale,
-		RiskScope:      wire.RiskScope,
-		CorrectedPaths: wire.CorrectedPaths,
+		Items:               items,
+		Summary:             wire.Summary,
+		ReviewedPaths:       wire.ReviewedPaths,
+		WithdrawnFindings:   wire.WithdrawnFindings,
+		Tested:              wire.Tested,
+		TestingSummary:      wire.TestingSummary,
+		Artifacts:           wire.Artifacts,
+		Scenarios:           wire.Scenarios,
+		Verdict:             wire.Verdict,
+		TestedHeadSHA:       wire.TestedHeadSHA,
+		UnvalidatedSinceSHA: wire.UnvalidatedSinceSHA,
+		RiskLevel:           wire.RiskLevel,
+		RiskRationale:       wire.RiskRationale,
+		RiskScope:           wire.RiskScope,
 	}, nil
 }
 
@@ -411,25 +388,11 @@ func FindingsMetadata(findings Findings) Findings {
 
 // NormalizeFindings assigns deterministic IDs to findings that do not have one yet.
 func NormalizeFindings(findings Findings, prefix string) Findings {
-	used := make(map[string]bool, len(findings.Items))
-	for _, item := range findings.Items {
-		if item.ID != "" {
-			used[item.ID] = true
-		}
-	}
 	for i := range findings.Items {
 		if findings.Items[i].ID != "" {
 			continue
 		}
-		for candidate := i + 1; ; candidate++ {
-			id := prefix + "-" + itoa(candidate)
-			if used[id] {
-				continue
-			}
-			findings.Items[i].ID = id
-			used[id] = true
-			break
-		}
+		findings.Items[i].ID = prefix + "-" + itoa(i+1)
 	}
 	return findings
 }
@@ -557,6 +520,26 @@ func HasActionableFindings(findings Findings) bool {
 	return false
 }
 
+// HasReviewQuestion reports whether a gate is parked on a question its
+// reviewer asked and nobody has answered.
+//
+// It qualifies HasActionableFindings above, which counts an open question as
+// actionable because its action is ask-user. That is right for every other
+// ask-user finding and wrong for this one: a question is resolved by an
+// ANSWER, not by a verdict and not by a fix, so yolo / auto-resolve has to
+// recognize it and stand aside rather than treating it as standing consent.
+// Keyed on the category, never on the finding ID's "question-" prefix, so an
+// agent-authored finding that happens to be named that way is never mistaken
+// for one.
+func HasReviewQuestion(findings Findings) bool {
+	for _, item := range findings.Items {
+		if item.Category == FindingCategoryReviewQuestion {
+			return true
+		}
+	}
+	return false
+}
+
 func summarizeSelectedFindings(count int) string {
 	switch count {
 	case 0:
@@ -637,7 +620,6 @@ func (f *Finding) UnmarshalJSON(data []byte) error {
 	f.UserInstructions = wire.UserInstructions
 	f.ReviewScope = wire.ReviewScope
 	f.Category = wire.Category
-	f.Class = wire.Class
 	f.Check = wire.Check
 	f.CheckID = wire.CheckID
 	if f.Action == "" && wire.RequiresHumanReview != nil {

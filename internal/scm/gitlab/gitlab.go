@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 )
@@ -190,15 +191,16 @@ func parseMergeRequestURL(raw, expectedHost, expectedProject string) (int, error
 }
 
 type mrPayload struct {
-	IID                 int    `json:"iid"`
-	Title               string `json:"title"`
-	WebURL              string `json:"web_url"`
-	URL                 string `json:"url"`
-	State               string `json:"state"`
-	HasConflicts        bool   `json:"has_conflicts"`
-	DetailedMergeStatus string `json:"detailed_merge_status"`
-	MergeStatus         string `json:"merge_status"`
-	TargetBranch        string `json:"target_branch"`
+	Description         *string `json:"description"`
+	IID                 int     `json:"iid"`
+	Title               string  `json:"title"`
+	WebURL              string  `json:"web_url"`
+	URL                 string  `json:"url"`
+	State               string  `json:"state"`
+	HasConflicts        bool    `json:"has_conflicts"`
+	DetailedMergeStatus string  `json:"detailed_merge_status"`
+	MergeStatus         string  `json:"merge_status"`
+	TargetBranch        string  `json:"target_branch"`
 }
 
 func (p mrPayload) toPR() *scm.PR {
@@ -263,6 +265,13 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 }
 
 func (h *Host) CreatePR(ctx context.Context, branch, base string, content scm.PRContent) (*scm.PR, error) {
+	effectiveTitle := content.Title
+	if h.draft && !isDraftTitle(effectiveTitle) {
+		effectiveTitle = "Draft: " + effectiveTitle
+	}
+	if err := validateMRTitle(effectiveTitle); err != nil {
+		return nil, fmt.Errorf("glab mr create: %w", err)
+	}
 	args := []string{"mr", "create",
 		"--source-branch", branch,
 		"--target-branch", base,
@@ -305,21 +314,28 @@ func (h *Host) UpdatePR(ctx context.Context, pr *scm.PR, content scm.PRContent) 
 	// draft MR ready for review, so read the live title first and re-apply the
 	// marker. Preserve only: a non-draft MR never gains one. A failed read fails
 	// the update closed rather than risk toggling draft state.
-	mr, err := h.viewMR(ctx, id)
-	if err != nil {
-		return nil, err
+	args := []string{"mr", "update", id}
+	// Body-only updates must omit title, not read then resend it: doing so
+	// would overwrite a concurrent title/draft edit.
+	if content.Title != "" {
+		mr, err := h.viewMR(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(mr.Title) == "" {
+			return nil, errors.New("glab mr view: missing merge request title")
+		}
+		title := content.Title
+		if isDraftTitle(mr.Title) && !isDraftTitle(title) {
+			title = "Draft: " + title
+		}
+		if err := validateMRTitle(title); err != nil {
+			return nil, fmt.Errorf("glab mr update: %w", err)
+		}
+		args = append(args, "--title", title)
 	}
-	if strings.TrimSpace(mr.Title) == "" {
-		return nil, errors.New("glab mr view: missing merge request title")
-	}
-	title := content.Title
-	if isDraftTitle(mr.Title) && !isDraftTitle(title) {
-		title = "Draft: " + title
-	}
-	cmd := h.cmd(ctx, "glab", "mr", "update", id,
-		"--title", title,
-		"--description", content.Body,
-	)
+	args = append(args, "--description", content.Body)
+	cmd := h.cmd(ctx, "glab", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("glab mr update: %s: %w", strings.TrimSpace(string(out)), err)
 	}
@@ -354,6 +370,13 @@ func (h *Host) SetPRBaseBranch(ctx context.Context, pr *scm.PR, baseBranch strin
 func isDraftTitle(title string) bool {
 	t := strings.ToLower(strings.TrimSpace(title))
 	return strings.HasPrefix(t, "draft:") || strings.HasPrefix(t, "[draft]") || strings.HasPrefix(t, "(draft)")
+}
+
+func validateMRTitle(title string) error {
+	if utf8.RuneCountInString(title) > 255 {
+		return errors.New("GitLab merge request title must not exceed 255 characters")
+	}
+	return nil
 }
 
 func (h *Host) GetPRState(ctx context.Context, pr *scm.PR) (scm.PRState, error) {

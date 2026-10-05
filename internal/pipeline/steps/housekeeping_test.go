@@ -37,7 +37,7 @@ func TestDocumentStep_CombinedPassCoversBothDutiesAndSplitsFindings(t *testing.T
 		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
 			return &agent.Result{Output: json.RawMessage(`{
 				"findings":[
-					{"severity":"warning","file":"README.md","description":"config docs conflict","action":"ask-user","category":"documentation","class":"substantive"},
+					{"severity":"warning","description":"config docs conflict","action":"ask-user","category":"documentation"},
 					{"severity":"warning","description":"unfixable vet warning","action":"ask-user","category":"lint"}
 				],
 				"summary":"housekeeping pass"
@@ -129,7 +129,7 @@ func TestDocumentStep_ConfiguredLintCommandKeepsLintCategorizedFindingInDocument
 		name: "test",
 		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
 			return &agent.Result{Output: json.RawMessage(`{
-				"findings":[{"severity":"warning","description":"documentation needs a decision","action":"ask-user","category":"lint","class":"substantive"}],
+				"findings":[{"severity":"warning","description":"documentation needs a decision","action":"ask-user","category":"lint"}],
 				"summary":"documentation needs review"
 			}`)}, nil
 		},
@@ -252,8 +252,8 @@ func TestLintStep_RunsOwnPassWithoutCombinedResult(t *testing.T) {
 	if outcome.NeedsApproval {
 		t.Fatal("clean lint pass must not park")
 	}
-	if outcome.FixSummary != noChangesAppliedSummary {
-		t.Fatalf("fix summary = %q, want %q", outcome.FixSummary, noChangesAppliedSummary)
+	if outcome.FixSummary != NoChangesAppliedSummary {
+		t.Fatalf("fix summary = %q, want %q", outcome.FixSummary, NoChangesAppliedSummary)
 	}
 }
 
@@ -267,7 +267,7 @@ func TestDocumentStep_CombinedRetryDropsPriorLintResultWhenOutputIsUntrusted(t *
 		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
 			calls++
 			if calls == 1 {
-				return &agent.Result{Output: json.RawMessage(`{"findings":[{"severity":"warning","file":"README.md","description":"docs need a decision","action":"ask-user","category":"documentation","class":"substantive"}],"summary":"docs need review"}`)}, nil
+				return &agent.Result{Output: json.RawMessage(`{"findings":[{"severity":"warning","description":"docs need a decision","action":"ask-user","category":"documentation"}],"summary":"docs need review"}`)}, nil
 			}
 			return &agent.Result{Text: "untrusted output"}, nil
 		},
@@ -324,6 +324,7 @@ func TestLintStep_FixRoundReassessesWithOwnAgentPass(t *testing.T) {
 // pass must cost exactly one.
 func TestPipeline_DocumentPlusLintIsOneAgentInvocation(t *testing.T) {
 	workDir, baseSHA, headSHA := setupGitRepo(t)
+	ensureHermeticOrigin(t, workDir)
 
 	database, err := db.Open(filepath.Join(t.TempDir(), "state.sqlite"))
 	if err != nil {

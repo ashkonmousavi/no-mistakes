@@ -80,7 +80,7 @@ If one daemon serves repositories that require non-overlapping accounts, give ea
 - PR creation and update on pushes
 - CI check polling with exponential backoff (30s → 60s → 120s) until the PR is merged, closed, or the configured `ci_timeout` idle window elapses
 - Failed job log fetching (`gh run view --log-failed`) for the CI auto-fix step
-- A red Greptile check parked for a decision: available unresolved review-thread comments become `ask-user` CI findings and are also supplied to CI repair prompts, while the red check itself remains as one check-level finding when no comment can be attached; see the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci) for filtering and prompt-safety details
+- A red Greptile check parked as `ask-user` CI findings carrying its unresolved review-thread comments, which are also supplied to CI repair prompts; see the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci) for filtering and prompt-safety details
 - PR mergeability polling, and agent-driven resolution when the provider reports an actual merge conflict
 
 ### GitHub fork contributions
@@ -99,6 +99,11 @@ Re-running `no-mistakes init` later preserves the stored fork URL unless you pas
 
 Fork routing currently requires both `origin` and `--fork-url` to be GitHub remotes with owner/repo paths.
 GitLab, Forgejo, Bitbucket, and Azure DevOps fork MR/PR routing are not implemented yet; if a legacy or manually edited repo record has `fork_url` set for those providers, PR creation skips instead of opening an unsafe self PR.
+
+#### Workflow-file changes require the `workflow` scope
+
+If your branch touches a `.github/workflows/*.yml` or `*.yaml` file, the push to your fork requires a GitHub credential with the `workflow` scope; GitHub rejects it with `refusing to allow an OAuth App to create or update workflow ... without workflow scope` when the stored token lacks it.
+See [Troubleshooting](/no-mistakes/guides/troubleshooting/#push-fails-with-refusing-to-allow-an-oauth-app-to-create-or-update-workflow--without-workflow-scope) for the recovery steps.
 
 ## GitLab
 
@@ -198,11 +203,11 @@ well as their SSH forms (`git@ssh.dev.azure.com:v3/...`).
 
 **What you get:**
 
-- PR creation and update (`az repos pr create` / `update`); Azure DevOps caps
-  PR descriptions at 4000 characters, so the pipeline builds the body within
-  that budget and applies a final truncation backstop with a visible marker.
+- PR creation and update (`az repos pr create` / `update`).
   See the [PR step reference](/no-mistakes/reference/pipeline-steps/#pr) for
-  section composition and truncation behavior.
+  ordinary description composition and truncation, and
+  [`pr.template`](/no-mistakes/reference/repo-config/#prtemplate) for
+  author-preserving publication and its provider limits.
 - CI status polling - Azure branch policy evaluations (build validation and
   status checks) are read via `az repos pr policy list` until the PR is
   completed, abandoned, or the configured `ci_timeout` idle window elapses
@@ -278,7 +283,7 @@ The GitLab backend is pinned against `glab v1.5x`. Self-hosted detection and the
 
 ## SSH host aliases
 
-SSH remotes that use a host alias from your SSH configuration (for example `git@github-personal:owner/repo` or `git@gitlab-work:group/repo`, where `github-personal`/`gitlab-work` map to a real `HostName` via `~/.ssh/config`) are supported. `no-mistakes` resolves the alias through `ssh -G` to its real host name and uses that host only for provider detection and identity checks, including scoping `gh` or `glab` to the right instance and matching an SSH Forgejo remote to `FORGEJO_BASE_URL`. The original Git remote URL is left untouched, so authentication and pushes continue to use the alias exactly as your SSH configuration expects.
+SSH remotes that use a host alias from your SSH configuration (for example `git@github-personal:owner/repo` or `git@gitlab-work:group/repo`, where `github-personal`/`gitlab-work` map to a real `HostName` via `~/.ssh/config`) are supported. `no-mistakes` resolves the alias through `ssh -G` to its real host name and uses that host only for provider detection and identity checks, including scoping `gh` or `glab` to the right instance and matching an SSH Forgejo remote to `FORGEJO_BASE_URL`. `ssh.github.com` and `altssh.gitlab.com` are rewritten to `github.com` and `gitlab.com` before provider detection and `gh`/`glab` host scoping. The original Git remote URL is left untouched, so the URL used for push stays the user's alias and authentication continues to use it exactly as the SSH configuration expects.
 
 If `ssh -G` is unavailable or the alias does not resolve, detection falls back to the literal host in the remote URL rather than failing the run.
 
@@ -301,5 +306,5 @@ no-mistakes doctor
 `doctor` checks `gh` and `az` availability. It also validates every configured forge profile, including its provider config, target host, and online authentication. Without profiles, confirm `glab` is installed and authenticated for GitLab. For Forgejo, run `FORGEJO_BASE_URL=<host> forgejo-axi status --json` from the daemon's environment. For Bitbucket Cloud, confirm the two env vars are set in that environment. For Azure DevOps, confirm the `azure-devops` extension is installed (`az extension show --name azure-devops`) and a PAT is available. For Gitea, confirm `tea` is installed and has a login configured for your instance (`tea logins list`).
 
 :::note
-When the daemon runs through a managed service (launchd, systemd, Task Scheduler), it reloads environment from your login shell on macOS and Linux so CLI auth and provider token variables are picked up, and it augments `PATH` with common binary directories. If credentials or PATH-derived tools are missing, check `~/.no-mistakes/logs/daemon.log` for a login-shell environment resolution warning. On Windows it reuses the current process environment.
+Provider CLIs and credentials inherit the daemon's startup environment. If credentials or PATH-derived tools are missing, check `~/.no-mistakes/logs/daemon.log` for a login-shell environment resolution warning, then see [Environment the daemon sees](/no-mistakes/reference/environment/#environment-the-daemon-sees) for the platform-specific resolution and restart behavior.
 :::

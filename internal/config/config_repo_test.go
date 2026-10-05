@@ -125,6 +125,22 @@ func TestLoadRepo_AgentTimeoutIsNotARepoSetting(t *testing.T) {
 // branch cannot widen or remove the Test-step evidence-agent bound. It is a
 // global-only operator machine setting (config.GlobalConfig,
 // DefaultTestAgentTimeout).
+func TestLoadRepo_WorkingTimeoutIsNotARepoSetting(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".no-mistakes.yaml")
+	data := "agent_working_timeout: \"2h\"\nreview_agent_working_timeout: \"2h\"\ntest_agent_working_timeout: \"2h\"\n"
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadRepo(dir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Agent != "" || cfg.Commands.Test != "" {
+		t.Fatalf("unrelated repo config fields changed: %#v", cfg)
+	}
+}
+
 func TestLoadRepo_TestAgentTimeoutIsNotARepoSetting(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".no-mistakes.yaml")
@@ -305,72 +321,6 @@ func TestMerge_CIRerunTransientFromRepoConfig(t *testing.T) {
 				t.Fatalf("ci.rerun_transient = %d, want %d", cfg.CI.RerunTransient, tc.want)
 			}
 		})
-	}
-}
-
-// Artifact-service retries spend a separate, candidate-wide allowance. The
-// safe default is disabled and the hard maximum is one, so neither a typo nor
-// the cancellation budget can turn one candidate into a retry loop.
-func TestMerge_CIRerunInfrastructureDefaultsOffAndCapsAtOne(t *testing.T) {
-	cases := []struct {
-		name string
-		yaml string
-		want int
-	}{
-		{"unset is off", "ci: {}\n", DefaultCIRerunInfrastructure},
-		{"explicit opt in", "ci:\n  rerun_infrastructure: 1\n", 1},
-		{"zero disables", "ci:\n  rerun_infrastructure: 0\n", 0},
-		{"negative disables", "ci:\n  rerun_infrastructure: -1\n", 0},
-		{"above cap is one", "ci:\n  rerun_infrastructure: 9\n", MaxCIRerunInfrastructure},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			if err := os.WriteFile(filepath.Join(dir, ".no-mistakes.yaml"), []byte(tc.yaml), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			repo, err := LoadRepo(dir)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if got := Merge(DefaultGlobalConfig(), repo).CI.RerunInfrastructure; got != tc.want {
-				t.Fatalf("ci.rerun_infrastructure = %d, want %d", got, tc.want)
-			}
-		})
-	}
-}
-
-// The infrastructure allowance is trusted-only and independent of
-// rerun_transient: a pushed branch cannot buy itself a retry or borrow the
-// cancellation budget.
-func TestEffectiveRepoConfig_CIRerunInfrastructureTrustedOnlyAndIndependent(t *testing.T) {
-	pushedInfra, trustedInfra, transient := 1, 0, 4
-	pushed := &RepoConfig{}
-	pushed.CI.RerunInfrastructure = &pushedInfra
-	pushed.CI.RerunTransient = &transient
-	trusted := &RepoConfig{}
-	trusted.CI.RerunInfrastructure = &trustedInfra
-	trusted.CI.RerunTransient = &transient
-
-	effective := EffectiveRepoConfig(pushed, trusted, true)
-	resolved := Merge(DefaultGlobalConfig(), effective)
-	if resolved.CI.RerunInfrastructure != 0 {
-		t.Fatalf("ci.rerun_infrastructure = %d, want trusted value 0", resolved.CI.RerunInfrastructure)
-	}
-	if resolved.CI.RerunTransient != transient {
-		t.Fatalf("ci.rerun_transient = %d, want independent value %d", resolved.CI.RerunTransient, transient)
-	}
-
-	withoutTrusted := EffectiveRepoConfig(pushed, nil, false)
-	if withoutTrusted.CI.RerunInfrastructure != nil {
-		t.Fatalf("pushed ci.rerun_infrastructure survived without a trusted copy: %v", withoutTrusted.CI.RerunInfrastructure)
-	}
-}
-
-func TestLoadRepo_CIRerunInfrastructureRejectsNonInteger(t *testing.T) {
-	t.Parallel()
-	if _, err := LoadRepoFromBytes([]byte("ci:\n  rerun_infrastructure: once\n")); err == nil {
-		t.Fatal("non-integer ci.rerun_infrastructure was accepted")
 	}
 }
 

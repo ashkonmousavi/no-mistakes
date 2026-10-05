@@ -48,6 +48,15 @@ func RunRaw(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	return runInDirWithEnvRaw(ctx, dir, nil, args...)
 }
 
+// RunWithInput executes a git command with exact standard input and returns
+// trimmed stdout. It carries the same bare-repository handling as Run.
+func RunWithInput(ctx context.Context, dir, input string, args ...string) (string, error) {
+	if isBareGitDir(dir) {
+		return runInDirWithEnvAndInput(ctx, dir, nil, input, append([]string{"--git-dir=" + dir}, args...)...)
+	}
+	return runInDirWithEnvAndInput(ctx, dir, nil, input, args...)
+}
+
 // RunBare executes Git against exactly bareDir. Unlike Run, it never falls
 // back to cwd-based repository discovery when bareDir is malformed. Gate
 // recovery uses this after structural validation so an invalid directory under
@@ -77,14 +86,25 @@ func runInDir(ctx context.Context, dir string, args ...string) (string, error) {
 }
 
 func runInDirWithEnv(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
-	out, err := runInDirWithEnvRaw(ctx, dir, extraEnv, args...)
+	return runInDirWithEnvAndInput(ctx, dir, extraEnv, "", args...)
+}
+
+func runInDirWithEnvAndInput(ctx context.Context, dir string, extraEnv []string, input string, args ...string) (string, error) {
+	out, err := runInDirWithEnvAndInputRaw(ctx, dir, extraEnv, input, args...)
 	return strings.TrimSpace(string(out)), err
 }
 
 func runInDirWithEnvRaw(ctx context.Context, dir string, extraEnv []string, args ...string) ([]byte, error) {
+	return runInDirWithEnvAndInputRaw(ctx, dir, extraEnv, "", args...)
+}
+
+func runInDirWithEnvAndInputRaw(ctx context.Context, dir string, extraEnv []string, input string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(nonInteractiveEnvForContext(ctx, dir), extraEnv...)
+	if input != "" {
+		cmd.Stdin = strings.NewReader(input)
+	}
 	winproc.Harden(cmd)
 	// OutputShellCommand captures stdout only, so unlike cmd.Output it never
 	// fills ExitError.Stderr. Capture stderr explicitly or the git error text
@@ -100,6 +120,36 @@ func runInDirWithEnvRaw(ctx context.Context, dir string, extraEnv []string, args
 		return nil, fmt.Errorf("git %s: %w: %s", safeurl.RedactText(strings.Join(args, " ")), err, safeurl.RedactText(strings.TrimSpace(stderr.String())))
 	}
 	return out, nil
+}
+
+// StablePatchID returns Git's stable patch identity for one file between two
+// commits. The file path is part of the diff, so the same-shaped edit to a
+// different file cannot prove content preservation.
+//
+// The pathspec is explicitly literal: a wildcard or leading colon in a real
+// file name would otherwise be read as a glob or as pathspec magic and fold a
+// sibling file's diff into this file's identity.
+func StablePatchID(ctx context.Context, dir, from, to, path string) (string, error) {
+	diff, err := RunRaw(ctx, dir, "diff", "--no-ext-diff", "--binary", from, to, "--", ":(literal)"+path)
+	if err != nil {
+		return "", err
+	}
+	if len(diff) == 0 {
+		return "", nil
+	}
+	args := []string{"patch-id", "--stable"}
+	if isBareGitDir(dir) {
+		args = append([]string{"--git-dir=" + dir}, args...)
+	}
+	out, err := runInDirWithEnvAndInputRaw(ctx, dir, nil, string(diff), args...)
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return "", fmt.Errorf("git patch-id --stable returned no identity")
+	}
+	return fields[0], nil
 }
 
 // ValidateBareRepository verifies both the filesystem shape and Git's own bare
@@ -508,37 +558,48 @@ func Push(ctx context.Context, dir, remote, ref, expectedSHA string, forceWithLe
 // PushCommit pushes one immutable commit object to a remote ref. Unlike Push,
 // a concurrent worktree HEAD move cannot change the source selected by git.
 func PushCommit(ctx context.Context, dir, remote, commitSHA, ref, expectedSHA string, forceWithLease bool) error {
-	return pushSourceWithOptions(ctx, dir, remote, commitSHA, ref, expectedSHA, forceWithLease, nil)
+	return pushSourceWithOptions(ctx, dir, remote, commitSHA, ref, expectedSHA, forceWithLease, nil, false)
 }
 
 // PushCommitWithOptions pushes an immutable commit with hook-visible options.
 // It keeps proof launch identity attached to the commit sampled before pushing.
 func PushCommitWithOptions(ctx context.Context, dir, remote, commitSHA, ref, expectedSHA string, forceWithLease bool, pushOptions []string) error {
-	return pushSourceWithOptions(ctx, dir, remote, commitSHA, ref, expectedSHA, forceWithLease, pushOptions)
+	return pushSourceWithOptions(ctx, dir, remote, commitSHA, ref, expectedSHA, forceWithLease, pushOptions, false)
+}
+
+// PushCommitWithOptionsSkippingHooks is PushCommitWithOptions for an internal
+// control-plane push that must not invoke the repository's pre-push hook. Use
+// it only for a local no-mistakes gate trigger; delivery pushes keep the
+// repository hook.
+func PushCommitWithOptionsSkippingHooks(ctx context.Context, dir, remote, commitSHA, ref, expectedSHA string, forceWithLease bool, pushOptions []string) error {
+	return pushSourceWithOptions(ctx, dir, remote, commitSHA, ref, expectedSHA, forceWithLease, pushOptions, true)
 }
 
 // PushWithOptions pushes HEAD to a remote with per-push options.
 func PushWithOptions(ctx context.Context, dir, remote, ref, expectedSHA string, forceWithLease bool, pushOptions []string) error {
-	return pushSourceWithOptions(ctx, dir, remote, "HEAD", ref, expectedSHA, forceWithLease, pushOptions)
+	return pushSourceWithOptions(ctx, dir, remote, "HEAD", ref, expectedSHA, forceWithLease, pushOptions, false)
 }
 
-func pushSourceWithOptions(ctx context.Context, dir, remote, source, ref, expectedSHA string, forceWithLease bool, pushOptions []string) error {
-	// git's send-pack writes push options even when no ref needs updating
-	// (send-pack.c, unchanged from v2.43.0 through master), but receive-pack
-	// reads them only after a non-empty command list. On an up-to-date push it
-	// can therefore exit while send-pack is still writing, and git push dies of
-	// SIGPIPE ("signal: broken pipe") - a scheduling race that surfaced as a
-	// macOS-only CI failure. A push whose remote ref already names the source
-	// commit updates nothing and runs no hook, so its options can reach no one:
-	// skipping it returns exactly what a surviving no-op push returns, as if the
-	// push ran at the moment of the check. Force-with-lease is left to git,
-	// because its lease can still reject a push that would otherwise be a no-op.
-	if len(pushOptions) > 0 && !forceWithLease {
-		if upToDate, err := remoteRefNamesSource(ctx, dir, remote, source, ref); err == nil && upToDate {
-			return nil
-		}
+// PushWithOptionsSkippingHooks is PushWithOptions for an internal control-plane
+// push that must not invoke the repository's pre-push hook. Use it only for a
+// local no-mistakes gate trigger; delivery pushes keep the repository hook.
+func PushWithOptionsSkippingHooks(ctx context.Context, dir, remote, ref, expectedSHA string, forceWithLease bool, pushOptions []string) error {
+	return pushSourceWithOptions(ctx, dir, remote, "HEAD", ref, expectedSHA, forceWithLease, pushOptions, true)
+}
+
+func pushSourceWithOptions(ctx context.Context, dir, remote, source, ref, expectedSHA string, forceWithLease bool, pushOptions []string, skipHooks bool) error {
+	// On an up-to-date push, send-pack sends no ref update but still writes the
+	// push options and a closing flush; receive-pack exits on the empty update
+	// list without reading them, so that write can kill git with SIGPIPE. Git
+	// reports up-to-date before any lease check and runs no hook, so skipping
+	// the push gives the same result without the race.
+	if len(pushOptions) > 0 && remoteRefAt(ctx, dir, remote, ref, source) {
+		return nil
 	}
 	args := []string{"push"}
+	if skipHooks {
+		args = append(args, "--no-verify")
+	}
 	for _, option := range pushOptions {
 		args = append(args, "-o", option)
 	}
@@ -555,25 +616,23 @@ func pushSourceWithOptions(ctx context.Context, dir, remote, source, ref, expect
 	return err
 }
 
-// remoteRefNamesSource reports whether remote's ref already names the commit
-// source resolves to in dir, which is exactly when a push of source to ref has
-// nothing to update. It matches the ref name exactly, because ls-remote's
-// pattern also matches longer refs that merely end in the same path.
-func remoteRefNamesSource(ctx context.Context, dir, remote, source, ref string) (bool, error) {
-	local, err := Run(ctx, dir, "rev-parse", "--verify", source+"^{commit}")
+// remoteRefAt reports whether remote's exact ref already points at source's
+// commit. Any lookup failure reports false so the caller pushes as usual.
+func remoteRefAt(ctx context.Context, dir, remote, ref, source string) bool {
+	commit, err := Run(ctx, dir, "rev-parse", "--verify", source+"^{commit}")
 	if err != nil {
-		return false, err
+		return false
 	}
 	out, err := Run(ctx, dir, "ls-remote", remote, ref)
 	if err != nil {
-		return false, err
+		return false
 	}
 	for _, line := range strings.Split(out, "\n") {
-		if fields := strings.Fields(line); len(fields) == 2 && fields[1] == ref {
-			return fields[0] == local, nil
+		if sha, name, ok := strings.Cut(line, "\t"); ok && name == ref {
+			return sha == commit
 		}
 	}
-	return false, nil
+	return false
 }
 
 // LsRemote returns the SHA of a ref on a remote. Returns empty string if the ref doesn't exist.
@@ -723,6 +782,35 @@ func ResolveRef(ctx context.Context, dir, ref string) (string, error) {
 		return "", fmt.Errorf("resolve ref %s: %w", ref, err)
 	}
 	return out, nil
+}
+
+func DirectRefTarget(ctx context.Context, dir, ref string) (string, bool, error) {
+	target, err := Run(ctx, dir, "symbolic-ref", "--quiet", "--no-recurse", ref)
+	if err == nil {
+		return "", false, fmt.Errorf("ref %s is symbolic (target %s)", ref, target)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		return "", false, err
+	}
+	out, err := Run(ctx, dir, "for-each-ref", "--format=%(refname) %(objectname) %(symref)", ref)
+	if err != nil {
+		return "", false, err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != ref {
+			continue
+		}
+		if len(fields) > 2 {
+			return "", false, fmt.Errorf("ref %s is symbolic (target %s)", ref, fields[2])
+		}
+		if len(fields) != 2 {
+			return "", false, fmt.Errorf("ref %s has no direct object target", ref)
+		}
+		return fields[1], true, nil
+	}
+	return "", false, nil
 }
 
 func ExactRefTarget(ctx context.Context, dir, ref string) (string, bool, error) {

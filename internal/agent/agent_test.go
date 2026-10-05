@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,6 +28,7 @@ func TestNew_KnownAgents(t *testing.T) {
 		{name: "pi", agent: types.AgentPi, bin: "pi", wantName: "pi"},
 		{name: "copilot", agent: types.AgentCopilot, bin: "copilot", wantName: "copilot"},
 		{name: "cursor alias", agent: types.AgentCursor, bin: "acpx", wantName: "acp:cursor"},
+		{name: "devin alias", agent: types.AgentDevin, bin: "acpx", wantName: "acp:devin"},
 	}
 
 	for _, tt := range tests {
@@ -63,7 +65,7 @@ func TestNewWithOptions_ACPRegistryOverride(t *testing.T) {
 	if !ok {
 		t.Fatalf("agent type = %T, want *acpxAgent", a)
 	}
-	args := acpx.buildArgs(RunOpts{Prompt: "do work", CWD: "/repo"})
+	args := acpx.buildArgs(acpx.rawCommand, RunOpts{Prompt: "do work", CWD: "/repo"})
 	joined := strings.Join(args, "\x00")
 	if !strings.Contains(joined, "--agent\x00node /tmp/mock-acp.mjs") {
 		t.Fatalf("args = %q, want raw --agent override", args)
@@ -88,7 +90,7 @@ func TestACPAliasUsesDefaultCommand(t *testing.T) {
 	if acpx.rawCommand != "cursor-agent acp" {
 		t.Errorf("rawCommand = %q, want cursor-agent acp", acpx.rawCommand)
 	}
-	args := acpx.buildArgs(RunOpts{Prompt: "do work"})
+	args := acpx.buildArgs(acpx.rawCommand, RunOpts{Prompt: "do work"})
 	joined := strings.Join(args, "\x00")
 	if !strings.Contains(joined, "--agent\x00cursor-agent acp") {
 		t.Fatalf("args = %q, want alias default command", args)
@@ -110,7 +112,7 @@ func TestACPTargetUsesAliasDefaultCommand(t *testing.T) {
 	if acpx.rawCommand != "cursor-agent acp" {
 		t.Errorf("rawCommand = %q, want cursor-agent acp", acpx.rawCommand)
 	}
-	args := acpx.buildArgs(RunOpts{Prompt: "do work"})
+	args := acpx.buildArgs(acpx.rawCommand, RunOpts{Prompt: "do work"})
 	joined := strings.Join(args, "\x00")
 	if !strings.Contains(joined, "--agent\x00cursor-agent acp") {
 		t.Fatalf("args = %q, want target default command", args)
@@ -151,7 +153,7 @@ func TestACPAliasBlankRegistryOverrideUsesDefaultCommand(t *testing.T) {
 
 func TestACPAgentBuildArgsUsesExecMode(t *testing.T) {
 	a := &acpxAgent{target: "gemini"}
-	args := a.buildArgs(RunOpts{Prompt: "do work"})
+	args := a.buildArgs(a.rawCommand, RunOpts{Prompt: "do work"})
 
 	if got, want := args[len(args)-4:], []string{"gemini", "exec", "--file", "-"}; strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("trailing args = %q, want %q", got, want)
@@ -393,6 +395,26 @@ func TestFinalizeTextResult_WithSchemaParsesJSON(t *testing.T) {
 	}
 }
 
+func TestFinalizeTextResult_SchemaRejectKeepsReportedUsage(t *testing.T) {
+	usage := TokenUsage{InputTokens: 11, OutputTokens: 7, CacheReadTokens: 9, CacheCreationTokens: 2, Reported: true, CacheCreationReported: true}
+	result, err := finalizeTextResult("pi", "this is not json", json.RawMessage(`{"type":"object"}`), usage)
+	if err == nil {
+		t.Fatal("expected schema rejection")
+	}
+	if !IsStructuredOutputRejected(err) {
+		t.Fatalf("want structured-output rejection, got %v", err)
+	}
+	if result == nil {
+		t.Fatal("schema rejection must still return the invocation's reported usage")
+	}
+	if result.Usage != usage || !result.UsageReported || !result.CacheCreationReported {
+		t.Fatalf("usage = %+v reported=%v cacheCreation=%v, want %+v", result.Usage, result.UsageReported, result.CacheCreationReported, usage)
+	}
+	if result.Output != nil {
+		t.Fatalf("rejected output must not be treated as structured JSON, got %s", result.Output)
+	}
+}
+
 func TestFinalizeTextResult_WithSchemaPreservesTypeErrorForValidJSON(t *testing.T) {
 	for _, text := range []string{"[]", "null"} {
 		t.Run(text, func(t *testing.T) {
@@ -523,6 +545,179 @@ func TestFinalizeTextResult_WithSchemaRejectsAmbiguousBareJSON(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "multiple bare JSON objects") {
 		t.Fatalf("expected multiple bare JSON objects error, got %v", err)
+	}
+}
+
+// reviewOutputTestSchema mirrors the review step's structured-output contract
+// (internal/pipeline/steps/common.go reviewFindingsSchema) for the fields the
+// parse-failure regressions below exercise.
+func reviewOutputTestSchema() json.RawMessage {
+	return json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"findings":{"type":"array","items":{
+				"type":"object",
+				"properties":{
+					"id":{"type":"string"},
+					"severity":{"type":"string","enum":["error","warning","info"]},
+					"file":{"type":"string"},
+					"line":{"type":"integer"},
+					"description":{"type":"string"},
+					"action":{"type":"string","enum":["no-op","auto-fix","ask-user"]},
+					"review_scope":{"type":"string","enum":["source","pipeline-owned-delivery","external-delivery"]}
+				},
+				"required":["severity","description","action","review_scope"]
+			}},
+			"risk_level":{"type":"string","enum":["low","medium","high"]},
+			"risk_rationale":{"type":"string"},
+			"risk_scope":{"type":"string","enum":["source-or-external","pipeline-owned-delivery"]}
+		},
+		"required":["findings","risk_level","risk_rationale","risk_scope"]
+	}`)
+}
+
+func readAgentTestdata(t *testing.T, name string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatalf("read testdata %s: %v", name, err)
+	}
+	return string(data)
+}
+
+func TestFinalizeTextResult_ToleratesTrailingProviderResidue(t *testing.T) {
+	// Regression: run 01M25W667HT9M14CBN0S05K8PC (review-fix). The model emitted a
+	// complete, schema-valid object and then stray closing DeepSeek tool-call
+	// delimiters that never open a call, so the residue landed in the assistant
+	// content text. The whole step used to fail as
+	// "invalid character '<' after top-level value".
+	text := readAgentTestdata(t, "structured_output_trailing_residue.txt")
+	schema := json.RawMessage(`{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}`)
+	result, err := finalizeTextResult("pi", text, schema, TokenUsage{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var output map[string]any
+	if err := json.Unmarshal(result.Output, &output); err != nil {
+		t.Fatalf("failed to parse output: %v", err)
+	}
+	if output["summary"] != "fix open badge contrast and merge_method type guard" {
+		t.Errorf("expected summary preserved, got %v", output["summary"])
+	}
+}
+
+func TestFinalizeTextResult_FusesAdjacentSplitObjects(t *testing.T) {
+	// Regression: run 01M25WKCT6QYCFCJCNQ0M7ZS1G (review round 3). The model split
+	// one structured answer across two adjacent top-level objects, so each half
+	// failed validation alone ("missing required field \"risk_level\"") while the
+	// union satisfies the schema.
+	text := readAgentTestdata(t, "structured_output_split_objects.txt")
+	result, err := finalizeTextResult("pi", text, reviewOutputTestSchema(), TokenUsage{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var output map[string]any
+	if err := json.Unmarshal(result.Output, &output); err != nil {
+		t.Fatalf("failed to parse output: %v", err)
+	}
+	if output["risk_level"] != "low" {
+		t.Errorf("expected risk_level=low, got %v", output["risk_level"])
+	}
+	findings, ok := output["findings"].([]any)
+	if !ok || len(findings) != 1 {
+		t.Fatalf("expected one finding, got %v", output["findings"])
+	}
+}
+
+func TestFinalizeTextResult_FusesCommaSeparatedSplitObjects(t *testing.T) {
+	// The split can arrive with a comma between the halves rather than only
+	// whitespace; it is still one answer, not two statements, so the halves must
+	// fuse into the schema-valid union.
+	text := `{"findings":[]},
+{"risk_level":"low","risk_rationale":"r","risk_scope":"source-or-external"}`
+	result, err := finalizeTextResult("pi", text, reviewOutputTestSchema(), TokenUsage{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var output map[string]any
+	if err := json.Unmarshal(result.Output, &output); err != nil {
+		t.Fatalf("failed to parse output: %v", err)
+	}
+	if output["risk_level"] != "low" {
+		t.Errorf("expected risk_level=low, got %v", output["risk_level"])
+	}
+}
+
+func TestFinalizeTextResult_UnfusedSplitObjectsReturnDedicatedRetryableError(t *testing.T) {
+	// A concluding split pair whose union is still not schema-valid must fail
+	// with its own dedicated error instead of the generic schema error, so the
+	// retry classifier gives the step a fresh turn rather than killing the run.
+	text := `{"findings":[]},{"risk_level":"low"}`
+	_, err := finalizeTextResult("pi", text, reviewOutputTestSchema(), TokenUsage{})
+	if !errors.Is(err, errSplitBareObjects) {
+		t.Fatalf("expected errSplitBareObjects, got %v", err)
+	}
+	if _, retry := classifyTransient(err); !retry {
+		t.Fatalf("expected the unfused split error to be retryable, got %v", err)
+	}
+}
+
+func TestFinalizeTextResult_RejectsAdjacentObjectsWithDuplicateKeys(t *testing.T) {
+	// Fusion must never let two competing verdicts combine; a repeated key is
+	// the signal that they are alternatives, not two halves of one answer. The
+	// union here would satisfy the schema if the duplicate risk_level were
+	// merged (last wins), so accepting it is the failure this guards. Competing
+	// values stay terminal: they must not reach the retryable split error.
+	text := `{"findings":[{"id":"F1"}],"risk_level":"low"}{"risk_level":"high","risk_rationale":"r","risk_scope":"source"}`
+	schema := json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"findings":{"type":"array"},
+			"risk_level":{"type":"string"},
+			"risk_rationale":{"type":"string"},
+			"risk_scope":{"type":"string"}
+		},
+		"required":["findings","risk_level","risk_rationale","risk_scope"]
+	}`)
+	_, err := finalizeTextResult("pi", text, schema, TokenUsage{})
+	if err == nil {
+		t.Fatal("expected duplicate-key objects to be rejected")
+	}
+	if errors.Is(err, errSplitBareObjects) {
+		t.Fatalf("duplicate-key objects must not use the retryable split error, got %v", err)
+	}
+	if _, retry := classifyTransient(err); retry {
+		t.Fatalf("competing duplicate-key objects must stay terminal, got retryable: %v", err)
+	}
+}
+
+func TestFinalizeTextResult_RejectsMarkupProseAfterBareJSON(t *testing.T) {
+	// Regression for Greptile P1: a token that merely contains both '<' and '>'
+	// is not provider residue. Markup wrapping real words is prose, so the object
+	// before it is not the conclusion of the answer and the parse must fail.
+	schema := json.RawMessage(`{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}`)
+	for _, text := range []string{
+		`{"summary":"done"}<b>note</b>`,
+		`{"summary":"done"} <b>note</b>`,
+		`{"summary":"done"} 1<2>0`,
+		`{"summary":"done"}<b>note</b></invoke>`,
+	} {
+		if _, err := finalizeTextResult("pi", text, schema, TokenUsage{}); err == nil {
+			t.Fatalf("expected markup prose after the object to be rejected: %q", text)
+		}
+	}
+}
+
+func TestFinalizeTextResult_RejectsFusableObjectsFollowedByProse(t *testing.T) {
+	// Only a concluding run of objects is a verdict: a fusable pair quoted
+	// mid-output and followed by substantive prose must not be returned as the
+	// answer while the prose after it is ignored.
+	text := `I will answer with:
+{"findings":[]}
+{"risk_level":"low","risk_rationale":"r","risk_scope":"source-or-external"}
+Now let me actually read the diff:`
+	if _, err := finalizeTextResult("pi", text, reviewOutputTestSchema(), TokenUsage{}); err == nil {
+		t.Fatal("expected objects followed by substantive prose to be rejected")
 	}
 }
 
@@ -1081,5 +1276,77 @@ func TestFinalizeTextResult_ProseWithNonJSONFenceReturnsEndedWithProseError(t *t
 	}
 	if !strings.Contains(err.Error(), "ended its turn with prose instead of the required JSON object") {
 		t.Fatalf("expected ended with prose error, got: %v", err)
+	}
+}
+
+func TestValidateStructuredOutput_ReportsTheFailingSchemaField(t *testing.T) {
+	schema := json.RawMessage(`{
+		"type": "object",
+		"additionalProperties": false,
+		"required": ["findings", "risk_rationale"],
+		"properties": {
+			"risk_rationale": {"type": "string"},
+			"findings": {"type": "array", "items": {
+				"type": "object",
+				"required": ["review_scope"],
+				"properties": {"review_scope": {"type": "string", "enum": ["source", "tests"]}}
+			}}
+		}
+	}`)
+	for _, tc := range []struct {
+		name, output, wantField, wantMessage string
+	}{
+		{"top-level type is no field", `[]`, "", "JSON output must be object"},
+		{"unknown field is named by its key", `{"findings": [], "risk_rationale": "r", "notes": 1}`, "notes", `JSON output contains unknown field "notes"`},
+		{"missing top-level field", `{"findings": []}`, "risk_rationale", `JSON output missing required field "risk_rationale"`},
+		{"missing nested field drops the index", `{"findings": [{"review_scope": "source"}, {}], "risk_rationale": "r"}`, "findings.review_scope", `JSON output findings[1] missing required field "review_scope"`},
+		{"invalid nested field drops the index", `{"findings": [{"review_scope": "other"}], "risk_rationale": "r"}`, "findings.review_scope", "JSON output findings[0].review_scope must match one of the allowed values"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateStructuredOutput(json.RawMessage(tc.output), schema)
+			var violation *SchemaViolation
+			if !errors.As(err, &violation) {
+				t.Fatalf("validateStructuredOutput() = %v, want a *SchemaViolation", err)
+			}
+			if violation.Field != tc.wantField {
+				t.Errorf("Field = %q, want %q", violation.Field, tc.wantField)
+			}
+			if err.Error() != tc.wantMessage {
+				t.Errorf("error = %q, want %q", err, tc.wantMessage)
+			}
+		})
+	}
+}
+
+// An unchanged output with several invalid properties must report the same
+// violation on every validation, or Review's retry attribution would read a
+// repeated failure as failures across distinct fields.
+func TestValidateStructuredOutput_RepeatedOutputReportsTheSameViolation(t *testing.T) {
+	schema := json.RawMessage(`{
+		"type": "object",
+		"additionalProperties": false,
+		"properties": {
+			"risk_scope": {"type": "string", "enum": ["source-or-external"]},
+			"tested": {"type": ["array", "null"]},
+			"a": {}, "b": {}, "c": {}, "d": {}, "e": {}, "f": {}, "g": {}, "h": {}
+		}
+	}`)
+	for _, tc := range []struct{ name, output string }{
+		{"two invalid properties", `{"risk_scope": "everything", "tested": "yes", "a": 1, "b": 1, "c": 1, "d": 1, "e": 1, "f": 1, "g": 1, "h": 1}`},
+		{"two unknown fields", `{"notes": 1, "extra": 1, "a": 1, "b": 1, "c": 1, "d": 1, "e": 1, "f": 1, "g": 1, "h": 1}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fields := map[string]struct{}{}
+			for range 200 {
+				var violation *SchemaViolation
+				if err := validateStructuredOutput(json.RawMessage(tc.output), schema); !errors.As(err, &violation) {
+					t.Fatalf("validateStructuredOutput() = %v, want a *SchemaViolation", err)
+				}
+				fields[violation.Field] = struct{}{}
+			}
+			if len(fields) != 1 {
+				t.Fatalf("the same output was rejected for different fields %v, want one", fields)
+			}
+		})
 	}
 }

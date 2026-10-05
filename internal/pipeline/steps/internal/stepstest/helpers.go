@@ -20,10 +20,11 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/testgit"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
-var testGitExecutable, _ = exec.LookPath("git")
+var testGitExecutable, testGitErr = testgit.RealGit()
 
 // ExecuteWithAutoFix drives step the way the executor drives a step whose
 // outcome carries auto-fix findings (see Executor.executeStep): it executes
@@ -215,6 +216,9 @@ func SetupGitRepo(t *testing.T) (string, string, string) {
 // newTestContext creates a StepContext for testing with optional config overrides.
 func NewTestContext(t *testing.T, ag agent.Agent, workDir, baseSHA, headSHA string, cmds config.Commands) *pipeline.StepContext {
 	t.Helper()
+	if testGitErr != nil {
+		t.Fatal(testGitErr)
+	}
 
 	// Most step tests do not exercise remote transport. Give repositories that
 	// lack an explicitly configured origin a local one so incidental upstream
@@ -259,6 +263,9 @@ func NewTestContext(t *testing.T, ag agent.Agent, workDir, baseSHA, headSHA stri
 // fakeCLIEnv builds environment variable entries for a fake CLI binary and PATH override.
 // Returns env entries that should be set on StepContext.Env for parallel-safe tests.
 func FakeCLIEnv(binDir string, vars map[string]string) []string {
+	if testGitErr != nil {
+		panic(testGitErr)
+	}
 	env := []string{
 		"PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"FAKE_CLI_REAL_GIT=" + testGitExecutable,
@@ -383,8 +390,9 @@ func findModuleRoot() (string, error) {
 	}
 }
 
-// linkTestBinary creates a hard link (or copy) of the tiny fake-CLI helper
-// with the given name in binDir. On Windows, .exe is appended.
+// LinkFakeCLI aliases the tiny fake-CLI helper with the given name in binDir.
+// macOS uses symlinks; other platforms use hard links (or copies).
+// On Windows, .exe is appended.
 func LinkFakeCLI(t *testing.T, binDir, name string) {
 	t.Helper()
 	if fakeCLIHelperPath == "" {
@@ -394,6 +402,15 @@ func LinkFakeCLI(t *testing.T, binDir, name string) {
 		name += ".exe"
 	}
 	dst := filepath.Join(binDir, name)
+	if runtime.GOOS == "darwin" {
+		// Keep one executable path for macOS code-signature validation.
+		// Concurrent creation/removal of hard-link aliases can make AMFI
+		// reject the shared helper before main runs (signal: killed).
+		if err := os.Symlink(fakeCLIHelperPath, dst); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
 	if err := os.Link(fakeCLIHelperPath, dst); err != nil {
 		// Fallback to copy if hard link fails (cross-device, etc.)
 		data, readErr := os.ReadFile(fakeCLIHelperPath)
