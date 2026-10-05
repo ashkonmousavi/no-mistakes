@@ -1,0 +1,212 @@
+package custody
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	"github.com/kunchenguid/no-mistakes/internal/git"
+	"github.com/kunchenguid/no-mistakes/internal/types"
+)
+
+var rescueIdentifier = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// PreservePartialWork requires quiescent writers. It uses raw blobs and private
+// indexes: no filters, signing, hooks, shared stash, live index or HEAD writes.
+// Unsupported states get best-effort content storage but require retention.
+func PreservePartialWork(ctx context.Context, dir, runID, step, stopID string) (*types.PartialWork, error) {
+	p := &types.PartialWork{Version: 1, RunID: runID, Step: step, StopID: stopID, State: "retained", Path: dir}
+	for _, id := range []string{runID, step, stopID} {
+		if !rescueIdentifier.MatchString(id) {
+			return p, fmt.Errorf("invalid rescue identifier %q", id)
+		}
+	}
+	p.Ref = "refs/no-mistakes/rescue/" + runID + "/" + step + "/" + stopID
+	head, err := git.HeadSHA(ctx, dir)
+	if err != nil {
+		return p, err
+	}
+	p.ParentHead = head
+	gitDir, err := git.Run(ctx, dir, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return p, err
+	}
+	scratch, err := os.MkdirTemp(gitDir, "rescue-index-")
+	if err != nil {
+		return p, err
+	}
+	defer os.RemoveAll(scratch)
+	indexEnv := []string{"GIT_INDEX_FILE=" + filepath.Join(scratch, "index"), "GIT_OPTIONAL_LOCKS=0"}
+	run := func(args ...string) (string, error) { return git.RunWithEnv(ctx, dir, indexEnv, args...) }
+	// Stage-zero entries preserve staged content. Conflict entries are omitted
+	// only from the best-effort snapshot; the original index must then survive.
+	entries, err := git.RunRaw(ctx, dir, "ls-files", "--stage", "-z")
+	if err != nil {
+		return p, err
+	}
+	if _, err = run("read-tree", "--empty"); err != nil {
+		return p, err
+	}
+	add := func(mode, blob, path string) error {
+		_, e := run("update-index", "--add", "--cacheinfo", mode, blob, path)
+		return e
+	}
+	for _, entry := range strings.Split(string(entries), "\x00") {
+		if entry == "" {
+			continue
+		}
+		parts := strings.SplitN(entry, "\t", 2)
+		if len(parts) != 2 {
+			return p, fmt.Errorf("invalid index entry")
+		}
+		fields := strings.Fields(parts[0])
+		if len(fields) != 3 {
+			return p, fmt.Errorf("invalid index metadata")
+		}
+		if fields[2] != "0" {
+			p.Reason = "unmerged index"
+			continue
+		}
+		if fields[0] == "160000" {
+			p.Reason = "nested repository or submodule requires original checkout"
+		}
+		if err = add(fields[0], fields[1], parts[1]); err != nil {
+			return p, err
+		}
+	}
+	indexTree, err := run("write-tree")
+	if err != nil {
+		return p, err
+	}
+	identity := append(indexEnv, "GIT_AUTHOR_NAME=no-mistakes", "GIT_AUTHOR_EMAIL=local@no-mistakes.invalid", "GIT_COMMITTER_NAME=no-mistakes", "GIT_COMMITTER_EMAIL=local@no-mistakes.invalid")
+	commit := func(tree string, parents ...string) (string, error) {
+		args := []string{"-c", "commit.gpgsign=false", "commit-tree", tree}
+		for _, parent := range parents {
+			args = append(args, "-p", parent)
+		}
+		args = append(args, "-m", "no-mistakes partial work "+runID+"/"+step+"/"+stopID)
+		return git.RunWithEnv(ctx, dir, identity, args...)
+	}
+	p.IndexSHA, err = commit(indexTree, head)
+	if err != nil {
+		return p, err
+	}
+	if _, err = run("read-tree", "--empty"); err != nil {
+		return p, err
+	}
+	files, err := git.RunRaw(ctx, dir, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return p, err
+	}
+	seen := map[string]bool{}
+	for _, name := range strings.Split(string(files), "\x00") {
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		abs := filepath.Join(dir, filepath.FromSlash(name))
+		info, e := os.Lstat(abs)
+		if os.IsNotExist(e) {
+			continue
+		}
+		if e != nil {
+			return p, e
+		}
+		mode := "100644"
+		content := abs
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, e := os.Readlink(abs)
+			if e != nil {
+				return p, e
+			}
+			content = filepath.Join(scratch, "link")
+			if e = os.WriteFile(content, []byte(target), 0o600); e != nil {
+				return p, e
+			}
+			mode = "120000"
+		} else if info.IsDir() {
+			p.Reason = "nested repository or submodule requires original checkout"
+			continue
+		} else if !info.Mode().IsRegular() {
+			p.Reason = "unsupported file type"
+			continue
+		} else if info.Mode()&0o111 != 0 {
+			mode = "100755"
+		}
+		blob, e := run("hash-object", "-w", "--no-filters", "--", content)
+		if e != nil {
+			return p, e
+		}
+		if e = add(mode, blob, name); e != nil {
+			return p, e
+		}
+	}
+	ignored, err := git.RunRaw(ctx, dir, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
+	if err != nil {
+		return p, err
+	}
+	if len(ignored) > 0 {
+		p.Reason = "ignored files require original checkout"
+	}
+	for _, marker := range []string{"MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"} {
+		if _, e := os.Stat(filepath.Join(gitDir, marker)); e == nil {
+			p.Reason = "unfinished Git operation"
+		} else if !os.IsNotExist(e) {
+			return p, e
+		}
+	}
+	tree, err := run("write-tree")
+	if err != nil {
+		return p, err
+	}
+	p.SHA, err = commit(tree, head, p.IndexSHA)
+	if err != nil {
+		return p, err
+	}
+	if err = PreserveRecoveryAnchor(ctx, dir, p.Ref, p.SHA); err != nil {
+		return p, err
+	}
+	if err = ValidatePartialWork(ctx, dir, p); err != nil {
+		return p, err
+	}
+	if p.Reason == "" {
+		p.State = "saved"
+		p.Path = ""
+	}
+	return p, nil
+}
+
+// ValidatePartialWork binds the exact non-symbolic ref and both parents.
+func ValidatePartialWork(ctx context.Context, dir string, p *types.PartialWork) error {
+	if p == nil || p.Version != 1 || p.Ref != "refs/no-mistakes/rescue/"+p.RunID+"/"+p.Step+"/"+p.StopID {
+		return fmt.Errorf("unknown or cross-bound rescue")
+	}
+	if target, e := git.Run(ctx, dir, "symbolic-ref", "-q", p.Ref); e == nil {
+		return fmt.Errorf("symbolic rescue ref %s targets %s", p.Ref, target)
+	}
+	sha, e := git.Run(ctx, dir, "rev-parse", "--verify", p.Ref+"^{commit}")
+	if e != nil {
+		return e
+	}
+	if sha != p.SHA {
+		return fmt.Errorf("rescue ref %s moved", p.Ref)
+	}
+	parents, e := git.Run(ctx, dir, "show", "-s", "--format=%P", p.SHA)
+	if e != nil {
+		return e
+	}
+	if parents != p.ParentHead+" "+p.IndexSHA {
+		return fmt.Errorf("rescue parent mismatch")
+	}
+	parent, e := git.Run(ctx, dir, "show", "-s", "--format=%P", p.IndexSHA)
+	if e != nil {
+		return e
+	}
+	if parent != p.ParentHead {
+		return fmt.Errorf("rescue index parent mismatch")
+	}
+	return nil
+}
