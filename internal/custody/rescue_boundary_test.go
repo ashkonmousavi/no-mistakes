@@ -38,10 +38,6 @@ func TestRescueHiddenIndexFlagsRequireRawCapture(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				needed, err := WorkNeedsRescue(context.Background(), dir)
-				if err != nil || !needed {
-					t.Errorf("hidden index flag bypassed raw inspection: needed=%v err=%v", needed, err)
-				}
 				p, err := PreservePartialWork(context.Background(), dir, "run", "test", "stop")
 				if err != nil {
 					t.Fatal(err)

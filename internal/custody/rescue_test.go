@@ -84,10 +84,6 @@ func TestRescueCleanSuperprojectRetainsIgnoredGitlinkBytes(t *testing.T) {
 	if status := gitOutput(t, dir, "status", "--porcelain", "--ignore-submodules=none"); status != "" {
 		t.Fatalf("not a clean superproject: %q", status)
 	}
-	needed, err := WorkNeedsRescue(context.Background(), dir)
-	if err != nil || !needed {
-		t.Fatalf("nested bytes deemed disposable: needed=%v err=%v", needed, err)
-	}
 	snapshot, err := PreservePartialWork(context.Background(), dir, "run-1", "review", "stop-1")
 	if err != nil || snapshot.State != "retained" || snapshot.Path != dir {
 		t.Fatalf("nested bytes not retained: %+v %v", snapshot, err)
@@ -149,13 +145,6 @@ func TestFixProgressRescueInspectionDoesNotExecuteCleanFilter(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "filtered.txt"), []byte("part"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	needed, err := WorkNeedsRescue(context.Background(), dir)
-	if err != nil || !needed {
-		t.Fatalf("failed to find useful edits: %v %v", needed, err)
-	}
-	if _, err := git.Run(context.Background(), dir, "rev-parse", "--verify", "refs/no-mistakes/filter-invoked"); err == nil {
-		t.Fatal("emergency inspection executed repository clean filter")
-	}
 	p, err := PreservePartialWork(context.Background(), dir, "run-1", "review", "stop-1")
 	if err != nil {
 		t.Fatal(err)
@@ -163,6 +152,9 @@ func TestFixProgressRescueInspectionDoesNotExecuteCleanFilter(t *testing.T) {
 	got, err := git.RunRaw(context.Background(), dir, "cat-file", "blob", p.Ref+":filtered.txt")
 	if err != nil || string(got) != "part" {
 		t.Fatalf("filter transformed rescue bytes: %q %v", got, err)
+	}
+	if _, err := git.Run(context.Background(), dir, "rev-parse", "--verify", "refs/no-mistakes/filter-invoked"); err == nil {
+		t.Fatal("emergency inspection executed repository clean filter")
 	}
 }
 

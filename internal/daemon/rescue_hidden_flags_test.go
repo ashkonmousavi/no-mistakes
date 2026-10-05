@@ -41,6 +41,13 @@ func TestRescueHiddenFlagsCleanupPreservesBytes(t *testing.T) {
 				}
 				gitCmd(t, wt, "add", "generated")
 				gitCmd(t, wt, "commit", "-m", "generated")
+				current, err := git.HeadSHA(context.Background(), wt)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := d.UpdateRunHeadSHA(run.ID, current); err != nil {
+					t.Fatal(err)
+				}
 				gitCmd(t, wt, "update-index", flag, "generated")
 				if err := os.WriteFile(filepath.Join(wt, "generated"), []byte("hidden cleanup bytes\n"), 0o644); err != nil {
 					t.Fatal(err)

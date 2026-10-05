@@ -3,6 +3,7 @@ package steps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -101,11 +102,6 @@ func parents(t *testing.T, dir, rev string) []string {
 	return fields[1:]
 }
 
-// assertRestoredToReviewedHead is what every rejected merge shape owes the run:
-// the step fails, and the worktree is left back on the head the pipeline
-// reviewed with nothing of the rejected attempt staged, modified, or untracked
-// on top of it. Anything else leaves the invalid head checked out as if it were
-// the branch's real state.
 func assertRestoredToReviewedHead(t *testing.T, dir, reviewedHead string) {
 	t.Helper()
 	if head := gitCmd(t, dir, "rev-parse", "HEAD"); head != reviewedHead {
@@ -400,9 +396,6 @@ func TestRebaseStep_MergeStrategyRebasedInsteadOfMergedFails(t *testing.T) {
 	setRescueFixturePopulation(t)
 	f := newMergeFixture(t, true)
 
-	// The head the agent actually left is captured inside the turn, because the
-	// step restores the worktree off it before returning; the fixture-integrity
-	// assertions still have to be made against that head, not the restored one.
 	var rebasedHead string
 	ag := &mockAgent{
 		name: "test",
@@ -431,7 +424,7 @@ func TestRebaseStep_MergeStrategyRebasedInsteadOfMergedFails(t *testing.T) {
 	if !isAncestor(context.Background(), f.dir, f.mainSHA, rebasedHead) {
 		t.Fatal("fixture no longer satisfies plain ancestry; the test proves nothing")
 	}
-	assertRestoredToReviewedHead(t, f.dir, f.headSHA)
+	assertRejectedWorkRetained(t, sctx, rebasedHead, f.headSHA, err)
 }
 
 // Nothing forbids the agent from committing again after concluding the merge -
@@ -504,10 +497,6 @@ func TestRebaseStep_MergeStrategyUnrelatedCommitInsteadOfMergeFails(t *testing.T
 		t.Fatalf("error = %v, want it to name the missing merge", err)
 	}
 
-	// Fixture integrity: the head the agent left must be one ONLY the
-	// target-ancestry check can reject, or the test proves nothing about that
-	// check. It is read from the capture, not from HEAD, because the step has
-	// since restored the worktree off it.
 	if unrelatedHead == f.headSHA {
 		t.Fatal("fixture left HEAD unmoved; the moved-head check would reject this instead")
 	}
@@ -517,7 +506,7 @@ func TestRebaseStep_MergeStrategyUnrelatedCommitInsteadOfMergeFails(t *testing.T
 	if isAncestor(context.Background(), f.dir, f.mainSHA, unrelatedHead) {
 		t.Fatal("fixture integrated the target after all; the test proves nothing")
 	}
-	assertRestoredToReviewedHead(t, f.dir, f.headSHA)
+	assertRejectedWorkRetained(t, sctx, unrelatedHead, f.headSHA, err)
 }
 
 // Resetting hard onto the target is the third way to end the conflict without
@@ -556,7 +545,7 @@ func TestRebaseStep_MergeStrategyResetOntoTargetFails(t *testing.T) {
 	if isAncestor(context.Background(), f.dir, f.headSHA, resetHead) {
 		t.Fatal("fixture kept the reviewed head; the test proves nothing about the reviewed-head check")
 	}
-	assertRestoredToReviewedHead(t, f.dir, f.headSHA)
+	assertRejectedWorkRetained(t, sctx, resetHead, f.headSHA, err)
 }
 
 // fixtureGitAllowFail runs a fixture git command that is EXPECTED to exit
@@ -613,4 +602,28 @@ func setRescueFixturePopulation(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func assertRejectedWorkRetained(t *testing.T, sctx *pipeline.StepContext, observed, recorded string, cause error) {
+	t.Helper()
+	if !errors.Is(cause, pipeline.ErrWorkRetained) {
+		t.Fatalf("rejected work did not refuse rollback: %v", cause)
+	}
+	if got := gitCmd(t, sctx.WorkDir, "rev-parse", "HEAD"); got != observed {
+		t.Fatalf("rejected head changed: got %s want %s", got, observed)
+	}
+	p, err := sctx.DB.LatestWorkRescue(sctx.Run.ID)
+	if err != nil || p == nil || p.State != "retained" || p.Path != sctx.WorkDir || p.ParentHead != observed {
+		t.Fatalf("rejected work not retained: %+v %v", p, err)
+	}
+	if err := sctx.CheckWorkRescue(); !errors.Is(err, pipeline.ErrWorkRetained) {
+		t.Fatalf("retention permitted later mutation: %v", err)
+	}
+	run, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil || run == nil || run.HeadSHA != recorded {
+		t.Fatalf("rejected work changed recorded run head: %+v %v", run, err)
+	}
+	if status := gitCmd(t, sctx.WorkDir, "status", "--porcelain"); status != "" {
+		t.Fatalf("retention changed rejected content: %s", status)
+	}
 }
