@@ -435,6 +435,7 @@ type ShutdownResult struct {
 
 // RunInfo is the IPC representation of a pipeline run.
 type RunInfo struct {
+	FixProgress      *types.FixProgress         `json:"fix_progress,omitempty"`
 	PartialWork      *types.PartialWork         `json:"partial_work,omitempty"`
 	VerificationPlan *verificationplan.Snapshot `json:"verification_plan"`
 	PiProfile        *agentcfg.PiProfile        `json:"pi_profile,omitempty"`

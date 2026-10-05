@@ -24,6 +24,9 @@ func workRescueCleanupReason(d *db.DB, runID, dir string) string {
 	if p != nil && (p.State == "retained" || p.State == "active") {
 		return fmt.Sprintf("partial work retained %s: %s", dir, p.Reason)
 	}
+	if err := pipeline.ValidateFixCheckpointRefs(ctx, d, runID, dir); err != nil {
+		return fmt.Sprintf("repair checkpoint invalid; retained %s: %v", dir, err)
+	}
 	if p != nil {
 		if err := custody.ValidatePartialWork(ctx, dir, p); err != nil {
 			p.State = "retained"

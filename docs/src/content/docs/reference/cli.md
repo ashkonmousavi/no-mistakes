@@ -338,7 +338,9 @@ Runs with unfinished agent work include an optional `partial_work` object, also 
 An interrupted invocation whose shutdown could not be confirmed is retained, not reported as safely saved.
 Saved work does not imply a successful repair or successful validation.
 Keep these refs and retained paths until their unfinished work has been reconciled; do not push a rescue snapshot or remove retained work to clear a failure.
-Legacy runs without unfinished records omit this object.
+An optional `fix_progress` object reports `applied`, `total`, the current unfinished finding, `saved_head`, and `validation_pending` for the latest repair selection.
+Its counters report stored edit turns, not verified resolutions or approval.
+Legacy runs without progress records omit these objects.
 
 When `--run` is omitted, show this branch's run: its active run, else its most recent one.
 Resolution is scoped to the current branch and never falls back to another branch's run, because one clone commonly has several worktrees on different branches.

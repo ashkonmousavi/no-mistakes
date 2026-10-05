@@ -113,6 +113,7 @@ type stepView struct {
 
 // runView is a render-ready view of a pipeline run.
 type runView struct {
+	FixProgress      *types.FixProgress
 	PartialWork      *types.PartialWork
 	PiProfile        *agentcfg.PiProfile
 	VerificationPlan *verificationplan.Snapshot
@@ -138,6 +139,7 @@ type runView struct {
 
 func runViewFromIPC(r *ipc.RunInfo) runView {
 	rv := runView{
+		FixProgress:        r.FixProgress,
 		PartialWork:        r.PartialWork,
 		ID:                 r.ID,
 		Branch:             r.Branch,
@@ -197,6 +199,7 @@ func runViewFromDB(r *db.Run, steps []*db.StepResult, database *db.DB) runView {
 	}
 	if database != nil {
 		rv.PartialWork = database.WorkRescueStatus(r.ID)
+		rv.FixProgress, _ = database.FixProgress(r.ID)
 	}
 	if r.PRURL != nil {
 		rv.PRURL = *r.PRURL
@@ -491,6 +494,11 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 	}
 	fields = append(fields, toon.Field{Key: "head", Value: shortSHA(rv.HeadSHA)})
 	fields = append(fields, toon.Field{Key: "head_sha", Value: rv.HeadSHA})
+	if p := rv.FixProgress; p != nil {
+		fields = append(fields, toon.Field{Key: "fix_progress", Value: toon.NewObject(
+			toon.Field{Key: "applied", Value: p.Applied}, toon.Field{Key: "total", Value: p.Total}, toon.Field{Key: "current", Value: p.Current}, toon.Field{Key: "saved_head", Value: p.SavedHead}, toon.Field{Key: "validation_pending", Value: p.ValidationPending},
+		)})
+	}
 	if p := rv.PartialWork; p != nil {
 		fields = append(fields, toon.Field{Key: "partial_work", Value: toon.NewObject(
 			toon.Field{Key: "state", Value: p.State},

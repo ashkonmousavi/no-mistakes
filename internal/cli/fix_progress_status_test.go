@@ -34,13 +34,27 @@ func TestFixProgressStatusOnlineAndDisconnectedAgree(t *testing.T) {
 	if err = d.SaveWorkRescue(p); err != nil {
 		t.Fatal(err)
 	}
-	online := runViewFromIPC(&ipc.RunInfo{ID: run.ID, Branch: run.Branch, Status: run.Status, HeadSHA: run.HeadSHA, PartialWork: p})
+	c := &db.FixCheckpoint{RunID: run.ID, Step: "review", Selection: "selected", Ordinal: 1, Total: 3, FindingID: "A", FindingDigest: "a", ParentHead: run.HeadSHA}
+	if err := d.BeginFixCheckpoint(c); err != nil {
+		t.Fatal(err)
+	}
+	c.State = "applied"
+	c.AppliedHead = run.HeadSHA
+	c.Ref = "refs/no-mistakes/fix/fixture/review/selected/1"
+	if err := d.ApplyFixCheckpoint(c); err != nil {
+		t.Fatal(err)
+	}
+	progress, err := d.FixProgress(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	online := runViewFromIPC(&ipc.RunInfo{ID: run.ID, Branch: run.Branch, Status: run.Status, HeadSHA: run.HeadSHA, PartialWork: p, FixProgress: progress})
 	offline := runViewFromDB(run, nil, d)
 	a, b := axiDoc(runObjectField(online)), axiDoc(runObjectField(offline))
 	if a != b {
 		t.Fatalf("online/offline differ:\n%s\n%s", a, b)
 	}
-	for _, want := range []string{"partial_work", p.Ref, p.SHA, "saved", "failed"} {
+	for _, want := range []string{"partial_work", p.Ref, p.SHA, "saved", "failed", "fix_progress", "applied: 1", "total: 3", "validation_pending: true"} {
 		if !strings.Contains(a, want) {
 			t.Errorf("status missing %q: %s", want, a)
 		}

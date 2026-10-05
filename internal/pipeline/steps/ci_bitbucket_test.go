@@ -391,16 +391,19 @@ func TestCIStep_BitbucketAutoFixAggregatesSelectedPipelineLogs(t *testing.T) {
 	ag := &mockAgent{
 		name: "test",
 		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			if opts.Purpose == "ci-fix-verification" {
+				return &agent.Result{Output: json.RawMessage(`{"summary":"focused checks passed"}`)}, nil
+			}
 			capturedPrompt = opts.Prompt
 			if err := os.WriteFile(filepath.Join(opts.CWD, "ci-fix.txt"), []byte("fixed"), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			return &agent.Result{}, nil
+			return &agent.Result{Output: json.RawMessage(`{"summary":"repair CI cause","code_change_needed":true}`)}, nil
 		},
 	}
 
 	prURL := "https://bitbucket.org/test/repo/pull-requests/42"
-	sctx := newTestContext(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = fakeBitbucketEnv(api.server.URL)
 	sctx.Run.PRURL = &prURL
 	sctx.Repo.UpstreamURL = upstream

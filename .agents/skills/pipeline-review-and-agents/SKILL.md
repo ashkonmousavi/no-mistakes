@@ -47,6 +47,11 @@ metadata:
 
 **Review Fixer Verification Discipline (`internal/pipeline/steps/review.go`)**
 
+- Review, Test and CI dispatch one selected cause per bounded editing turn, committing and anchoring each completed unit locally before the next one.
+`pipeline.BeginFixUnit` and `RecordFixUnitHead` own identity and ref-first/atomic-DB recording; applied is unverified, a no-change cause creates no commit, and CI no-code conclusions remain ask-user.
+Multi-cause Review and CI verify once after the batch; Test retains its baseline/evidence turn and all new-test paths.
+CI calls its usual final `recordRepair` policy once and never publishes an intermediate unit.
+The executor still owns the one round and its limits.
 - The shared agent return seam journals unfinished work under local rescue refs before a failed invocation returns.
   Rescue state never grants publication or validation authority; cleanup retains uncertain or unsupported state.
   `axi status` exposes saved refs or retained paths from the same durable records online and offline.

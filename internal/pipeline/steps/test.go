@@ -107,9 +107,10 @@ Previous test findings to address:
 		}
 		fixTimeout := testAgentTimeout(sctx)
 		summary, err := executeFixMode(sctx, s.Name(), fixExecutionOptions{
-			LogMessage:      "asking agent to fix test failures...",
-			Prompt:          fixPrompt,
-			FallbackSummary: "fix test failures",
+			LogMessage:       "asking agent to fix test failures...",
+			Prompt:           fixPrompt,
+			SelectedFindings: testRepairFindings(sctx.PreviousFindings),
+			FallbackSummary:  "fix test failures",
 			RunAgent: func(runOpts agent.RunOpts) (*agent.Result, error) {
 				result, runErr := sctx.RunAgentBudget(sctx.Ctx, fixTimeout, testAgentWorkingTimeout(sctx), errTestAgentTimeout, runOpts)
 				if runErr != nil {
@@ -118,7 +119,11 @@ Previous test findings to address:
 				return result, nil
 			},
 			AfterAgentRun: func(*agent.Result) error {
-				newTestsFromFix = detectNewTestFiles(ctx, sctx.WorkDir)
+				paths := detectNewTestFiles(ctx, sctx.WorkDir)
+				newTestsFromFix = append(newTestsFromFix, paths...)
+				if sctx.CurrentFixUnit != nil {
+					sctx.CurrentFixUnit.NewTests = paths
+				}
 				return nil
 			},
 		})
@@ -302,6 +307,9 @@ Rules:
 		reassessHistory,
 		agent.MemoryFilesRule,
 	)
+	if len(newTestsFromFix) > 0 {
+		evidencePrompt += "\nRegression files added by the completed repair units:\n" + strings.Join(mergeNewTestFiles(newTestsFromFix, nil), "\n")
+	}
 	findings, err := runTestAnalyzer(sctx, evidencePrompt)
 	if err != nil {
 		if errors.Is(err, errTestAgentTimeout) {

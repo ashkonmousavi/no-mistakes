@@ -37,7 +37,11 @@ func (sctx *StepContext) beginAgentRescue(opts agent.RunOpts) (*types.PartialWor
 		step = purpose
 	}
 	selection := sha256.Sum256([]byte(sctx.PreviousFindings))
-	return sctx.DB.BeginWorkRescue(sctx.Run, step, fmt.Sprintf("%x", selection), head, sctx.WorkDir)
+	selectionID := fmt.Sprintf("%x", selection)
+	if sctx.FixSelectionID != "" {
+		selectionID = sctx.FixSelectionID
+	}
+	return sctx.DB.BeginWorkRescue(sctx.Run, step, selectionID, head, sctx.WorkDir)
 }
 
 func (sctx *StepContext) finishAgentRescue(p *types.PartialWork, invocationErr error, activity *agentActivity) error {

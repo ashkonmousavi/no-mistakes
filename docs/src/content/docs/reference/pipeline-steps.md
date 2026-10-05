@@ -391,6 +391,16 @@ Unsupported Git operations, ignored content, uncertain writer shutdown, and stor
 Immediate, startup, and retention cleanup must preserve dirty bytes durably or refuse deletion.
 For the saved and retained fields, see [`axi status`](/no-mistakes/reference/cli/#no-mistakes-axi-status).
 
+Review, Test, and CI repair each selected finding's cause in a separate bounded editing turn, including its sibling sites.
+The pipeline uses normal staging and configured correction messages, creates an exact local checkpoint ref under `refs/no-mistakes/fix/<run>/<step>/<selection>/<ordinal>`, and records the completed unit before starting the next one.
+A completed no-change unit records progress without creating a commit.
+Applied units remain unverified until the existing validation completes; they do not clear findings or confer approval.
+Multi-cause Review and CI repairs run one focused verification after their final local checkpoint.
+Test keeps its configured command baseline and evidence turn, including new regression paths accumulated across all units.
+CI intermediate checkpoints stay local; the existing final publish or revalidation policy runs once for the completed batch.
+An external CI no-code conclusion still parks for a decision rather than counting as an applied repair.
+All these calls belong to the executor's one existing fix round and do not change automatic round limits.
+
 Each step progresses through these statuses:
 
 | Status | Meaning |
