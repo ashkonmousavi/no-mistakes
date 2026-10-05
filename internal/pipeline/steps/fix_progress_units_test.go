@@ -68,6 +68,7 @@ func TestFixProgressCILocalCheckpointDoesNotPublishMidBatch(t *testing.T) {
 		return &agent.Result{Output: []byte(`{"summary":"repair first check","code_change_needed":true}`)}, nil
 	}}
 	sctx := newTestContextWithDBRecords(t, ag, dir, base, head, config.Commands{})
+	bindStepResult(t, sctx, types.StepCI)
 	sctx.PreviousFindings = `{"findings":[{"id":"A","severity":"error","description":"test A","category":"ci-check","check":"A","check_id":"1","action":"auto-fix"},{"id":"B","severity":"error","description":"test B","category":"ci-check","check":"B","check_id":"2","action":"auto-fix"}]}`
 	upstream := t.TempDir()
 	gitCmd(t, upstream, "init", "--bare")
@@ -187,5 +188,39 @@ func TestFixProgressAuthorityPendingUnitCannotPublish(t *testing.T) {
 	}
 	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got != head {
 		t.Fatalf("publication changed head: %s", got)
+	}
+}
+
+func TestFixProgressCIEmptySummaryUsesExistingCommitFallback(t *testing.T) {
+	dir, base, head := setupGitRepo(t)
+	calls := 0
+	ag := &mockAgent{runFn: func(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+		calls++
+		if err := os.WriteFile(filepath.Join(opts.CWD, "empty-result.txt"), []byte("useful repair"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		return &agent.Result{}, nil
+	}}
+	sctx := newTestContextWithDBRecords(t, ag, dir, base, head, config.Commands{})
+	bindStepResult(t, sctx, types.StepCI)
+	sctx.Config.CI.RevalidateRepairs = true
+	sctx.PreviousFindings = `{"findings":[{"id":"A","category":"ci-check","check":"tests","description":"failing tests"}]}`
+	targets, err := parseCIFixTargets(sctx.PreviousFindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repair, err := (&CIStep{}).autoFixCI(sctx, &mockReviewHost{}, &scm.PR{Number: "1"}, targets)
+	if err != nil || !repair.Revalidate {
+		t.Fatalf("empty successful result lost existing revalidation: %+v %v", repair, err)
+	}
+	if calls != 1 || gitCmd(t, dir, "rev-list", "--count", head+"..HEAD") != "1" {
+		t.Fatal("empty summary lost useful repair or replayed it")
+	}
+	if got := gitCmd(t, dir, "log", "-1", "--format=%s"); !strings.Contains(got, "repair failing checks") {
+		t.Fatalf("configured fallback missing: %q", got)
+	}
+	units, err := sctx.DB.GetFixCheckpoints(sctx.Run.ID, "ci", "")
+	if err != nil || len(units) != 1 || units[0].State != "applied" || units[0].Summary != "" {
+		t.Fatalf("no-summary receipt fabricated a summary: %+v %v", units, err)
 	}
 }

@@ -564,17 +564,14 @@ func TestCIStep_CIAutoFixRetriesWhenSomeChecksStayFailing(t *testing.T) {
 	ag := &mockAgent{
 		name: "test",
 		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
-			if opts.Purpose == "ci-fix-verification" {
-				return &agent.Result{Output: json.RawMessage(`{"summary":"focused checks passed"}`)}, nil
-			}
 			fixCount++
 			os.WriteFile(filepath.Join(opts.CWD, fmt.Sprintf("fix-%d.txt", fixCount)), []byte("fixed"), 0o644)
-			return &agent.Result{Output: json.RawMessage(`{"summary":"repair one CI cause","code_change_needed":true}`)}, nil
+			return &agent.Result{}, nil
 		},
 	}
 
 	prURL := "https://github.com/test/repo/pull/42"
-	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx := newTestContext(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = env
 	sctx.Run.PRURL = &prURL
 	sctx.Repo.UpstreamURL = upstream
@@ -598,8 +595,8 @@ func TestCIStep_CIAutoFixRetriesWhenSomeChecksStayFailing(t *testing.T) {
 		t.Fatalf("expected approval outcome after retries, got error: %v", err)
 	}
 	assertCIRestartsValidation(t, outcome, err)
-	if fixCount != 2 {
-		t.Fatalf("expected two local causes in one repair round before revalidation, got %d", fixCount)
+	if fixCount != 1 {
+		t.Fatalf("expected one local repair before revalidation, got %d", fixCount)
 	}
 }
 

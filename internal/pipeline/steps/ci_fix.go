@@ -168,7 +168,8 @@ func (s *CIStep) autoFixCI(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR
 	}
 	targets.Findings.Items = causes
 	targets.Findings = types.NormalizeFindings(targets.Findings, "ci")
-	if len(targets.Findings.Items) == 0 || (len(targets.Findings.Items) == 1 && sctx.StepResultID == "") {
+	// Standalone/legacy callers without a persisted selection retain the original batch path.
+	if len(targets.Findings.Items) == 0 || sctx.StepResultID == "" {
 		return s.autoFixCITurn(sctx, host, pr, targets, "")
 	}
 	defer func() { sctx.CurrentFixUnit = nil; sctx.FixSelectionID = "" }()
@@ -328,15 +329,15 @@ CI logs:
 
 	conclusion, conclusionErr := extractCIFixConclusion(result)
 	if conclusionErr != nil {
-		if sctx.CurrentFixUnit != nil {
+		if sctx.CurrentFixUnit != nil && result != nil && len(result.Output) > 0 {
+			if _, summaryErr := extractCommitSummary(result); summaryErr != nil {
+				return ciRepairResult{}, summaryErr
+			}
 			return ciRepairResult{}, conclusionErr
 		}
 		sctx.Log(fmt.Sprintf("warning: could not parse CI repair conclusion: %v", conclusionErr))
 	}
 	if sctx.CurrentFixUnit != nil {
-		if strings.TrimSpace(conclusion.Summary) == "" {
-			return ciRepairResult{}, fmt.Errorf("empty CI repair-unit summary")
-		}
 		if !mergeConflict && conclusion.CodeChangeNeeded != nil && !*conclusion.CodeChangeNeeded {
 			status, e := stepGitRun(sctx, "status", "--porcelain")
 			if e != nil {
