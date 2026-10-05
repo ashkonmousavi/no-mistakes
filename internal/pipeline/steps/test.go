@@ -66,7 +66,7 @@ func (s *TestStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 	// detectNewTestFiles reads uncommitted status, so the evidence turn that
 	// follows can no longer see a test file the fixer already committed.
 	var newTestsFromFix []string
-	if sctx.Fixing {
+	if sctx.Fixing && sctx.StepResultID != "" {
 		var repair types.Findings
 		var err error
 		if raw := testRepairFindings(sctx.PreviousFindings); raw != "" {
