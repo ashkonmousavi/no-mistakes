@@ -597,7 +597,7 @@ func TestRebaseStep_MergeStrategyConflictedRebaseLeftInProgressIsRetainedAndFail
 func setRescueFixturePopulation(t *testing.T) {
 	t.Helper()
 	bin := t.TempDir()
-	population := fmt.Sprintf("#!/bin/sh\nprintf '%d 1 %d 00:01 fixture\\n'\n", os.Getpid(), os.Getpid())
+	population := fmt.Sprintf("#!/bin/sh\ncase \"$1\" in\n-eo) printf '%d 1 %d S\\n';;\n*) printf '%d 1 %d 00:01 fixture\\n';;\nesac\n", os.Getpid(), os.Getpid(), os.Getpid(), os.Getpid())
 	if err := os.WriteFile(filepath.Join(bin, "ps"), []byte(population), 0o755); err != nil {
 		t.Fatal(err)
 	}

@@ -41,6 +41,21 @@ func listProcesses() ([]Process, error) {
 	if lines == 0 || lines != len(procs) {
 		return nil, fmt.Errorf("incomplete process table")
 	}
+	// Keep command/CWD access account-scoped, but ownership expansion and
+	// ancestor protection need identities even after a tool changes its UID.
+	states, err := listProcessStates()
+	if err != nil {
+		return nil, err
+	}
+	known := make(map[int]bool, len(procs))
+	for _, p := range procs {
+		known[p.PID] = true
+	}
+	for _, p := range states {
+		if !known[p.PID] {
+			procs = append(procs, Process{PID: p.PID, PPID: p.PPID, PGID: p.PGID, metadataOnly: true})
+		}
+	}
 	return procs, nil
 }
 
@@ -53,9 +68,14 @@ func listProcessStates() ([]processState, error) {
 		return nil, fmt.Errorf("enumerate processes: %w", err)
 	}
 	var procs []processState
+	lines := 0
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 4 {
+		if len(fields) == 0 {
+			continue
+		}
+		lines++
+		if len(fields) != 4 {
 			continue
 		}
 		pid, pidErr := strconv.Atoi(fields[0])
@@ -65,6 +85,9 @@ func listProcessStates() ([]processState, error) {
 			continue
 		}
 		procs = append(procs, processState{PID: pid, PPID: ppid, PGID: pgid, Stat: fields[3]})
+	}
+	if lines == 0 || lines != len(procs) {
+		return nil, fmt.Errorf("incomplete process identity table")
 	}
 	return procs, nil
 }
