@@ -113,6 +113,7 @@ type stepView struct {
 
 // runView is a render-ready view of a pipeline run.
 type runView struct {
+	FixProgress      *types.FixProgress
 	PartialWork      *types.PartialWork
 	PiProfile        *agentcfg.PiProfile
 	VerificationPlan *verificationplan.Snapshot
@@ -138,6 +139,7 @@ type runView struct {
 
 func runViewFromIPC(r *ipc.RunInfo) runView {
 	rv := runView{
+		FixProgress:        r.FixProgress,
 		PartialWork:        r.PartialWork,
 		ID:                 r.ID,
 		Branch:             r.Branch,
@@ -197,6 +199,7 @@ func runViewFromDB(r *db.Run, steps []*db.StepResult, database *db.DB) runView {
 	}
 	if database != nil {
 		rv.PartialWork = database.WorkRescueStatus(r.ID)
+		rv.FixProgress, _ = database.FixProgress(r.ID)
 	}
 	if r.PRURL != nil {
 		rv.PRURL = *r.PRURL
@@ -491,6 +494,11 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 	}
 	fields = append(fields, toon.Field{Key: "head", Value: shortSHA(rv.HeadSHA)})
 	fields = append(fields, toon.Field{Key: "head_sha", Value: rv.HeadSHA})
+	if p := rv.FixProgress; p != nil {
+		fields = append(fields, toon.Field{Key: "fix_progress", Value: toon.NewObject(
+			toon.Field{Key: "applied", Value: p.Applied}, toon.Field{Key: "total", Value: p.Total}, toon.Field{Key: "current", Value: p.Current}, toon.Field{Key: "saved_head", Value: p.SavedHead}, toon.Field{Key: "validation_pending", Value: p.ValidationPending},
+		)})
+	}
 	if p := rv.PartialWork; p != nil {
 		fields = append(fields, toon.Field{Key: "partial_work", Value: toon.NewObject(
 			toon.Field{Key: "state", Value: p.State},
@@ -498,6 +506,8 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 			toon.Field{Key: "sha", Value: p.SHA},
 			toon.Field{Key: "parent_head", Value: p.ParentHead},
 			toon.Field{Key: "source_run", Value: p.RunID},
+			toon.Field{Key: "consumed_by", Value: p.ConsumedBy},
+			toon.Field{Key: "consumption_completed", Value: p.ConsumptionCompleted},
 			toon.Field{Key: "path", Value: p.Path},
 			toon.Field{Key: "reason", Value: p.Reason},
 		)})
@@ -585,6 +595,12 @@ func gateFields(gate stepView) []toon.Field {
 		}
 	}
 	skip := "Run `no-mistakes axi respond --action skip` to skip this step"
+	if pipeline.HasFixSizingRefusal(gate.FindingsJSON) {
+		help = []string{
+			"The fixer was not launched because its estimate exceeded the invocation deadline after a safety margin. Completed correction commits and outstanding findings are preserved.",
+			"Inspect the finding's scope or adjust the existing invocation budget, then explicitly retry with `no-mistakes axi respond --action fix --findings <original finding ids>`. No cause is automatically decomposed or retried.",
+		}
+	}
 	if pipeline.HasUnvalidatedWorkRefusal(gate.FindingsJSON) {
 		help = []string{
 			"Approve is rejected: the run worktree holds work a timed-out Test agent left that no Test turn validated, and approval would publish it. The findings name that work and how to inspect it.",

@@ -120,6 +120,28 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 // the ordinary Push step.
 func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate string, attestationSteps []*db.StepResult) error {
 	if sctx.DB != nil && sctx.Run != nil {
+		if err := pipeline.ValidateFixCheckpointRefs(sctx.Ctx, sctx.DB, sctx.Run.ID, sctx.WorkDir); err != nil {
+			return fmt.Errorf("check saved repair refs before publication: %w", err)
+		}
+		unfinished, err := sctx.DB.UnfinishedFixBatch(sctx.Run.ID)
+		if err != nil {
+			return err
+		}
+		if unfinished {
+			return fmt.Errorf("refusing to publish unfinished repair selection")
+		}
+		inherited, err := sctx.DB.InheritedWorkRescue(sctx.Run.ID)
+		if err != nil {
+			return err
+		}
+		if inherited != nil {
+			if err = pipeline.ValidateInheritedWork(sctx.Ctx, sctx.DB, sctx.Run, sctx.WorkDir, inherited); err != nil {
+				return err
+			}
+			if !inherited.ConsumptionCompleted {
+				return fmt.Errorf("refusing to publish unfinished inherited rescue %s", inherited.Ref)
+			}
+		}
 		p, err := sctx.DB.LatestWorkRescue(sctx.Run.ID)
 		if err != nil {
 			return fmt.Errorf("check unfinished work before publication: %w", err)

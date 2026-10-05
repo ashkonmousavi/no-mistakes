@@ -47,6 +47,21 @@ metadata:
 
 **Review Fixer Verification Discipline (`internal/pipeline/steps/review.go`)**
 
+- Review, Test and CI dispatch one selected cause per bounded editing turn, committing and anchoring each completed unit locally before the next one.
+`pipeline.BeginFixUnit` and `RecordFixUnitHead` own identity and ref-first/atomic-DB recording; applied is unverified, a no-change cause creates no commit, and CI no-code conclusions remain ask-user.
+Multi-cause Review and CI verify once after the batch; Test retains its baseline/evidence turn and all new-test paths.
+CI calls its usual final `recordRepair` policy once and never publishes an intermediate unit.
+The executor still owns the one round and its limits.
+Before a checkpointed repair launch, `sizeFixCall` compares a size-scaled successful repair maximum (repository/step/adapter) with the existing absolute bound minus a 10% margin, respecting inherited deadlines and working caps.
+Absent timing is explicitly an unmeasured size heuristic, never a successful measurement.
+An oversized individual cause parks before launch and is not decomposed; `HasFixSizingRefusal` keeps AXI/TUI automatic responses and gate reconciliation from resolving it.
+The scheduling marker is excluded from repair selection and review carry, while original findings and applied receipts keep their existing authority rules.
+- `PrepareFixContinuation` validates original scoped identity/instructions, exact refs and parent, skips only applied edit turns, and leaves independent findings/validation intact.
+`ContinuationCompleted` closes a completed repair attempt so re-reported defects start fresh work; AXI's `validation_pending` remains tied to the actual step status.
+`InheritedFixSelection` carries only unfinished causes into a verified matching rerun, and the executor runs the required independent gates afterwards.
+`CompleteInheritedWork` requires current local applied receipts, never a rescue or operator skip alone.
+CI persists its original check freshness; Test unions prior and inherited regression paths.
+The manager restores before preparation and follows verified source bindings rather than mistaking inherited submitted commits for publication.
 - The shared agent return seam journals unfinished work under local rescue refs before a failed invocation returns.
   Rescue state never grants publication or validation authority; cleanup retains uncertain or unsupported state.
   `axi status` exposes saved refs or retained paths from the same durable records online and offline.

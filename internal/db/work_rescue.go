@@ -47,6 +47,12 @@ func (d *DB) SaveWorkRescue(p *types.PartialWork) error {
 	if old.Version != p.Version || old.RepoID != p.RepoID || old.Branch != p.Branch || old.Step != p.Step || old.Selection != p.Selection || old.ParentHead != p.ParentHead {
 		return fmt.Errorf("rescue source binding changed")
 	}
+	if old.ConsumedBy != "" && old.ConsumedBy != p.ConsumedBy {
+		return fmt.Errorf("rescue consumption binding changed")
+	}
+	if old.ConsumptionCompleted && !p.ConsumptionCompleted {
+		return fmt.Errorf("completed rescue consumption cannot be reopened")
+	}
 	if old.SHA != "" && (old.SHA != p.SHA || old.Ref != p.Ref || old.IndexSHA != p.IndexSHA) {
 		return fmt.Errorf("saved rescue evidence changed")
 	}
@@ -67,7 +73,7 @@ func (d *DB) LatestWorkRescue(runID string) (*types.PartialWork, error) {
 
 func (d *DB) latestWorkRescue(runID string, excludeActive bool) (*types.PartialWork, error) {
 	var raw string
-	e := d.sql.QueryRow(`SELECT payload FROM run_work_rescues WHERE run_id=? AND json_extract(payload,'$.state') NOT IN ('settled','consumed') AND (?=0 OR json_extract(payload,'$.state')!='active') ORDER BY stop_id DESC LIMIT 1`, runID, excludeActive).Scan(&raw)
+	e := d.sql.QueryRow(`SELECT payload FROM run_work_rescues WHERE run_id=? AND COALESCE(json_extract(payload,'$.state'),'unknown') NOT IN ('settled','consumed') AND (?=0 OR COALESCE(json_extract(payload,'$.state'),'unknown')!='active') ORDER BY rowid DESC LIMIT 1`, runID, excludeActive).Scan(&raw)
 	if errors.Is(e, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -95,6 +101,15 @@ func (d *DB) WorkRescueStatus(runID string) *types.PartialWork {
 	if err != nil {
 		return &types.PartialWork{RunID: runID, State: "retained", Reason: "cannot read partial work: " + err.Error()}
 	}
+	if p == nil {
+		inherited, e := d.InheritedWorkRescue(runID)
+		if e != nil {
+			return &types.PartialWork{RunID: runID, State: "retained", Reason: e.Error()}
+		}
+		if inherited != nil && !inherited.ConsumptionCompleted {
+			return inherited
+		}
+	}
 	if p != nil && p.State == "active" {
 		r, err := d.GetRun(runID)
 		if err == nil && r != nil && (r.Status == types.RunRunning || r.Status == types.RunPending) {
@@ -102,9 +117,35 @@ func (d *DB) WorkRescueStatus(runID string) *types.PartialWork {
 			if err != nil {
 				return &types.PartialWork{RunID: runID, State: "retained", Reason: "cannot read prior partial work: " + err.Error()}
 			}
+			if previous == nil {
+				previous, err = d.InheritedWorkRescue(runID)
+				if err != nil {
+					return &types.PartialWork{RunID: runID, State: "retained", Reason: err.Error()}
+				}
+			}
 			return previous
 		}
 		p.State = "retained"
 	}
 	return p
+}
+
+// InheritedWorkRescue keeps the source/ref binding after restoring into a rerun.
+func (d *DB) InheritedWorkRescue(runID string) (*types.PartialWork, error) {
+	var source, raw string
+	err := d.sql.QueryRow(`SELECT run_id,payload FROM run_work_rescues WHERE json_extract(payload,'$.consumed_by')=? ORDER BY rowid DESC LIMIT 1`, runID).Scan(&source, &raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var p types.PartialWork
+	if err = json.Unmarshal([]byte(raw), &p); err != nil {
+		return nil, err
+	}
+	if p.Version != 1 || p.RunID != source || p.ConsumedBy != runID || p.State != "consumed" {
+		return nil, fmt.Errorf("unknown or cross-bound inherited rescue")
+	}
+	return &p, nil
 }

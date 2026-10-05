@@ -97,11 +97,18 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 	if sctx != nil {
 		ag = sctx.Agent
 	}
+	if sctx != nil && sctx.InheritedRepairContext != "" {
+		opts.Prompt += sctx.InheritedRepairContext
+	}
+	if err := sctx.sizeFixCall(parent, timeout, working); err != nil {
+		return nil, err
+	}
 	activity := observeAgentActivity(&opts)
 	rescue, err := sctx.beginAgentRescue(opts)
 	if err != nil {
 		return nil, fmt.Errorf("record editing invocation before launch: %w", err)
 	}
+	started := time.Now()
 	result, runErr := invokeAgent(parent, timeout, working, cause, activity, func(ctx context.Context) (*agent.Result, error) {
 		if sessionRole != "" && sctx != nil && sctx.Sessions != nil {
 			return sctx.Sessions.Run(ctx, ag, sessionRole, opts, sctx.Log)
@@ -113,6 +120,9 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 	})
 	if err := sctx.finishAgentRescue(rescue, runErr, activity); err != nil {
 		return nil, errors.Join(runErr, err)
+	}
+	if runErr == nil && sctx != nil && sctx.CurrentFixUnit != nil {
+		sctx.CurrentFixUnit.FixDurationMS = max(int64(1), time.Since(started).Milliseconds())
 	}
 	return result, runErr
 }

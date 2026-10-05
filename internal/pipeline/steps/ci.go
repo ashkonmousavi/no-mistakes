@@ -183,6 +183,11 @@ func (s *CIStep) ReconcileApprovalGate(sctx *pipeline.StepContext) (bool, error)
 // reruns, or pushes anything, and it never blocks the approval itself - it
 // only decides how the resulting completion is recorded.
 func (s *CIStep) VerifyApprovalOverride(sctx *pipeline.StepContext) (string, error) {
+	if pending, err := sctx.DB.UnfinishedFixBatch(sctx.Run.ID); err != nil {
+		return "", err
+	} else if pending {
+		return "unfinished local CI repair selection remains unvalidated", nil
+	}
 	ctx := sctx.Ctx
 	if err := ctx.Err(); err != nil {
 		return "", err

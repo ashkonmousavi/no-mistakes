@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -423,6 +424,7 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 	m.wg.Add(1)
 	go func() {
 		startedAt := time.Now()
+		suspended := false
 		defer m.wg.Done()
 		defer close(done)
 		defer func() {
@@ -437,12 +439,14 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 			cancel(nil)
 			_ = plan.agent.Close()
 			m.closeSubscribers(plan.run.ID)
-			m.removeRunWorktree(plan.repo.ID, plan.run.ID, plan.gateDir, plan.workDir, "resumed_run_finished")
-			// A recovered run is a finished run too. This is the second of the
-			// two completion boundaries, and leaving it out is what let a run
-			// resumed after a daemon restart keep its empty evidence directory
-			// until some later run or restart happened to sweep it.
-			m.cleanupRunEvidence(plan.cfg, plan.run.ID)
+			if !suspended {
+				m.removeRunWorktree(plan.repo.ID, plan.run.ID, plan.gateDir, plan.workDir, "resumed_run_finished")
+				// A recovered run is a finished run too. This is the second of the
+				// two completion boundaries, and leaving it out is what let a run
+				// resumed after a daemon restart keep its empty evidence directory
+				// until some later run or restart happened to sweep it.
+				m.cleanupRunEvidence(plan.cfg, plan.run.ID)
+			}
 			m.mu.Lock()
 			delete(m.executors, plan.run.ID)
 			delete(m.cancels, plan.run.ID)
@@ -451,6 +455,11 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 		}()
 
 		if err := executor.Resume(runCtx, plan.run, plan.repo, plan.workDir); err != nil {
+			if errors.Is(err, pipeline.ErrRunSuspended) {
+				suspended = true
+				slog.Info("recovered parked run suspended for daemon restart", "run_id", plan.run.ID)
+				return
+			}
 			if plan.run.Status == types.RunRunning {
 				errMsg := err.Error()
 				plan.run.Status = types.RunFailed
@@ -1123,7 +1132,7 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 	if latestForBranch == nil {
 		return "", fmt.Errorf("no previous run for branch %s", branch)
 	}
-	headSHA, err := resolveRerunHead(ctx, gateDir, branch, latestForBranch)
+	headSHA, err := m.resolveContinuationHead(ctx, gateDir, branch, latestForBranch)
 	if err != nil {
 		return "", err
 	}
@@ -1157,6 +1166,17 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 			intent = *selectedRun.Intent
 			intentSource = db.RunIntentSourceRerun
 		}
+	}
+
+	saved, err := m.matchingRerunRescue(ctx, latestForBranch, headSHA, intent)
+	if err != nil {
+		return "", err
+	}
+	if saved != nil {
+		if selectedRun.ID != latestForBranch.ID {
+			return "", fmt.Errorf("refusing cross-run continuation of %s", saved.Ref)
+		}
+		ctx = context.WithValue(ctx, rerunRescueKey{}, saved)
 	}
 
 	storedPRBaseBranch := strings.TrimSpace(prBaseBranch)
@@ -1405,6 +1425,23 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		}
 	}
 
+	if requested, ok := ctx.Value(rerunRescueKey{}).(*types.PartialWork); ok {
+		sourceRun, e := m.db.GetRun(requested.RunID)
+		if e != nil {
+			return "", e
+		}
+		if sourceRun == nil {
+			return "", fmt.Errorf("source run unavailable for %s", requested.Ref)
+		}
+		current, e := m.matchingRerunRescue(ctx, sourceRun, headSHA, intent)
+		if e != nil {
+			return "", e
+		}
+		if current == nil || current.StopID != requested.StopID {
+			return "", fmt.Errorf("saved continuation changed at %s", requested.Ref)
+		}
+	}
+
 	// Cancel any active run for this repo+branch.
 	m.cancelActiveRuns(repo.ID, branch)
 
@@ -1503,6 +1540,19 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 			m.removeRunWorktree(repo.ID, run.ID, gateDir, wtDir, "run_setup_failed")
 		}
 	}()
+
+	if saved, ok := ctx.Value(rerunRescueKey{}).(*types.PartialWork); ok {
+		if err := custody.RestorePartialWork(ctx, wtDir, saved); err != nil {
+			m.db.UpdateRunError(run.ID, err.Error())
+			return "", err
+		}
+		saved.State = "consumed"
+		saved.ConsumedBy = run.ID
+		if err := m.db.SaveWorkRescue(saved); err != nil {
+			m.db.UpdateRunError(run.ID, err.Error())
+			return "", err
+		}
+	}
 
 	if err := git.CopyLocalUserIdentity(ctx, repo.WorkingPath, wtDir); err != nil {
 		m.db.UpdateRunError(run.ID, fmt.Sprintf("configure worktree git identity: %s", err))
@@ -1672,6 +1722,7 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 	m.wg.Add(1)
 	go func() {
 		startedAt := time.Now()
+		suspended := false
 		defer m.wg.Done()
 		defer close(done)
 		defer func() {
@@ -1710,8 +1761,10 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 			ag.Close()
 			// Close subscriber channels for this run.
 			m.closeSubscribers(run.ID)
-			m.removeRunWorktree(repo.ID, run.ID, gateDir, wtDir, "run_finished")
-			m.cleanupRunEvidence(cfg, run.ID)
+			if !suspended {
+				m.removeRunWorktree(repo.ID, run.ID, gateDir, wtDir, "run_finished")
+				m.cleanupRunEvidence(cfg, run.ID)
+			}
 			// Remove tracking.
 			m.mu.Lock()
 			delete(m.executors, run.ID)
@@ -1721,6 +1774,11 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		}()
 
 		if err := executor.Execute(runCtx, run, repo, wtDir); err != nil {
+			if errors.Is(err, pipeline.ErrRunSuspended) {
+				suspended = true
+				slog.Info("parked run suspended for daemon restart", "run_id", run.ID)
+				return
+			}
 			fields := telemetry.Fields{
 				"action":      "finished",
 				"trigger":     trigger,
@@ -2120,7 +2178,7 @@ func (m *RunManager) Shutdown() {
 	m.mu.Unlock()
 
 	for id, cancel := range cancels {
-		cancel(fmt.Errorf("daemon shutting down"))
+		cancel(pipeline.ErrDaemonShutdown)
 		slog.Info("cancelled run on shutdown", "run_id", id)
 	}
 

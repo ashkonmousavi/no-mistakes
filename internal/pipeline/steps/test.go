@@ -66,11 +66,29 @@ func (s *TestStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 	// detectNewTestFiles reads uncommitted status, so the evidence turn that
 	// follows can no longer see a test file the fixer already committed.
 	var newTestsFromFix []string
+	if sctx.Fixing && sctx.StepResultID != "" {
+		var repair types.Findings
+		var err error
+		if raw := testRepairFindings(sctx.PreviousFindings); raw != "" {
+			repair, err = types.ParseFindingsJSON(raw)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if _, err = sctx.PrepareFixContinuation(s.Name(), repair); err != nil {
+			return nil, err
+		}
+	}
+	newTestsFromFix, err = sctx.SavedFixTests(s.Name())
+	if err != nil {
+		return nil, err
+	}
 	var fixSummary string
 	var repairCut error
 	if sctx.Fixing && onlyTestBudgetCutFindings(sctx.PreviousFindings) {
 		sctx.Log("fix selection holds only the Test agent budget cut; re-running validation without a repair turn...")
 		fixSummary = NoChangesAppliedSummary
+		sctx.CompletedFixSelectionID = sctx.FixSelectionID
 	} else if sctx.Fixing {
 		historySection := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx) + planSection + testguidance.Rule
 		fixPrompt := fmt.Sprintf(
@@ -107,9 +125,10 @@ Previous test findings to address:
 		}
 		fixTimeout := testAgentTimeout(sctx)
 		summary, err := executeFixMode(sctx, s.Name(), fixExecutionOptions{
-			LogMessage:      "asking agent to fix test failures...",
-			Prompt:          fixPrompt,
-			FallbackSummary: "fix test failures",
+			LogMessage:       "asking agent to fix test failures...",
+			Prompt:           fixPrompt,
+			SelectedFindings: testRepairFindings(sctx.PreviousFindings),
+			FallbackSummary:  "fix test failures",
 			RunAgent: func(runOpts agent.RunOpts) (*agent.Result, error) {
 				result, runErr := sctx.RunAgentBudget(sctx.Ctx, fixTimeout, testAgentWorkingTimeout(sctx), errTestAgentTimeout, runOpts)
 				if runErr != nil {
@@ -118,11 +137,18 @@ Previous test findings to address:
 				return result, nil
 			},
 			AfterAgentRun: func(*agent.Result) error {
-				newTestsFromFix = detectNewTestFiles(ctx, sctx.WorkDir)
+				paths := detectNewTestFiles(ctx, sctx.WorkDir)
+				newTestsFromFix = append(newTestsFromFix, paths...)
+				if sctx.CurrentFixUnit != nil {
+					sctx.CurrentFixUnit.NewTests = paths
+				}
 				return nil
 			},
 		})
 		if err != nil {
+			if outcome := pipeline.FixSizingOutcome(err, sctx); outcome != nil {
+				return outcome, nil
+			}
 			if !errors.Is(err, errTestAgentTimeout) {
 				return nil, err
 			}
@@ -302,6 +328,9 @@ Rules:
 		reassessHistory,
 		agent.MemoryFilesRule,
 	)
+	if len(newTestsFromFix) > 0 {
+		evidencePrompt += "\nRegression files added by the completed repair units:\n" + strings.Join(mergeNewTestFiles(newTestsFromFix, nil), "\n")
+	}
 	findings, err := runTestAnalyzer(sctx, evidencePrompt)
 	if err != nil {
 		if errors.Is(err, errTestAgentTimeout) {
@@ -338,6 +367,9 @@ Rules:
 		})
 	}
 
+	if err := sctx.FinishFixValidation(s.Name()); err != nil {
+		return nil, err
+	}
 	findingsJSON, _ := json.Marshal(findings)
 	return &pipeline.StepOutcome{
 		NeedsApproval: needsApproval,

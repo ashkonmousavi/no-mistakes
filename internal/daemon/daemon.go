@@ -1607,6 +1607,7 @@ func runToInfo(d *db.DB, r *db.Run, steps []*db.StepResult) *ipc.RunInfo {
 		UpdatedAt:          r.UpdatedAt,
 	}
 	info.PartialWork = d.WorkRescueStatus(r.ID)
+	info.FixProgress, _ = d.FixProgress(r.ID)
 	if len(steps) > 0 {
 		info.Steps = make([]ipc.StepResultInfo, 0, len(steps))
 		for _, s := range steps {
