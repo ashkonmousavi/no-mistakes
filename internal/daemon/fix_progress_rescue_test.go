@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,6 +16,7 @@ import (
 )
 
 func TestFixProgressRescueCleanupPreservesInterruptedBytes(t *testing.T) {
+	setRescueFixturePopulation(t)
 	p := paths.WithRoot(t.TempDir())
 	if err := p.EnsureDirs(); err != nil {
 		t.Fatal(err)
@@ -49,6 +51,57 @@ func TestFixProgressRescueCleanupPreservesInterruptedBytes(t *testing.T) {
 	}
 	if _, err := os.Stat(wt); !os.IsNotExist(err) {
 		t.Fatalf("saved worktree not removed: %v", err)
+	}
+}
+
+func TestRescueCleanupRetainsIgnoredGitlinkAcrossDeletionRoutes(t *testing.T) {
+	setRescueFixturePopulation(t)
+	p := paths.WithRoot(t.TempDir())
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	d, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	repo, head := setupTestGitRepo(t, p, d, "repo1")
+	run, err := d.InsertRun(repo.ID, "feature", head, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := filepath.Join(p.WorktreesDir(), repo.ID, run.ID)
+	gitCmd(t, p.RepoDir(repo.ID), "worktree", "add", "--detach", wt, head)
+	sub := t.TempDir()
+	gitCmd(t, sub, "init")
+	gitCmd(t, sub, "config", "user.name", "test")
+	gitCmd(t, sub, "config", "user.email", "test@test.com")
+	if err := os.WriteFile(filepath.Join(sub, ".gitignore"), []byte("private\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, sub, "add", ".gitignore")
+	gitCmd(t, sub, "commit", "-m", "ignore nested bytes")
+	gitCmd(t, wt, "-c", "protocol.file.allow=always", "submodule", "add", sub, "module")
+	gitCmd(t, wt, "-c", "user.name=test", "-c", "user.email=test@test.com", "commit", "-m", "initialized submodule")
+	file := filepath.Join(wt, "module", "private")
+	if err := os.WriteFile(file, []byte("nested unfinished bytes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if status, err := git.Run(context.Background(), wt, "status", "--porcelain", "--ignore-submodules=none"); err != nil || status != "" {
+		t.Fatalf("precondition status=%q error=%v", status, err)
+	}
+	if err := d.UpdateRunStatus(run.ID, types.RunFailed); err != nil {
+		t.Fatal(err)
+	}
+	NewRunManager(d, p, nil).removeRunWorktree(repo.ID, run.ID, p.RepoDir(repo.ID), wt, "test")
+	cleanupOrphanWorktrees(d, p, []db.RunWorktree{{RepoID: repo.ID, RunID: run.ID, Dir: wt}})
+	reapWorktrees(d, p, worktreeReapPolicy{Retention: time.Nanosecond}, time.Now().Add(time.Hour))
+	if got, err := os.ReadFile(file); err != nil || string(got) != "nested unfinished bytes\n" {
+		t.Fatalf("cleanup lost nested bytes: %q %v", got, err)
+	}
+	rescue, err := d.LatestWorkRescue(run.ID)
+	if err != nil || rescue == nil || rescue.State != "retained" {
+		t.Fatalf("cleanup retention unavailable: %+v %v", rescue, err)
 	}
 }
 
@@ -125,4 +178,14 @@ func TestFixProgressFailureCleanupRetainsUnsupportedAndBrokenEvidence(t *testing
 			}
 		})
 	}
+}
+
+func setRescueFixturePopulation(t *testing.T) {
+	t.Helper()
+	bin := t.TempDir()
+	population := fmt.Sprintf("#!/bin/sh\nprintf '%d 1 %d 00:01 fixture\\n'\n", os.Getpid(), os.Getpid())
+	if err := os.WriteFile(filepath.Join(bin, "ps"), []byte(population), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 }

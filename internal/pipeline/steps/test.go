@@ -149,7 +149,7 @@ Previous test findings to address:
 			if outcome := pipeline.FixSizingOutcome(err, sctx); outcome != nil {
 				return outcome, nil
 			}
-			if !errors.Is(err, errTestAgentTimeout) {
+			if errors.Is(err, pipeline.ErrWorkRetained) || !errors.Is(err, errTestAgentTimeout) {
 				return nil, err
 			}
 			repairCut = err
@@ -333,6 +333,9 @@ Rules:
 	}
 	findings, err := runTestAnalyzer(sctx, evidencePrompt)
 	if err != nil {
+		if errors.Is(err, pipeline.ErrWorkRetained) {
+			return nil, err
+		}
 		if errors.Is(err, errTestAgentTimeout) {
 			outcome := testAgentTimeoutOutcome(sctx, err, startHead, baselineFindings, baselineSummary, baselineExitCode)
 			outcome.FixSummary = fixSummary
@@ -409,7 +412,7 @@ func runTestAnalyzer(sctx *pipeline.StepContext, prompt string) (Findings, error
 			OnChunk:    sctx.LogChunk,
 		})
 		runErr := testAgentError(timeout, "agent run tests", err)
-		if runErr != nil && (errors.Is(runErr, errTestAgentTimeout) || sctx.Ctx.Err() != nil || !agent.IsStructuredOutputRejected(runErr)) {
+		if runErr != nil && (errors.Is(runErr, pipeline.ErrWorkRetained) || errors.Is(runErr, errTestAgentTimeout) || sctx.Ctx.Err() != nil || !agent.IsStructuredOutputRejected(runErr)) {
 			return Findings{}, runErr
 		}
 

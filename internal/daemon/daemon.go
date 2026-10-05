@@ -947,6 +947,17 @@ func removeOrphanWorktree(ctx context.Context, d *db.DB, wt orphanWorktree) bool
 		slog.Warn("preserving run worktree", "path", wt.dir, "reason", refusal)
 		return false
 	}
+	run, err := d.GetRun(wt.runID)
+	if err != nil {
+		return false
+	}
+	if run == nil {
+		if err := os.Remove(wt.dir); err != nil && !os.IsNotExist(err) {
+			slog.Warn("failed to remove empty unbound storage", "path", wt.dir, "error", err)
+			return false
+		}
+		return true
+	}
 	gateDir, wtPath := wt.gateDir, wt.dir
 	if err := git.WorktreeRemove(ctx, gateDir, wtPath); err != nil {
 		slog.Warn("git worktree remove failed, falling back to os.RemoveAll", "path", wtPath, "error", err)

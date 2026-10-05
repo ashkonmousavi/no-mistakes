@@ -106,7 +106,7 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 	activity := observeAgentActivity(&opts)
 	rescue, err := sctx.beginAgentRescue(opts)
 	if err != nil {
-		return nil, fmt.Errorf("record editing invocation before launch: %w", err)
+		return nil, errors.Join(ErrWorkRetained, fmt.Errorf("record editing invocation before launch: %w", err))
 	}
 	started := time.Now()
 	result, runErr := invokeAgent(parent, timeout, working, cause, activity, func(ctx context.Context) (*agent.Result, error) {
@@ -119,7 +119,7 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 		return ag.Run(ctx, opts)
 	})
 	if err := sctx.finishAgentRescue(rescue, runErr, activity); err != nil {
-		return nil, errors.Join(runErr, err)
+		return nil, errors.Join(ErrWorkRetained, runErr, err)
 	}
 	if runErr == nil && sctx != nil && sctx.CurrentFixUnit != nil {
 		sctx.CurrentFixUnit.FixDurationMS = max(int64(1), time.Since(started).Milliseconds())
