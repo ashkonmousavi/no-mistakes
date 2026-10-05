@@ -125,6 +125,9 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 	fixKey := encodeLastFixedChecks(targets.Checks, targets.MergeConflict)
 	fixCompletedAt := completionTimesForTargets(s.observedCompletedAt, targets.Checks)
 	repair, err := s.autoFixCI(sctx, host, pr, targets)
+	if outcome := pipeline.FixSizingOutcome(err, sctx); outcome != nil {
+		return outcome, nil
+	}
 	if outcome := pipeline.ProtectedPathOutcome(err); outcome != nil {
 		return ciTerminalRepairOutcome(outcome, targets.Findings, sctx.DeferredFindings), nil
 	}

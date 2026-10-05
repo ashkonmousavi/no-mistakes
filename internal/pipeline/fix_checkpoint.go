@@ -11,6 +11,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 	"os/exec"
+	"unicode/utf8"
 )
 
 func (sctx *StepContext) BeginFixUnit(step types.StepName, finding types.Finding, ordinal, total int) error {
@@ -40,6 +41,10 @@ func (sctx *StepContext) BeginFixUnit(step types.StepName, finding types.Finding
 		selectionJSON = sctx.PreviousFindings
 	}
 	c := &db.FixCheckpoint{RunID: sctx.Run.ID, Step: string(step), StepResultID: sctx.StepResultID, Selection: selection, Ordinal: ordinal, Total: total, FindingID: finding.ID, FindingDigest: fmt.Sprintf("%x", sha256.Sum256(raw)), ParentHead: sctx.Run.HeadSHA, SelectionJSON: selectionJSON, CISnapshotJSON: sctx.CIFixSnapshotJSON}
+	c.FixSize = (utf8.RuneCount(raw) + 1023) / 1024
+	if sctx.Agent != nil {
+		c.FixAgent = sctx.Agent.Name()
+	}
 	if err = sctx.DB.BeginFixCheckpoint(c); err != nil {
 		return err
 	}

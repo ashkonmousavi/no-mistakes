@@ -186,6 +186,9 @@ Previous review findings to address:
 			Workload:                workload,
 		})
 		if err != nil {
+			if outcome := pipeline.FixSizingOutcome(err, sctx); outcome != nil {
+				return outcome, nil
+			}
 			return nil, err
 		}
 		fixSummary = summary

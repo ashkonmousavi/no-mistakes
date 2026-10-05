@@ -28,6 +28,28 @@ type FixCheckpoint struct {
 	State                 string
 	ContinuationCompleted bool
 	CISnapshotJSON        string
+	// Successful applied units supply local sizing evidence for future calls.
+	// Legacy receipts leave these unknown; no prompt or output is stored here.
+	FixDurationMS int64
+	FixSize       int
+	FixAgent      string
+}
+
+// FixDurationPerSize returns the slowest measured successful repair per size
+// unit on this repository, step and adapter. Failed and legacy turns contribute
+// no invented timing. A size unit is 1024 runes of the authorized finding JSON.
+func (d *DB) FixDurationPerSize(repoID, step, adapter string) (int64, error) {
+	var duration int64
+	err := d.sql.QueryRow(`SELECT COALESCE(MAX(
+		(json_extract(c.payload,'$.FixDurationMS') + json_extract(c.payload,'$.FixSize') - 1)
+		/ json_extract(c.payload,'$.FixSize')),0)
+		FROM fix_checkpoints c JOIN runs r ON r.id=c.run_id
+		WHERE r.repo_id=? AND c.step=?
+		AND json_extract(c.payload,'$.State')='applied'
+		AND json_extract(c.payload,'$.FixAgent')=?
+		AND json_extract(c.payload,'$.FixDurationMS')>0
+		AND json_extract(c.payload,'$.FixSize')>0`, repoID, step, adapter).Scan(&duration)
+	return duration, err
 }
 
 func (d *DB) BeginFixCheckpoint(c *FixCheckpoint) error {

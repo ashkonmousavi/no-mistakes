@@ -1209,6 +1209,9 @@ rounds:
 		if refusal := ProtectedPathOutcome(err); refusal != nil {
 			outcome, err = refusal, nil
 		}
+		if refusal := FixSizingOutcome(err, sctx); refusal != nil {
+			outcome, err = refusal, nil
+		}
 		roundNum++
 		roundDuration := time.Since(phaseStart).Milliseconds()
 		if err != nil {
@@ -1278,6 +1281,8 @@ rounds:
 					writeLog(fmt.Sprintf("answers retracted finding %s: %s", w.ID, safeurl.RedactText(reason)))
 				}
 			}
+			outstandingFindings = DropFixSizingRefusal(outstandingFindings)
+			verificationFindings = DropFixSizingRefusal(verificationFindings)
 			outstandingFindings = resolveVerifiedFindingsJSON(outstandingFindings, pendingVerificationIDs, outcome.ReviewedPaths, outcome.ReviewablePaths, verificationFindings)
 			pendingVerificationIDs = retainFindingIDs(outstandingFindings, pendingVerificationIDs)
 			selectedOutstandingIDs = retainFindingIDs(outstandingFindings, selectedOutstandingIDs)
@@ -1917,7 +1922,7 @@ func (e *Executor) resumeApprovalGate(ctx context.Context, step Step, sctx *Step
 	if !ok {
 		return "", false, nil
 	}
-	if HasProtectedPathRefusal(findingsJSON) {
+	if HasProtectedPathRefusal(findingsJSON) || HasFixSizingRefusal(findingsJSON) {
 		return "", false, nil
 	}
 	timeout := e.gateReconcileTimeout
@@ -1936,7 +1941,7 @@ func (e *Executor) reconcileApprovalGate(ctx context.Context, step Step, sctx *S
 	if !ok {
 		return false, nil
 	}
-	if HasProtectedPathRefusal(findingsJSON) {
+	if HasProtectedPathRefusal(findingsJSON) || HasFixSizingRefusal(findingsJSON) {
 		return false, nil
 	}
 	timeout := e.gateReconcileTimeout

@@ -146,6 +146,9 @@ Previous test findings to address:
 			},
 		})
 		if err != nil {
+			if outcome := pipeline.FixSizingOutcome(err, sctx); outcome != nil {
+				return outcome, nil
+			}
 			if !errors.Is(err, errTestAgentTimeout) {
 				return nil, err
 			}

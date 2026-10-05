@@ -12,6 +12,13 @@ import (
 // actions may change at a timeout gate; cause identity and human instructions
 // cannot. Receipt completion excludes dispatch, never independent validation.
 func (sctx *StepContext) PrepareFixContinuation(step types.StepName, requested types.Findings) (types.Findings, error) {
+	for i := 0; i < len(requested.Items); {
+		if requested.Items[i].ID == FixSizingFindingID {
+			requested.Items = append(requested.Items[:i], requested.Items[i+1:]...)
+		} else {
+			i++
+		}
+	}
 	requested = types.NormalizeFindings(requested, string(step))
 	raw, err := types.MarshalFindingsJSON(requested)
 	if err != nil {
