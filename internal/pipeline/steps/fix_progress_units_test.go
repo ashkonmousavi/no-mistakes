@@ -174,3 +174,18 @@ func TestFixProgressReviewInvalidSummaryStopsBeforeNextUnit(t *testing.T) {
 		t.Fatalf("invalid unit bytes lost: %q %v", got, err)
 	}
 }
+
+func TestFixProgressAuthorityPendingUnitCannotPublish(t *testing.T) {
+	dir, base, head := setupGitRepo(t)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{}, dir, base, head, config.Commands{})
+	sctx.PreviousFindings = `{"findings":[{"id":"A","description":"unfinished"}]}`
+	if err := sctx.BeginFixUnit(types.StepCI, types.Finding{ID: "A", Description: "unfinished"}, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishRunHead(sctx, head, head, nil); err == nil || !strings.Contains(err.Error(), "unfinished") {
+		t.Fatalf("pending repair published: %v", err)
+	}
+	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got != head {
+		t.Fatalf("publication changed head: %s", got)
+	}
+}
