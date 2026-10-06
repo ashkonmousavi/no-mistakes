@@ -367,7 +367,14 @@ Monitors PR health after creation and auto-fixes CI failures. Mergeability polli
 - Settles the local gate mirror before atomically recording the published head and push binding, so a publication that stalls part way records nothing: the run stays on its pre-repair head and the next fix attempt re-enters the same path, finds the remote already at that commit, and completes it
 - Whenever a repair revalidates - either because the setting requires it or because continuity cannot be proven - restarts at Review only: Intent and Rebase keep their results, steps already skipped for the run stay skipped, the run id is unchanged, and the durable auto-fix attempt count carries across. Earlier cycles remain in the run's round history; the step's own status shows the latest cycle. The fresh Review cycle does not inherit the superseded cycle's outstanding finding carry set
 - Bounds that CI-fix agent with [`agent_timeout`](/no-mistakes/reference/global-config/#agent_timeout): a silent turn is cancelled at that stall budget, a still-working one continues past that budget only when its still-working cap is set, cancellation fails the attempt with a timeout diagnostic rather than leaving the run active indefinitely, and a late successful return after cancellation is not committed
-- If the CI-fix agent exhausts that budget, pauses for user approval instead of re-issuing the same request on the next poll. A budget burn is not transient - repeating it costs another full budget - so the remaining auto-fix attempts are left for the user to spend deliberately with a fix response. The finding carries the measured timeout diagnostic. When the timed-out agent left uncommitted work in the run worktree, the finding names that worktree's path. When the agent already committed a repair, that head is recorded locally for custody and is not published; an unfinished rebase or merge is reported instead of recorded. A later fix round that adds nothing to a recorded repair still routes it through the repair rule above, so it revalidates from Review rather than staying behind the published head. Ordinary (non-timeout) fix failures keep retrying as before
+- If the CI-fix agent exhausts that budget, pauses for user approval instead of re-issuing the same request on the next poll.
+  A budget burn is not transient - repeating it costs another full budget - so the remaining auto-fix attempts are left for the user to spend deliberately with a fix response.
+  The finding carries the measured timeout diagnostic.
+  When the timed-out agent left uncommitted work in the run worktree, the finding names that worktree's path.
+  When the agent already committed a repair, that head is recorded locally for custody and is not published; an unfinished rebase or merge is reported instead of recorded.
+  A later fix round that explicitly accepts the recorded repair with `code_change_needed: true` routes it through the repair rule above even if it adds nothing.
+  The [stop and no-change guards](#repairs-that-stop-before-completion) still apply to that retry.
+  Ordinary agent errors keep their existing retry behavior; invalid conclusions park instead.
 - On a merge conflict (GitHub, GitLab, Forgejo, Azure DevOps, or a provider plugin declaring `mergeable_state`): asks the agent to rebase onto the latest PR base branch tip and make the smallest correct root-cause fix for the conflicts, using user intent when available
 - If both CI failures and a merge conflict are present: fixes both in the same attempt
 - If a fix attempt produces no changes: a trusted conclusion that the failure is not caused by the PR's code parks the selected findings as `ask-user` immediately and reports the agent's summary. Otherwise the step re-observes the settled checks and reports the same findings again, so the executor retries while `auto_fix.ci` attempts remain and parks when they are spent - the same follow-up every other step's fix round gets
@@ -386,13 +393,12 @@ The controller checks that result before committing or publishing and parks the 
 Invalid conclusions, including structured-output rejection by the native adapter, also park; summary validation cannot erase a stop or no-change declaration.
 An optional `stopped: null` placeholder is treated as omission; required controls still undergo validation.
 The summary is limited to 4,096 UTF-8 bytes by the controller, even when it fits the schema character limit.
-It also refuses an unfinished merge, rebase, or unmerged index independently of the agent's conclusion, and a `code_change_needed: false` conclusion over a changed head or dirty worktree.
+It also refuses an unfinished merge, rebase, or unmerged index independently of the agent's conclusion, and a `code_change_needed: false` conclusion over a changed head, dirty worktree, or retained unpublished commit.
+Recording a refused commit locally for custody does not make it published: a later no-edit `code_change_needed: false` retry stays parked without restarting validation, including after daemon recovery.
 
-An unfinished Git operation stays in the run worktree with its partial HEAD, index and bytes intact through gate reconciliation, immediate cleanup, startup cleanup and retention sweeps.
-CI re-entry parks while the operation remains unfinished; ordinary continuity checks still apply once it is concluded.
-Worktree retention does not exempt escaped processes from cleanup.
+CI re-entry and automatic gate reconciliation remain parked while a Git operation is unfinished or unreadable; ordinary continuity checks still apply once it is concluded.
 An agent-created commit is recorded locally for custody without being marked as published; uncommitted changes remain in place.
-Refused staged, unstaged, untracked and unpublished work remains protected through cleanup even if PR closure or merge later completes the CI gate.
+The [daemon's worktree retention rules](/no-mistakes/concepts/daemon/#what-it-does) preserve unfinished and refused work through cleanup.
 Inspect the retained work and the supported gate action before continuing; a stop does not authorize discarding work or automatically retrying the repair.
 An ordinarily concluded, clean resolved merge still follows the existing validation and guarded publication path.
 

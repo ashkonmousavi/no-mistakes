@@ -965,18 +965,19 @@ func removeOrphanWorktree(ctx context.Context, wt orphanWorktree) bool {
 // pruned) are eligible for removal. RunManager.startRun always inserts the
 // run row before creating the worktree directory, so on a single daemon a
 // "no matching run" directory is never one whose insert simply hasn't landed
-// yet - it is safe to remove immediately.
+// yet. Refusal and unfinished-operation retention are checked separately by
+// worktreeCleanupReason before removal, including for a directory with no row.
 //
 // A run marked RunCIMonitorInterrupted (the daemon restarted while monitoring
 // CI for an already-open PR, issue #361) is terminal and would otherwise leak
 // its checkout on every future restart. Such a worktree is reclaimed like any
 // other terminal-run leftover EXCEPT when it may hold unpushed work: a CI
 // auto-fix commits locally before pushing (see steps/ci_fix.go), so a crash in
-// that window leaves the only copy of the fix commit in this checkout. We
-// reclaim only when the worktree HEAD equals the head the run already pushed -
-// run.HeadSHA advances solely after a verified push, so a match proves nothing
-// local is unpushed - and fail safe to preservation on any mismatch or
-// unreadable HEAD so recoverable commits are never discarded.
+// that window leaves the only copy of the fix commit in this checkout.
+// This guard requires the worktree HEAD to equal the run's recorded head and
+// fails safe on a mismatch or unreadable HEAD. A match alone does not prove
+// publication: worktreeCleanupReason separately protects refused CI work by
+// comparing against the push binding, since custody can advance run.HeadSHA.
 func skipWorktreeCleanup(ctx context.Context, d *db.DB, runID, wtPath string) (bool, string) {
 	run, err := d.GetRun(runID)
 	if err != nil {

@@ -106,8 +106,9 @@ func (s *CIStep) Name() types.StepName { return types.StepCI }
 // ReconcileApprovalGate re-checks the PR after the CI step has parked at an
 // approval gate. A PR can be merged or closed after a timeout/failure gate was
 // recorded; either terminal state supersedes the stale gate just as it does in
-// the normal CI polling loop. Open, unknown, and provider-error states remain
-// parked so reconciliation never guesses success.
+// the normal CI polling loop, unless unfinished or unreadable Git state blocks
+// reconciliation before continuity is checked. Open, unknown, and
+// provider-error states remain parked so reconciliation never guesses success.
 func (s *CIStep) ReconcileApprovalGate(sctx *pipeline.StepContext) (bool, error) {
 	unfinished, err := git.UnfinishedOperation(sctx.Ctx, sctx.WorkDir)
 	if err != nil || unfinished {
