@@ -582,7 +582,7 @@ func unfinishedRepairOperation(sctx *pipeline.StepContext) bool {
 
 func repairLeftInWorktree(sctx *pipeline.StepContext) bool {
 	head, err := stepGitHeadSHA(sctx)
-	return err != nil || head != sctx.Run.HeadSHA || dirtyRunWorktree(sctx) != ""
+	return err != nil || ciHeadAwaitsRecording(sctx, head) || dirtyRunWorktree(sctx) != ""
 }
 
 // retainRepairLeftover keeps a not-concluded repair in custody exactly like a
