@@ -1,0 +1,34 @@
+//go:build unix
+
+package daemon
+
+import (
+	"reflect"
+	"testing"
+	"time"
+)
+
+func TestUnfinishedWorktreeRetentionStillReapsEscapedProcesses(t *testing.T) {
+	original := orphanProcessMinAge
+	orphanProcessMinAge = 0
+	t.Cleanup(func() { orphanProcessMinAge = original })
+	for _, route := range []string{"immediate", "startup"} {
+		t.Run(route, func(t *testing.T) {
+			p, database, repo, run, dir := unfinishedCleanupFixture(t, "rebase", "default")
+			before := unfinishedWorktreeSnapshot(t, dir)
+			pid := startOrphanInWorktree(t, dir)
+			if route == "immediate" {
+				NewRunManager(database, p, nil).removeRunWorktree(repo.ID, run.ID, p.RepoDir(repo.ID), dir, "fixture")
+			} else {
+				sweepOrphanRunProcesses(database, p, nil, retainedDefaultTreeRunIDs(database, p, worktreeReapPolicy{Retention: time.Nanosecond}, time.Now().Add(time.Hour)))
+			}
+			if !pidGoneWithin(pid, 10*time.Second) {
+				t.Error("escaped process survived unfinished-work retention")
+			}
+			after := unfinishedWorktreeSnapshot(t, dir)
+			if !reflect.DeepEqual(before, after) {
+				t.Error("process sweep changed retained HEAD/index")
+			}
+		})
+	}
+}

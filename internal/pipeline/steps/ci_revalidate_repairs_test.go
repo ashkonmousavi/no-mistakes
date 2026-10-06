@@ -60,7 +60,7 @@ func newCIRepairFixture(t *testing.T, revalidate bool, agentAction func(workDir 
 		if agentAction != nil {
 			agentAction(opts.CWD)
 		}
-		return &agent.Result{Output: []byte(`{"summary":"repair the failing check"}`)}, nil
+		return &agent.Result{Output: []byte(`{"summary":"repair the failing check","code_change_needed":true}`)}, nil
 	}}
 
 	prURL := "https://github.com/test/repo/pull/42"

@@ -931,7 +931,7 @@ func removableOrphanWorktree(d *db.DB, wt orphanWorktree) bool {
 		slog.Warn("preserving run worktree: cannot read run", "run_id", wt.runID, "error", err)
 		return false
 	}
-	if reason := protectedPathCleanupReason(d, run); reason != "" {
+	if reason := worktreeCleanupReason(d, run, wt.dir); reason != "" {
 		slog.Info("skipping worktree cleanup", "path", wt.dir, "reason", reason)
 		return false
 	}
@@ -1003,6 +1003,21 @@ func skipWorktreeCleanup(ctx context.Context, d *db.DB, runID, wtPath string) (b
 		}
 	}
 	return false, ""
+}
+
+func worktreeCleanupReason(d *db.DB, run *db.Run, workDir string) string {
+	if _, err := os.Lstat(filepath.Join(workDir, ".git")); err == nil {
+		unfinished, err := git.UnfinishedOperation(context.Background(), workDir)
+		if err != nil {
+			return fmt.Sprintf("cannot inspect unfinished Git operation; preserving worktree: %v", err)
+		}
+		if unfinished {
+			return "unfinished Git operation; preserving partial HEAD, index and worktree"
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Sprintf("cannot inspect worktree Git metadata; preserving: %v", err)
+	}
+	return protectedPathCleanupReason(d, run)
 }
 
 // protectedPathCleanupReason protects only the index and working files. It must

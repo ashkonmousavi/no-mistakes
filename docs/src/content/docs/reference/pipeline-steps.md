@@ -383,9 +383,13 @@ Monitors PR health after creation and auto-fixes CI failures. Mergeability polli
 A successful agent process is not enough to conclude a CI repair.
 The CI fixer can return optional `stopped: true` with its required `summary` and `code_change_needed` fields when it cannot finish, including when an operator precondition or admission check refuses.
 The controller checks that result before committing or publishing and parks the selected findings for an explicit decision, retaining deferred findings.
+Invalid conclusions also park; summary validation cannot erase a stop or no-change declaration.
+The summary is limited to 4,096 UTF-8 bytes by the controller, even when it fits the schema character limit.
 It also refuses an unfinished merge, rebase, or unmerged index independently of the agent's conclusion, and a `code_change_needed: false` conclusion over a changed head or dirty worktree.
 
-An unfinished Git operation stays in the run worktree with its index and bytes intact.
+An unfinished Git operation stays in the run worktree with its partial HEAD, index and bytes intact through gate reconciliation, immediate cleanup, startup cleanup and retention sweeps.
+CI re-entry parks while the operation remains unfinished; ordinary continuity checks still apply once it is concluded.
+Worktree retention does not exempt escaped processes from cleanup.
 An agent-created commit is recorded locally for custody without being marked as published; uncommitted changes remain in place.
 Inspect the retained work and the supported gate action before continuing; a stop does not authorize discarding work or automatically retrying the repair.
 An ordinarily concluded, clean resolved merge still follows the existing validation and guarded publication path.

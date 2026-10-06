@@ -9,6 +9,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/cimonitor"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
@@ -108,6 +109,10 @@ func (s *CIStep) Name() types.StepName { return types.StepCI }
 // the normal CI polling loop. Open, unknown, and provider-error states remain
 // parked so reconciliation never guesses success.
 func (s *CIStep) ReconcileApprovalGate(sctx *pipeline.StepContext) (bool, error) {
+	unfinished, err := git.UnfinishedOperation(sctx.Ctx, sctx.WorkDir)
+	if err != nil || unfinished {
+		return false, err
+	}
 	if err := assertPipelineHeadContinuity(sctx, s.Name()); err != nil {
 		return false, fmt.Errorf("%w: %w", pipeline.ErrFatalGateReconciliation, err)
 	}
@@ -254,6 +259,21 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 		if stepResult != nil && stepResult.FindingsJSON != nil {
 			refusalFindings = *stepResult.FindingsJSON
 		}
+	}
+	if unfinishedRepairOperation(sctx) {
+		findingsJSON := sctx.PreviousFindings
+		if findingsJSON == "" {
+			findingsJSON = refusalFindings
+		}
+		var findings Findings
+		if findingsJSON != "" {
+			var err error
+			findings, err = types.ParseFindingsJSON(findingsJSON)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return ciRepairParkOutcome(findings, sctx.DeferredFindings, "An unfinished or unreadable Git operation remains in the run worktree; nothing committed or published. "+s.retainRepairLeftover(sctx)), nil
 	}
 	retryRefusal := sctx.Fixing && pipeline.HasProtectedPathRefusal(refusalFindings)
 	// A fix round repairs the findings the executor selected for it, unless

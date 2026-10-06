@@ -11,6 +11,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/testguidance"
@@ -289,9 +290,12 @@ CI logs:
 	// rule), and a no-change conclusion over a moved head or dirty tree is the
 	// agent declining to stand behind it. Either way nothing is committed or
 	// published; the bytes stay where the agent left them and the round parks.
-	declined := conclusionErr == nil && conclusion.CodeChangeNeeded != nil && !*conclusion.CodeChangeNeeded
-	stopped := conclusionErr == nil && conclusion.Stopped != nil && *conclusion.Stopped
-	if stopped || unfinishedRepairOperation(sctx) || (declined && repairLeftInWorktree(sctx)) {
+	declined := conclusion.CodeChangeNeeded != nil && !*conclusion.CodeChangeNeeded
+	stopped := conclusion.Stopped != nil && *conclusion.Stopped
+	if conclusionErr != nil || stopped || unfinishedRepairOperation(sctx) || (declined && repairLeftInWorktree(sctx)) {
+		if conclusionErr != nil {
+			conclusion.Summary = fmt.Sprintf("Invalid CI repair conclusion: %v", conclusionErr)
+		}
 		return ciRepairResult{Summary: conclusion.Summary}, errCIRepairNotConcluded
 	}
 	repair, err := s.commitRepair(sctx, conclusion.Summary, result)
@@ -453,21 +457,35 @@ var ciFixConclusionSchema = json.RawMessage(fmt.Sprintf(`{
 }`, config.MaxFixMessageSummaryBytes))
 
 func extractCIFixConclusion(result *agent.Result) (ciFixConclusion, error) {
+	var conclusion ciFixConclusion
+	if result == nil {
+		return conclusion, fmt.Errorf("agent returned no CI repair conclusion")
+	}
+	parseErr := json.Unmarshal(result.Output, &conclusion)
+	conclusion.Summary = ""
+	if parseErr != nil {
+		return conclusion, fmt.Errorf("parse CI repair conclusion: %w", parseErr)
+	}
+	if conclusion.Stopped == nil {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(result.Output, &fields); err != nil {
+			return conclusion, err
+		}
+		if _, present := fields["stopped"]; present {
+			return conclusion, fmt.Errorf("CI repair conclusion stopped must be a boolean")
+		}
+	}
 	summary, err := extractCommitSummary(result)
 	if err != nil {
-		return ciFixConclusion{}, err
-	}
-	var conclusion ciFixConclusion
-	if err := json.Unmarshal(result.Output, &conclusion); err != nil {
-		return ciFixConclusion{}, fmt.Errorf("parse CI repair conclusion: %w", err)
-	}
-	if conclusion.CodeChangeNeeded == nil {
-		return ciFixConclusion{}, fmt.Errorf("CI repair conclusion omitted code_change_needed")
-	}
-	if !*conclusion.CodeChangeNeeded && summary == "" {
-		return ciFixConclusion{}, fmt.Errorf("no-change CI repair conclusion omitted its summary")
+		return conclusion, err
 	}
 	conclusion.Summary = summary
+	if conclusion.CodeChangeNeeded == nil {
+		return conclusion, fmt.Errorf("CI repair conclusion omitted code_change_needed")
+	}
+	if !*conclusion.CodeChangeNeeded && summary == "" {
+		return conclusion, fmt.Errorf("no-change CI repair conclusion omitted its summary")
+	}
 	return conclusion, nil
 }
 
@@ -544,7 +562,7 @@ func (s *CIStep) ciFixAgentBudgetOutcome(sctx *pipeline.StepContext, issueDesc s
 	var leftover []string
 	head, headErr := stepGitHeadSHA(sctx)
 	switch {
-	case rebaseInProgress(sctx.Ctx, sctx.WorkDir) || mergeInProgress(sctx.Ctx, sctx.WorkDir):
+	case unfinishedRepairOperation(sctx):
 		leftover = append(leftover, fmt.Sprintf("The timed-out agent left an unfinished rebase or merge in the run worktree at %s; its partial HEAD is not recorded.", sctx.WorkDir))
 	case headErr == nil && head != "" && head != sctx.Run.HeadSHA:
 		if _, recErr := s.recordLocalRepair(sctx, head); recErr != nil {
@@ -564,7 +582,8 @@ func (s *CIStep) ciFixAgentBudgetOutcome(sctx *pipeline.StepContext, issueDesc s
 var errCIRepairNotConcluded = errors.New("CI repair was not concluded by the agent")
 
 func unfinishedRepairOperation(sctx *pipeline.StepContext) bool {
-	return rebaseInProgress(sctx.Ctx, sctx.WorkDir) || mergeInProgress(sctx.Ctx, sctx.WorkDir) || len(rebaseConflictFiles(sctx.Ctx, sctx.WorkDir)) > 0
+	unfinished, err := git.UnfinishedOperation(sctx.Ctx, sctx.WorkDir)
+	return unfinished || err != nil
 }
 
 func repairLeftInWorktree(sctx *pipeline.StepContext) bool {
