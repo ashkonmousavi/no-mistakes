@@ -1008,7 +1008,9 @@ func skipWorktreeCleanup(ctx context.Context, d *db.DB, runID, wtPath string) (b
 
 func worktreeCleanupReason(d *db.DB, run *db.Run, workDir string) string {
 	if _, err := os.Lstat(filepath.Join(workDir, ".git")); err == nil {
-		unfinished, err := git.UnfinishedOperation(context.Background(), workDir)
+		unfinished, err := git.UnfinishedOperation(workDir, func(args ...string) (string, error) {
+			return git.Run(context.Background(), workDir, args...)
+		})
 		if err != nil {
 			return fmt.Sprintf("cannot inspect unfinished Git operation; preserving worktree: %v", err)
 		}

@@ -1,16 +1,17 @@
 package git
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
 
-func UnfinishedOperation(ctx context.Context, workDir string) (bool, error) {
+// UnfinishedOperation inspects operation markers and unmerged index entries
+// through the caller's Git runner, preserving its environment and cancellation.
+func UnfinishedOperation(workDir string, run func(...string) (string, error)) (bool, error) {
 	for _, name := range []string{"MERGE_HEAD", "rebase-merge", "rebase-apply"} {
-		path, err := Run(ctx, workDir, "rev-parse", "--git-path", name)
+		path, err := run("rev-parse", "--git-path", name)
 		if err != nil {
 			return false, fmt.Errorf("inspect unfinished Git operation: %w", err)
 		}
@@ -23,7 +24,7 @@ func UnfinishedOperation(ctx context.Context, workDir string) (bool, error) {
 			return false, fmt.Errorf("inspect %s: %w", name, err)
 		}
 	}
-	unmerged, err := Run(ctx, workDir, "ls-files", "--unmerged", "-z")
+	unmerged, err := run("ls-files", "--unmerged", "-z")
 	if err != nil {
 		return false, fmt.Errorf("inspect unmerged index: %w", err)
 	}

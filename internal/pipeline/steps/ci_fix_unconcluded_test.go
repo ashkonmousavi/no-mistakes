@@ -81,6 +81,7 @@ func mergeHeadPresent(t *testing.T, dir string) bool {
 func leaveMerge(dir string) { unconcludedGit(dir, "merge", "--no-edit", "main") }
 
 func TestCIRepair_UnfinishedMergeIsNeverPublished(t *testing.T) {
+	t.Parallel()
 	// Today's agents report true with a prose refusal; the guard must not
 	// depend on the conclusion at all.
 	f := newUnconcludedFixture(t, true, leaveMerge, `{"summary":"admission refused; merge left unresolved","code_change_needed":true}`)
@@ -103,6 +104,7 @@ func TestCIRepair_UnfinishedMergeIsNeverPublished(t *testing.T) {
 }
 
 func TestCIRepair_StoppedChangedHeadIsRetainedNotPublished(t *testing.T) {
+	t.Parallel()
 	f := newUnconcludedFixture(t, false, leaveMerge, `{"summary":"post-merge admission refused","code_change_needed":true,"stopped":true}`)
 	outcome := f.repairRound(t)
 	local := f.localHead(t)
@@ -128,6 +130,7 @@ func TestCIRepair_StoppedChangedHeadIsRetainedNotPublished(t *testing.T) {
 }
 
 func TestCIRepair_StoppedWithoutChangesParks(t *testing.T) {
+	t.Parallel()
 	f := newUnconcludedFixture(t, true, func(string) {}, `{"summary":"pre-merge admission refused","code_change_needed":true,"stopped":true}`)
 	outcome := f.repairRound(t)
 	if got := f.remoteHead(t); got != f.headSHA {
@@ -139,6 +142,7 @@ func TestCIRepair_StoppedWithoutChangesParks(t *testing.T) {
 }
 
 func TestCIRepair_ResolvedMergeStillPublishes(t *testing.T) {
+	t.Parallel()
 	f := newUnconcludedFixture(t, true, func(dir string) {
 		leaveMerge(dir)
 		_ = os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("main side\nfeature\n"), 0o644)
@@ -161,6 +165,7 @@ func TestCIRepair_ResolvedMergeStillPublishes(t *testing.T) {
 // The shared catch-all staging boundary serves CI repair commits, the
 // Review/Test/Document/Lint fix commits, and Push's leftover commit.
 func TestStagePipelineChanges_RefusesUnfinishedMerge(t *testing.T) {
+	t.Parallel()
 	f := newUnconcludedFixture(t, true, leaveMerge, `{}`)
 	leaveMerge(f.dir)
 	if !mergeHeadPresent(t, f.dir) {
@@ -184,6 +189,7 @@ func TestStagePipelineChanges_RefusesUnfinishedMerge(t *testing.T) {
 }
 
 func TestCIRepair_RefusalControlsSurviveInvalidSummary(t *testing.T) {
+	t.Parallel()
 	long, _ := json.Marshal(strings.Repeat("界", 2000))
 	for _, tc := range []struct {
 		name, conclusion string
@@ -242,6 +248,7 @@ func TestCIRepair_RefusalControlsSurviveInvalidSummary(t *testing.T) {
 }
 
 func TestCIRepair_ParserKeepsControlsOnSummaryError(t *testing.T) {
+	t.Parallel()
 	raw, _ := json.Marshal(map[string]any{"summary": strings.Repeat("界", 2000), "code_change_needed": false, "stopped": true})
 	got, err := extractCIFixConclusion(&agent.Result{Output: raw})
 	if err == nil || got.Stopped == nil || !*got.Stopped || got.CodeChangeNeeded == nil || *got.CodeChangeNeeded {
@@ -250,6 +257,7 @@ func TestCIRepair_ParserKeepsControlsOnSummaryError(t *testing.T) {
 }
 
 func TestCIRepair_UnfinishedRebaseReconciliationAndReentry(t *testing.T) {
+	t.Parallel()
 	f := newUnconcludedFixture(t, true, func(dir string) {
 		unconcludedGit(dir, "rebase", "main")
 		_ = os.WriteFile(filepath.Join(dir, "untracked.txt"), []byte("preserve untracked\n"), 0600)
@@ -309,6 +317,7 @@ func (s *unconcludedExecutorStep) ReconcileApprovalGate(ctx *pipeline.StepContex
 	return resolved, err
 }
 func TestCIRepair_ExecutorKeepsUnfinishedRebaseParked(t *testing.T) {
+	t.Parallel()
 	for _, recovered := range []bool{false, true} {
 		name := "live"
 		if recovered {
@@ -349,7 +358,7 @@ func TestCIRepair_ExecutorKeepsUnfinishedRebaseParked(t *testing.T) {
 				}
 			}
 			executor := pipeline.NewExecutor(f.sctx.DB, p, f.sctx.Config, f.sctx.Agent, []pipeline.Step{step}, nil)
-			executor.SetGateReconcileTimings(time.Hour, time.Second)
+			executor.SetGateReconcileTimings(time.Hour, 0)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			done := make(chan error, 1)
@@ -393,6 +402,7 @@ func TestCIRepair_ExecutorKeepsUnfinishedRebaseParked(t *testing.T) {
 }
 
 func TestCIRepair_CleanDivergentHeadStillFailsContinuity(t *testing.T) {
+	t.Parallel()
 	f := newUnconcludedFixture(t, true, func(string) {}, `{}`)
 	gitCmd(t, f.dir, "checkout", "--detach", "main")
 	if resolved, err := (&CIStep{}).ReconcileApprovalGate(f.sctx); resolved || !errors.Is(err, pipeline.ErrFatalGateReconciliation) {
@@ -403,6 +413,19 @@ func TestCIRepair_CleanDivergentHeadStillFailsContinuity(t *testing.T) {
 	}
 	if f.remoteHead(t) != f.headSHA {
 		t.Error("divergent head published")
+	}
+}
+
+func TestCIRepair_UnfinishedReconciliationUsesStepEnv(t *testing.T) {
+	f := newUnconcludedFixture(t, true, func(string) {}, `{}`)
+	leaveMerge(f.dir)
+	if !mergeHeadPresent(t, f.dir) {
+		t.Fatal("fixture error: no unfinished merge")
+	}
+	// The step still has its working Git PATH; the ambient process does not.
+	t.Setenv("PATH", t.TempDir())
+	if resolved, err := (&CIStep{}).ReconcileApprovalGate(f.sctx); resolved || err != nil {
+		t.Fatalf("unfinished reconciliation = %v, %v; want parked without error", resolved, err)
 	}
 }
 
@@ -434,8 +457,15 @@ func ciConclusionAdapter(t *testing.T, conclusion string) agent.Agent {
 }
 
 func TestCIRepair_CodexOptionalStopPublishesAcceptedMerge(t *testing.T) {
-	for _, field := range []string{"", `,"stopped":null`, `,"stopped":false`, `,"stopped":true`} {
-		t.Run(field, func(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, field string }{
+		{"omitted", ""},
+		{"null", `,"stopped":null`},
+		{"false", `,"stopped":false`},
+		{"true", `,"stopped":true`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			field := tc.field
 			adapter := ciConclusionAdapter(t, `{"summary":"accepted merge","code_change_needed":true`+field+`}`)
 			f := newUnconcludedFixture(t, false, leaveMerge, `{}`)
 			f.sctx.Agent = &mockAgent{name: "codex", runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
@@ -459,6 +489,7 @@ func TestCIRepair_CodexOptionalStopPublishesAcceptedMerge(t *testing.T) {
 }
 
 func TestCIRepair_CodexStructuredRejectionParks(t *testing.T) {
+	t.Parallel()
 	long, _ := json.Marshal(strings.Repeat("界", 5000))
 	conclusions := []string{
 		`{"summary":` + string(long) + `,"code_change_needed":true,"stopped":true}`,
@@ -550,6 +581,7 @@ func TestCIRepair_CodexStructuredRejectionParks(t *testing.T) {
 }
 
 func TestCIRepair_UnrelatedAgentErrorStillUsesOrdinaryPolicy(t *testing.T) {
+	t.Parallel()
 	f := newUnconcludedFixture(t, false, func(string) {}, `{}`)
 	f.sctx.Agent = &mockAgent{name: "failed", runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
 		return nil, errors.New("transport failed")
@@ -563,6 +595,7 @@ func TestCIRepair_UnrelatedAgentErrorStillUsesOrdinaryPolicy(t *testing.T) {
 }
 
 func TestCIRepair_StoppedDirtyWithRevalidationPolicy(t *testing.T) {
+	t.Parallel()
 	for _, revalidate := range []bool{false, true} {
 		t.Run(fmt.Sprint(revalidate), func(t *testing.T) {
 			f := newUnconcludedFixture(t, false, func(dir string) {

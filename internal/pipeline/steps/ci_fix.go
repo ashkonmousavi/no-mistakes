@@ -576,7 +576,9 @@ func (s *CIStep) ciFixAgentBudgetOutcome(sctx *pipeline.StepContext, issueDesc s
 var errCIRepairNotConcluded = errors.New("CI repair was not concluded by the agent")
 
 func unfinishedRepairOperation(sctx *pipeline.StepContext) bool {
-	unfinished, err := git.UnfinishedOperation(sctx.Ctx, sctx.WorkDir)
+	unfinished, err := git.UnfinishedOperation(sctx.WorkDir, func(args ...string) (string, error) {
+		return stepGitRun(sctx, args...)
+	})
 	return unfinished || err != nil
 }
 

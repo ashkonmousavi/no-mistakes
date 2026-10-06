@@ -71,6 +71,7 @@ func retainedRepairSnapshot(t *testing.T, dir string) map[string]string {
 }
 
 func TestCIRepair_RetainedCommitConclusionThroughExecutor(t *testing.T) {
+	t.Parallel()
 	for _, recovered := range []bool{false, true} {
 		for _, revalidate := range []bool{false, true} {
 			for _, accept := range []bool{false, true} {
@@ -144,7 +145,7 @@ func TestCIRepair_RetainedCommitConclusionThroughExecutor(t *testing.T) {
 							parks <- *event.StepName
 						}
 					})
-					executor.SetGateReconcileTimings(time.Hour, time.Second)
+					executor.SetGateReconcileTimings(time.Hour, 0)
 					ctx, cancel := context.WithCancel(context.Background())
 					done := make(chan error, 1)
 					go func() {
@@ -256,6 +257,7 @@ func TestCIRepair_RetainedCommitConclusionThroughExecutor(t *testing.T) {
 }
 
 func TestCIRepair_CleanNoChangeHasNoUnpublishedWork(t *testing.T) {
+	t.Parallel()
 	f := newUnconcludedFixture(t, false, func(string) {}, `{"summary":"external failure","code_change_needed":false,"stopped":null}`)
 	out := f.repairRound(t)
 	if out == nil || !out.NeedsApproval || out.RestartFrom != "" || out.RepairPublished || f.localHead(t) != f.headSHA || f.remoteHead(t) != f.headSHA {

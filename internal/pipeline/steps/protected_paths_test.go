@@ -726,7 +726,11 @@ func TestStagePipelineChanges_DoesNotReAddRemovedPopulatedSubmodule(t *testing.T
 
 func TestProtectedPaths_UnreadableStatusFailsClosed(t *testing.T) {
 	t.Parallel()
-	sctx := newTestContext(t, &mockAgent{}, t.TempDir(), "", "", config.Commands{})
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	binDir := fakeCLIBinDir(t)
+	linkTestBinary(t, binDir, "git")
+	sctx := newTestContext(t, &mockAgent{}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = fakeCLIEnv(binDir, map[string]string{"FAKE_CLI_MODE": "git-status-error"})
 	sctx.Config.ProtectedPaths = []string{"*.lock"}
 	if err := stagePipelineChanges(sctx); err == nil || !strings.Contains(err.Error(), "check protected_paths") {
 		t.Fatalf("unreadable git status did not fail closed: %v", err)

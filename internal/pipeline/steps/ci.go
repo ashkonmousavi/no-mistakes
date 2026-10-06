@@ -110,7 +110,9 @@ func (s *CIStep) Name() types.StepName { return types.StepCI }
 // reconciliation before continuity is checked. Open, unknown, and
 // provider-error states remain parked so reconciliation never guesses success.
 func (s *CIStep) ReconcileApprovalGate(sctx *pipeline.StepContext) (bool, error) {
-	unfinished, err := git.UnfinishedOperation(sctx.Ctx, sctx.WorkDir)
+	unfinished, err := git.UnfinishedOperation(sctx.WorkDir, func(args ...string) (string, error) {
+		return stepGitRun(sctx, args...)
+	})
 	if err != nil || unfinished {
 		return false, err
 	}
@@ -251,6 +253,9 @@ func verifyMergedProof(ctx context.Context, host scm.Host, pr *scm.PR, expectedH
 }
 
 func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutcome, err error) {
+	if err := sctx.Ctx.Err(); err != nil {
+		return nil, err
+	}
 	refusalFindings := ""
 	if sctx.StepResultID != "" {
 		stepResult, err := sctx.DB.GetStepResult(sctx.StepResultID)
@@ -261,7 +266,11 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 			refusalFindings = *stepResult.FindingsJSON
 		}
 	}
-	if unfinishedRepairOperation(sctx) {
+	unfinished := unfinishedRepairOperation(sctx)
+	if err := sctx.Ctx.Err(); err != nil {
+		return nil, err
+	}
+	if unfinished {
 		findingsJSON := sctx.PreviousFindings
 		if findingsJSON == "" {
 			findingsJSON = refusalFindings

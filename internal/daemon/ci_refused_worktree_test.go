@@ -111,8 +111,8 @@ func TestCIRefusedWorkSurvivesTerminalExecutorAndCleanup(t *testing.T) {
 						env := os.Environ()
 						step := ciRefusedCleanupStep{CIStep: &steps.CIStep{}, env: env}
 						executor := pipeline.NewExecutor(database, p, &config.Config{}, nil, []pipeline.Step{step}, nil)
-						executor.SetGateReconcileTimings(time.Hour, time.Second)
-						ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+						executor.SetGateReconcileTimings(time.Hour, config.DefaultGateReconcileTimeout)
+						ctx, cancel := context.WithTimeout(context.Background(), 2*config.DefaultGateReconcileTimeout)
 						defer cancel()
 						if recovered {
 							err = executor.Resume(ctx, run, repo, dir)
