@@ -19,11 +19,16 @@ const ciRefusedFindings = `{"summary":"CI repair not concluded","findings":[{"id
 
 type ciRefusedCleanupStep struct {
 	*steps.CIStep
-	env []string
+	env      []string
+	findings string
 }
 
 func (s ciRefusedCleanupStep) Execute(*pipeline.StepContext) (*pipeline.StepOutcome, error) {
-	return &pipeline.StepOutcome{NeedsApproval: true, Findings: ciRefusedFindings}, nil
+	findings := s.findings
+	if findings == "" {
+		findings = ciRefusedFindings
+	}
+	return &pipeline.StepOutcome{NeedsApproval: true, Findings: findings}, nil
 }
 func (s ciRefusedCleanupStep) ReconcileApprovalGate(ctx *pipeline.StepContext) (bool, error) {
 	ctx.Env = s.env
@@ -52,7 +57,7 @@ func TestCIRefusedWorkSurvivesTerminalExecutorAndCleanup(t *testing.T) {
 	for _, recovered := range []bool{false, true} {
 		for _, state := range []string{"CLOSED", "MERGED"} {
 			for _, route := range []string{"immediate", "startup", "age", "count"} {
-				for _, mutation := range []string{"dirty", "commit", "clean"} {
+				for _, mutation := range []string{"dirty", "commit", "clean", "marker-cleared"} {
 					mode := "live"
 					if recovered {
 						mode = "recovered"
@@ -62,12 +67,36 @@ func TestCIRefusedWorkSurvivesTerminalExecutorAndCleanup(t *testing.T) {
 						if route == "startup" {
 							placement = "recorded"
 						}
-						p, database, repo, run, dir := unfinishedCleanupFixture(t, "clean", placement)
+						operation := "clean"
+						if mutation == "marker-cleared" {
+							operation = "merge"
+						}
+						p, database, repo, run, dir := unfinishedCleanupFixture(t, operation, placement)
+						findings := ciRefusedFindings
+						if mutation == "marker-cleared" {
+							out, err := (&steps.CIStep{}).Execute(&pipeline.StepContext{Ctx: context.Background(), DB: database, Run: run, WorkDir: dir, Log: func(string) {}})
+							if err != nil || out == nil || !out.NeedsApproval {
+								t.Fatalf("initial unfinished gate=%#v %v", out, err)
+							}
+							parsed, err := types.ParseFindingsJSON(out.Findings)
+							if err != nil || len(parsed.Items) != 1 || parsed.Items[0].ID != pipeline.CIIncompleteWorkFindingID {
+								t.Fatalf("initial gate omitted refusal: %+v %v", parsed, err)
+							}
+							findings = out.Findings
+							marker := gitOutput(t, dir, "rev-parse", "--git-path", "MERGE_HEAD")
+							if !filepath.IsAbs(marker) {
+								marker = filepath.Join(dir, marker)
+							}
+							if err := os.Remove(marker); err != nil {
+								t.Fatal(err)
+							}
+							gitCmd(t, dir, "add", "test.txt")
+						}
 						published := run.HeadSHA
 						if err := database.UpdateRunPushBinding(run.ID, db.PushBinding{HeadSHA: published, TargetKind: "upstream", TargetFingerprint: "fixture", Ref: "refs/heads/feature"}); err != nil {
 							t.Fatal(err)
 						}
-						if mutation != "clean" {
+						if mutation != "clean" && mutation != "marker-cleared" {
 							refusedDirtyWorktree(t, dir, mutation)
 							if mutation == "commit" {
 								if err := database.UpdateRunHeadSHA(run.ID, gitOutput(t, dir, "rev-parse", "HEAD")); err != nil {
@@ -86,7 +115,6 @@ func TestCIRefusedWorkSurvivesTerminalExecutorAndCleanup(t *testing.T) {
 						if err := database.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
 							t.Fatal(err)
 						}
-						findings := ciRefusedFindings
 						if recovered {
 							sr, err := database.InsertStepResult(run.ID, types.StepCI)
 							if err != nil {
@@ -109,7 +137,7 @@ func TestCIRefusedWorkSurvivesTerminalExecutorAndCleanup(t *testing.T) {
 						ghDir, _ := writeMockGHState(t, t.TempDir(), state)
 						t.Setenv("PATH", ghDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 						env := os.Environ()
-						step := ciRefusedCleanupStep{CIStep: &steps.CIStep{}, env: env}
+						step := ciRefusedCleanupStep{CIStep: &steps.CIStep{}, env: env, findings: findings}
 						executor := pipeline.NewExecutor(database, p, &config.Config{}, nil, []pipeline.Step{step}, nil)
 						executor.SetGateReconcileTimings(time.Hour, config.DefaultGateReconcileTimeout)
 						ctx, cancel := context.WithTimeout(context.Background(), 2*config.DefaultGateReconcileTimeout)

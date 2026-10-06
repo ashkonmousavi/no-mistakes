@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
@@ -108,7 +109,11 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 	}
 	if errors.Is(err, errCIRepairNotConcluded) {
 		sctx.Log(fmt.Sprintf("CI fixer did not conclude a repair; nothing committed or published: %s", repair.Summary))
-		return ciRepairParkOutcome(targets.Findings, sctx.DeferredFindings, strings.TrimSpace(repair.Summary+" "+s.retainRepairLeftover(sctx))), nil
+		summary := strings.TrimSpace(repair.Summary + " " + s.retainRepairLeftover(sctx))
+		if unfinishedRepairOperation(sctx) {
+			return ciIncompleteWorkOutcome(targets.Findings, sctx.DeferredFindings, summary), nil
+		}
+		return ciRepairParkOutcome(targets.Findings, sctx.DeferredFindings, summary), nil
 	}
 	if err != nil && pluginContractBroken(err) {
 		// A provider plugin that broke its contract during the repair (for
@@ -130,6 +135,19 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 		// executor retries while auto_fix.ci allows.
 		sctx.Log(fmt.Sprintf("warning: CI fix failed: %v", err))
 		return nil, nil
+	}
+	// A successfully concluded repair supersedes the synthetic operation
+	// refusal, including when the operator selected only the original check.
+	isIncompleteWork := func(finding Finding) bool { return finding.ID == pipeline.CIIncompleteWorkFindingID }
+	targets.Findings.Items = slices.DeleteFunc(targets.Findings.Items, isIncompleteWork)
+	if pipeline.HasCIIncompleteWorkRefusal(sctx.DeferredFindings) {
+		deferred, _ := types.ParseFindingsJSON(sctx.DeferredFindings)
+		deferred.Items = slices.DeleteFunc(deferred.Items, isIncompleteWork)
+		if len(deferred.Items) == 0 {
+			sctx.DeferredFindings = ""
+		} else {
+			sctx.DeferredFindings, _ = types.MarshalFindingsJSON(deferred)
+		}
 	}
 	if repair.HeadAdvanced || sctx.Run.HeadSHA != previousHeadSHA {
 		s.lastFixedChecks = fixKey

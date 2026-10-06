@@ -283,7 +283,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 				return nil, err
 			}
 		}
-		return ciRepairParkOutcome(findings, sctx.DeferredFindings, "An unfinished or unreadable Git operation remains in the run worktree; nothing committed or published. "+s.retainRepairLeftover(sctx)), nil
+		return ciIncompleteWorkOutcome(findings, sctx.DeferredFindings, "An unfinished or unreadable Git operation remains in the run worktree; nothing committed or published. "+s.retainRepairLeftover(sctx)), nil
 	}
 	retryRefusal := sctx.Fixing && pipeline.HasProtectedPathRefusal(refusalFindings)
 	// A fix round repairs the findings the executor selected for it, unless

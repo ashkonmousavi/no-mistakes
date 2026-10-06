@@ -1017,8 +1017,20 @@ func worktreeCleanupReason(d *db.DB, run *db.Run, workDir string) string {
 		if unfinished {
 			return "unfinished Git operation; preserving partial HEAD, index and worktree"
 		}
-	} else if !os.IsNotExist(err) {
-		return fmt.Sprintf("cannot inspect worktree Git metadata; preserving: %v", err)
+	} else {
+		if !os.IsNotExist(err) {
+			return fmt.Sprintf("cannot inspect worktree Git metadata; preserving: %v", err)
+		}
+		// A missing pointer proves nothing about the remaining checkout.
+		// Only an empty or already absent directory has no work to lose.
+		entries, readErr := os.ReadDir(workDir)
+		if readErr != nil && !os.IsNotExist(readErr) {
+			return fmt.Sprintf("worktree Git metadata and contents are unreadable; preserving: %v", readErr)
+		}
+		if len(entries) != 0 {
+			return "worktree Git metadata is missing; preserving remaining contents"
+		}
+		return ""
 	}
 	if run == nil || (run.Status == types.RunCancelled && run.Error != nil && *run.Error == types.RunCancelReasonAbortedByUser) {
 		return ""

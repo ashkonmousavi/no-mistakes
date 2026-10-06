@@ -19,7 +19,6 @@ import (
 )
 
 func TestCIStep_ProtectedPathRetryUsesPersistedRepair(t *testing.T) {
-	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		rebase     bool
@@ -33,7 +32,6 @@ func TestCIStep_ProtectedPathRetryUsesPersistedRepair(t *testing.T) {
 		{name: "unverified_rewrite_stays_refused", rebase: true, unverified: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
 			f := newCIRepairFixture(t, tc.revalidate, nil)
 			if tc.rebase {
 				gitCmd(t, f.dir, "checkout", "main")
@@ -243,14 +241,12 @@ func persistCIRefusal(t *testing.T, f *ciRepairFixture, outcome *pipeline.StepOu
 }
 
 func TestCIStep_ProtectedPathRetryFinishesRetainedRepairWithGreenChecks(t *testing.T) {
-	t.Parallel()
 	for _, revalidate := range []bool{false, true} {
 		name := "publish"
 		if revalidate {
 			name = "revalidate"
 		}
 		t.Run(name, func(t *testing.T) {
-			t.Parallel()
 			calls := 0
 			f := newCIRepairFixture(t, revalidate, func(dir string) {
 				calls++
@@ -307,7 +303,6 @@ func TestCIStep_ProtectedPathRetryFinishesRetainedRepairWithGreenChecks(t *testi
 }
 
 func TestCIStep_ProtectedPathRetryPublicationFailureKeepsRefusal(t *testing.T) {
-	t.Parallel()
 	f := newCIRepairFixture(t, false, func(dir string) {
 		for file, content := range map[string]string{"package.lock": "refused\n", "fix.go": "retained repair\n"} {
 			if err := os.WriteFile(filepath.Join(dir, file), []byte(content), 0o644); err != nil {
