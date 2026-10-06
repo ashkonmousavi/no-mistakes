@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -193,7 +195,6 @@ func TestCIRepair_RefusalControlsSurviveInvalidSummary(t *testing.T) {
 		{name: "malformed_stopped", conclusion: `{"summary":"repair","code_change_needed":true,"stopped":"true"}`},
 		{name: "malformed_change", conclusion: `{"summary":"repair","code_change_needed":"true"}`},
 		{name: "malformed_json", conclusion: `{"summary":"repair","code_change_needed":true`},
-		{name: "null_stopped", conclusion: `{"summary":"repair","code_change_needed":true,"stopped":null}`},
 		{name: "missing_change", conclusion: `{"summary":"repair"}`},
 		{name: "no_change_committed", conclusion: `{"summary":"external failure","code_change_needed":false}`},
 		{name: "valid_no_change_dirty", conclusion: `{"summary":"external failure","code_change_needed":false}`, dirty: true},
@@ -402,5 +403,182 @@ func TestCIRepair_CleanDivergentHeadStillFailsContinuity(t *testing.T) {
 	}
 	if f.remoteHead(t) != f.headSHA {
 		t.Error("divergent head published")
+	}
+}
+
+func ciConclusionAdapter(t *testing.T, conclusion string) agent.Agent {
+	t.Helper()
+	dir := t.TempDir()
+	event, err := json.Marshal(map[string]any{"type": "item.completed", "item": map[string]any{"type": "agent_message", "text": conclusion}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(dir, "output.jsonl")
+	if err := os.WriteFile(output, append(event, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	name, script := "codex", "#!/bin/sh\ncat '"+strings.ReplaceAll(output, "'", "'\"'\"'")+"'\n"
+	if runtime.GOOS == "windows" {
+		name, script = "codex.cmd", "@echo off\r\ntype \""+output+"\"\r\n"
+	}
+	bin := filepath.Join(dir, name)
+	if err := os.WriteFile(bin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := agent.New(types.AgentCodex, bin, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { adapter.Close() })
+	return adapter
+}
+
+func TestCIRepair_CodexOptionalStopPublishesAcceptedMerge(t *testing.T) {
+	for _, field := range []string{"", `,"stopped":null`, `,"stopped":false`, `,"stopped":true`} {
+		t.Run(field, func(t *testing.T) {
+			adapter := ciConclusionAdapter(t, `{"summary":"accepted merge","code_change_needed":true`+field+`}`)
+			f := newUnconcludedFixture(t, false, leaveMerge, `{}`)
+			f.sctx.Agent = &mockAgent{name: "codex", runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+				leaveMerge(opts.CWD)
+				return adapter.Run(ctx, opts)
+			}}
+			out := f.repairRound(t)
+			parents := strings.Fields(gitCmd(t, f.dir, "rev-list", "--parents", "-n", "1", "HEAD"))
+			if len(parents) != 3 {
+				t.Fatalf("accepted fixture is not a merge: %v", parents)
+			}
+			if strings.Contains(field, "true") {
+				if out == nil || !out.NeedsApproval || f.remoteHead(t) != f.headSHA {
+					t.Fatalf("stop outcome=%#v remote=%s", out, f.remoteHead(t))
+				}
+			} else if f.remoteHead(t) != f.localHead(t) || f.remoteHead(t) == f.headSHA || (out != nil && out.NeedsApproval) {
+				t.Fatalf("accepted Codex repair parked/unpublished: outcome=%#v log=%s", out, f.log())
+			}
+		})
+	}
+}
+
+func TestCIRepair_CodexStructuredRejectionParks(t *testing.T) {
+	long, _ := json.Marshal(strings.Repeat("界", 5000))
+	conclusions := []string{
+		`{"summary":` + string(long) + `,"code_change_needed":true,"stopped":true}`,
+		`{"summary":42,"code_change_needed":true,"stopped":true}`,
+		`{"summary":"partial","code_change_needed":null,"stopped":true}`,
+		`{"summary":"partial","stopped":true}`,
+		`{"summary":"partial","code_change_needed":"true"}`,
+		`{"summary":"partial","code_change_needed":true,"stopped":"true"}`,
+		`{"summary":"partial","code_change_needed":true`,
+	}
+	for i, conclusion := range conclusions {
+		for _, mutation := range []string{"dirty", "commit", "merge", "none"} {
+			t.Run(fmt.Sprintf("%d/%s", i, mutation), func(t *testing.T) {
+				adapter := ciConclusionAdapter(t, conclusion)
+				f := newUnconcludedFixture(t, mutation == "merge", func(string) {}, `{}`)
+				var rejection error
+				var head, index, bytes, rawIndex string
+				f.sctx.Agent = &mockAgent{name: "codex", runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+					switch mutation {
+					case "dirty":
+						if err := os.WriteFile(filepath.Join(opts.CWD, "feature.txt"), []byte("staged\n"), 0600); err != nil {
+							t.Fatal(err)
+						}
+						gitCmd(t, opts.CWD, "add", "feature.txt")
+						if err := os.WriteFile(filepath.Join(opts.CWD, "feature.txt"), []byte("dirty\x00bytes\n"), 0600); err != nil {
+							t.Fatal(err)
+						}
+					case "commit", "merge":
+						leaveMerge(opts.CWD)
+					}
+					head = f.localHead(t)
+					indexPath := gitCmd(t, f.dir, "rev-parse", "--git-path", "index")
+					if !filepath.IsAbs(indexPath) {
+						indexPath = filepath.Join(f.dir, indexPath)
+					}
+					indexRaw, indexErr := os.ReadFile(indexPath)
+					if indexErr != nil {
+						t.Fatal(indexErr)
+					}
+					rawIndex = string(indexRaw)
+					index = gitCmd(t, f.dir, "ls-files", "--stage")
+					raw, err := os.ReadFile(filepath.Join(f.dir, "feature.txt"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					bytes = string(raw)
+					result, err := adapter.Run(ctx, opts)
+					rejection = err
+					return result, err
+				}}
+				out := f.repairRound(t)
+				if i == 0 {
+					if rejection != nil {
+						t.Fatalf("oversized summary unexpectedly rejected by adapter: %v", rejection)
+					}
+				} else if !agent.IsStructuredOutputRejected(rejection) {
+					t.Fatalf("not an adapter rejection: %v; log: %s", rejection, f.log())
+				}
+				if out == nil || !out.NeedsApproval || out.AutoFixable {
+					t.Fatalf("schema rejection retried instead of parked: %#v", out)
+				}
+				if f.remoteHead(t) != f.headSHA || f.localHead(t) != head || gitCmd(t, f.dir, "ls-files", "--stage") != index {
+					t.Fatal("rejected repair published or mutated HEAD/index")
+				}
+				raw, err := os.ReadFile(filepath.Join(f.dir, "feature.txt"))
+				if err != nil || string(raw) != bytes {
+					t.Fatal("rejected repair bytes changed")
+				}
+				indexPath := gitCmd(t, f.dir, "rev-parse", "--git-path", "index")
+				if !filepath.IsAbs(indexPath) {
+					indexPath = filepath.Join(f.dir, indexPath)
+				}
+				indexRaw, indexErr := os.ReadFile(indexPath)
+				if indexErr != nil || string(indexRaw) != rawIndex {
+					t.Fatal("raw index changed after rejection")
+				}
+				if mutation == "merge" && !mergeHeadPresent(t, f.dir) {
+					t.Fatal("unfinished merge lost")
+				}
+				if mutation == "commit" {
+					run, err := f.sctx.DB.GetRun(f.sctx.Run.ID)
+					if err != nil || run.HeadSHA != head || run.LastPushedSHA == nil || *run.LastPushedSHA != f.headSHA {
+						t.Fatalf("unpublished custody: %+v %v", run, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestCIRepair_UnrelatedAgentErrorStillUsesOrdinaryPolicy(t *testing.T) {
+	f := newUnconcludedFixture(t, false, func(string) {}, `{}`)
+	f.sctx.Agent = &mockAgent{name: "failed", runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+		return nil, errors.New("transport failed")
+	}}
+	if out := f.repairRound(t); out != nil {
+		t.Fatalf("unrelated error parked: %#v", out)
+	}
+	if f.remoteHead(t) != f.headSHA || f.localHead(t) != f.headSHA {
+		t.Fatal("unrelated error moved HEAD")
+	}
+}
+
+func TestCIRepair_StoppedDirtyWithRevalidationPolicy(t *testing.T) {
+	for _, revalidate := range []bool{false, true} {
+		t.Run(fmt.Sprint(revalidate), func(t *testing.T) {
+			f := newUnconcludedFixture(t, false, func(dir string) {
+				if err := os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("retained\x00bytes"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}, `{"summary":"stopped","code_change_needed":true,"stopped":true}`)
+			f.sctx.Config.CI.RevalidateRepairs = revalidate
+			out := f.repairRound(t)
+			if out == nil || !out.NeedsApproval || out.RestartFrom != "" || f.remoteHead(t) != f.headSHA || f.localHead(t) != f.headSHA {
+				t.Fatalf("stopped policy outcome=%#v", out)
+			}
+			raw, err := os.ReadFile(filepath.Join(f.dir, "dirty.txt"))
+			if err != nil || string(raw) != "retained\x00bytes" {
+				t.Fatal("stopped bytes lost")
+			}
+		})
 	}
 }

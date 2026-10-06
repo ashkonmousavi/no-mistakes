@@ -278,6 +278,9 @@ CI logs:
 		OnChunk:    sctx.LogChunk,
 	})
 	if err != nil {
+		if agent.IsStructuredOutputRejected(err) {
+			return ciRepairResult{Summary: fmt.Sprintf("Invalid CI repair conclusion: %v", err)}, errCIRepairNotConcluded
+		}
 		return ciRepairResult{}, fmt.Errorf("agent CI fix: %w", err)
 	}
 
@@ -466,15 +469,6 @@ func extractCIFixConclusion(result *agent.Result) (ciFixConclusion, error) {
 	if parseErr != nil {
 		return conclusion, fmt.Errorf("parse CI repair conclusion: %w", parseErr)
 	}
-	if conclusion.Stopped == nil {
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(result.Output, &fields); err != nil {
-			return conclusion, err
-		}
-		if _, present := fields["stopped"]; present {
-			return conclusion, fmt.Errorf("CI repair conclusion stopped must be a boolean")
-		}
-	}
 	summary, err := extractCommitSummary(result)
 	if err != nil {
 		return conclusion, err
@@ -618,7 +612,7 @@ func (s *CIStep) retainRepairLeftover(sctx *pipeline.StepContext) string {
 // disappear with the worktree at cleanup. Best effort: an unreadable status
 // simply omits the detail.
 func dirtyRunWorktree(sctx *pipeline.StepContext) string {
-	status, err := stepGitRun(sctx, "status", "--porcelain")
+	status, err := stepGitRun(sctx, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
 	if err != nil || strings.TrimSpace(status) == "" {
 		return ""
 	}

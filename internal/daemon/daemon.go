@@ -1017,30 +1017,46 @@ func worktreeCleanupReason(d *db.DB, run *db.Run, workDir string) string {
 	} else if !os.IsNotExist(err) {
 		return fmt.Sprintf("cannot inspect worktree Git metadata; preserving: %v", err)
 	}
-	return protectedPathCleanupReason(d, run)
-}
-
-// protectedPathCleanupReason protects only the index and working files. It must
-// not be used as a process-liveness or test-evidence retention predicate.
-func protectedPathCleanupReason(d *db.DB, run *db.Run) string {
 	if run == nil || (run.Status == types.RunCancelled && run.Error != nil && *run.Error == types.RunCancelReasonAbortedByUser) {
 		return ""
 	}
 	results, err := d.GetStepsByRun(run.ID)
 	if err != nil {
-		return fmt.Sprintf("cannot read protected-path refusals for run %s: %v", run.ID, err)
+		return fmt.Sprintf("cannot read worktree refusals for run %s: %v", run.ID, err)
 	}
 	for _, step := range results {
-		if step.FindingsJSON == nil || !pipeline.HasProtectedPathRefusal(*step.FindingsJSON) || step.Status == types.StepStatusCompleted {
+		if step.FindingsJSON == nil || (step.Error != nil && *step.Error == "aborted by user") {
 			continue
 		}
-		if step.Status == types.StepStatusSkipped && (step.Error == nil || *step.Error != types.RunCIMonitorInterruptedReason) {
+		if pipeline.HasProtectedPathRefusal(*step.FindingsJSON) && step.Status != types.StepStatusCompleted &&
+			(step.Status != types.StepStatusSkipped || (step.Error != nil && *step.Error == types.RunCIMonitorInterruptedReason)) {
+			return fmt.Sprintf("run %s has an unresolved protected-path refusal; preserving index and worktree", run.ID)
+		}
+		if step.StepName != types.StepCI {
 			continue
 		}
-		if step.Error != nil && *step.Error == "aborted by user" {
-			continue
+		findings, err := types.ParseFindingsJSON(*step.FindingsJSON)
+		if err != nil {
+			return fmt.Sprintf("cannot read CI refusals for run %s; preserving worktree: %v", run.ID, err)
 		}
-		return fmt.Sprintf("run %s has an unresolved protected-path refusal; preserving index and worktree", run.ID)
+		for _, finding := range findings.Items {
+			if finding.ActionOrDefault() != types.ActionAskUser {
+				continue
+			}
+			status, err := git.Run(context.Background(), workDir, "--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none")
+			if err != nil || status != "" {
+				return fmt.Sprintf("run %s has uncommitted or unreadable CI work; preserving index and worktree", run.ID)
+			}
+			head, err := git.HeadSHA(context.Background(), workDir)
+			published := run.LastPushedSHA
+			if published == nil {
+				published = run.SubmittedHeadSHA
+			}
+			if err != nil || published == nil || head != *published {
+				return fmt.Sprintf("run %s has unpublished or unreadable CI work; preserving local commits", run.ID)
+			}
+			break
+		}
 	}
 	return ""
 }
