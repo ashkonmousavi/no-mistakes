@@ -34,6 +34,7 @@ var errAttestationWriteFailed = errors.New("pipeline attestation write failed")
 // invariant-complete discipline.
 const ciFixerClassRules = `- Before changing code, state for each finding the invariant it violates (what must always hold, in one sentence) and enumerate every place in the changed area where that same invariant must hold: every axis, direction, and representation; every sibling call path, command, action, and state transition; every consumer of the same input, field, or record. Fix the invariant at all of those places in this round, with the same small correction, or at the one shared boundary that makes all of them hold. A fix that closes only the reported site and leaves a sibling site reachable is incomplete; the next review will report the sibling.
 - Do not grow the fix into machinery: closing sibling sites with the same small edit, or moving a check to one shared boundary, is the fix; adding handling, state, fallbacks, retries, or a subsystem to manage symptoms is not. Prefer addressing a deeper architectural reason and simplifying it, than introducing machinery to handle the symptoms.
+- If you must stop before the repair is finished, including when an operator-supplied precondition or admission check refuses, leave every change exactly where it is, set stopped to true, and say why in summary. The pipeline then commits and publishes nothing and keeps your partial work for a human.
 - After applying the fixes and before verification, re-trace for each finding the concrete failing sequence it describes through the code as it now is, and trace the ordinary successful path through every function you changed, including each of its callers. Remove any alias, branch, parameter, or helper your fix made unreachable. A fix that makes the reported sequence pass while breaking the ordinary path, a caller's assumption, or a sibling site is a regression the next review will report.`
 
 const ciFailingCheckFixRules = `- If a failing check is caused by this PR's code (a broken test, build, lint, or similar defect in the change), you MUST produce file changes that fix it and set code_change_needed to true. A real failing test or build must still be fixed.
@@ -103,6 +104,10 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 	}
 	if outcome := s.ciFixAgentBudgetOutcome(sctx, issueDesc, err); outcome != nil {
 		return ciTerminalRepairOutcome(outcome, targets.Findings, sctx.DeferredFindings), nil
+	}
+	if errors.Is(err, errCIRepairNotConcluded) {
+		sctx.Log(fmt.Sprintf("CI fixer did not conclude a repair; nothing committed or published: %s", repair.Summary))
+		return ciRepairParkOutcome(targets.Findings, sctx.DeferredFindings, strings.TrimSpace(repair.Summary+" "+s.retainRepairLeftover(sctx))), nil
 	}
 	if err != nil && pluginContractBroken(err) {
 		// A provider plugin that broke its contract during the repair (for
@@ -279,6 +284,16 @@ CI logs:
 	if conclusionErr != nil {
 		sctx.Log(fmt.Sprintf("warning: could not parse CI repair conclusion: %v", conclusionErr))
 	}
+	// A repair is only what the agent finished and stood behind. An unfinished
+	// merge or rebase is never concluded by the pipeline (the Rebase step's own
+	// rule), and a no-change conclusion over a moved head or dirty tree is the
+	// agent declining to stand behind it. Either way nothing is committed or
+	// published; the bytes stay where the agent left them and the round parks.
+	declined := conclusionErr == nil && conclusion.CodeChangeNeeded != nil && !*conclusion.CodeChangeNeeded
+	stopped := conclusionErr == nil && conclusion.Stopped != nil && *conclusion.Stopped
+	if stopped || unfinishedRepairOperation(sctx) || (declined && repairLeftInWorktree(sctx)) {
+		return ciRepairResult{Summary: conclusion.Summary}, errCIRepairNotConcluded
+	}
 	repair, err := s.commitRepair(sctx, conclusion.Summary, result)
 	var refusal *pipeline.ProtectedPathError
 	if errors.As(err, &refusal) {
@@ -424,13 +439,15 @@ func boundedCILogError(err error, maxBytes int) string {
 type ciFixConclusion struct {
 	Summary          string `json:"summary"`
 	CodeChangeNeeded *bool  `json:"code_change_needed"`
+	Stopped          *bool  `json:"stopped,omitempty"`
 }
 
 var ciFixConclusionSchema = json.RawMessage(fmt.Sprintf(`{
 	"type": "object",
 	"properties": {
 		"summary": {"type": "string", "maxLength": %d},
-		"code_change_needed": {"type": "boolean"}
+		"code_change_needed": {"type": "boolean"},
+		"stopped": {"type": "boolean"}
 	},
 	"required": ["summary", "code_change_needed"]
 }`, config.MaxFixMessageSummaryBytes))
@@ -542,6 +559,39 @@ func (s *CIStep) ciFixAgentBudgetOutcome(sctx *pipeline.StepContext, issueDesc s
 		leftover = append(leftover, fmt.Sprintf("The timed-out agent left uncommitted changes in the run worktree at %s; they are not committed or pushed.", dirty))
 	}
 	return ciFixAgentTimeoutOutcome(issueDesc, strings.Join(leftover, " "), err)
+}
+
+var errCIRepairNotConcluded = errors.New("CI repair was not concluded by the agent")
+
+func unfinishedRepairOperation(sctx *pipeline.StepContext) bool {
+	return rebaseInProgress(sctx.Ctx, sctx.WorkDir) || mergeInProgress(sctx.Ctx, sctx.WorkDir) || len(rebaseConflictFiles(sctx.Ctx, sctx.WorkDir)) > 0
+}
+
+func repairLeftInWorktree(sctx *pipeline.StepContext) bool {
+	head, err := stepGitHeadSHA(sctx)
+	return err != nil || head != sctx.Run.HeadSHA || dirtyRunWorktree(sctx) != ""
+}
+
+// retainRepairLeftover keeps a not-concluded repair in custody exactly like a
+// timed-out one: an unfinished merge or rebase stays unrecorded, an agent
+// commit is recorded locally without publication, dirty bytes stay in place.
+func (s *CIStep) retainRepairLeftover(sctx *pipeline.StepContext) string {
+	var leftover []string
+	head, headErr := stepGitHeadSHA(sctx)
+	switch {
+	case unfinishedRepairOperation(sctx):
+		leftover = append(leftover, fmt.Sprintf("The agent left an unfinished rebase or merge in the run worktree at %s; it is not committed, recorded, or published.", sctx.WorkDir))
+	case headErr == nil && head != "" && head != sctx.Run.HeadSHA:
+		if _, recErr := s.recordLocalRepair(sctx, head); recErr != nil {
+			leftover = append(leftover, fmt.Sprintf("The agent left a committed head at %s in the run worktree.", shortObjectID(head)))
+		} else {
+			leftover = append(leftover, fmt.Sprintf("The agent committed %s; it is recorded locally for custody and is not published.", shortObjectID(head)))
+		}
+	}
+	if dirty := dirtyRunWorktree(sctx); dirty != "" && !unfinishedRepairOperation(sctx) {
+		leftover = append(leftover, fmt.Sprintf("The agent left uncommitted changes in the run worktree at %s; they are not committed or pushed.", dirty))
+	}
+	return strings.Join(leftover, " ")
 }
 
 // dirtyRunWorktree reports the run worktree path when the timed-out agent left
